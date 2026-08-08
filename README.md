@@ -9,7 +9,7 @@
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?logo=windows&logoColor=white)]()
 [![Rust](https://img.shields.io/badge/Made%20with-Rust-orange?logo=rust&logoColor=white)]()
 [![egui](https://img.shields.io/badge/UI-egui%20%2F%20eframe-blue)]()
-[![Latest Release](https://img.shields.io/github/v/release/blackixxce12/MacroRecorder?label=release&color=green)](../../releases)
+[![Latest Release](https://img.shields.io/github/v/release/blackixxce12/MacroRecorder?label=release&color=green)](https://github.com/blackixxce12/MacroRecorder/releases)
 
 *Record mouse & keyboard → replay it forever (or exactly N times) → go drink some tea.* ☕
 
