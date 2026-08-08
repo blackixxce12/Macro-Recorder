@@ -1,20 +1,4 @@
-
-## README_RU.md
-
-```md
-<div align="center">
-
-# 🦀 Macro Recorder
-
-**Современная open-source альтернатива TinyTask.**
-*Рождён из Roblox-гринда. Выкован в Rust.*
-
-[🇬 English version](README.md) • [📥 Скачать](../../releases)
-
-</div>
-
----
-
+ 🦀 Macro Recorder
 ## 📖 История: Roblox, аниме tower defense и уставшая рука
 
 Я много играю в **Roblox** — особенно в аниме tower defense игры. Кто в теме, тот знает *этот цикл*:
@@ -93,4 +77,4 @@
 
 ## 📄 Лицензия
 
-MIT © [Твой ник](https://github.com/blackixxce12)
+MIT © (https://github.com/blackixxce12)
