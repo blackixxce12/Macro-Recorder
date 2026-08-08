@@ -67,7 +67,7 @@ That weekend project got slightly out of hand. 🦀
 | Feature | TinyTask | Macro Recorder |
 |---|:---:|:---:|
 | License | Freeware, closed source | **MIT, fully open source** |
-| Era | 2007 vibes | 2025 |
+| Era | 2007 vibes | 2026 |
 | UI | Classic tray tool | Modern GPU-rendered GUI, **8 themes** (incl. Windows 11 **Mica / Acrylic blur**) |
 | Languages | English | **EN + RU**, auto-detected |
 | Input capture | Mouse + keyboard | Mouse + keyboard + **wheel + X1/X2 buttons** |
