@@ -1,7 +1,5 @@
 #![cfg(windows)]
 #![windows_subsystem = "windows"]
-// For maximum performance on modern AMD/Intel CPUs, compile with:
-// RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -601,6 +599,36 @@ fn set_window_pixel_alpha(enabled: bool) {
     }
 }
 
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    let candidates = [
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\msyhbd.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\simsun.ttc",
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+    ];
+
+    for path in candidates {
+        if let Ok(data) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "cjk_fallback".to_owned(),
+                egui::FontData::from_owned(data).into(), // <-- добавили .into()
+            );
+                        if let Some(fams) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                fams.push("cjk_fallback".to_owned());
+            }
+            if let Some(fams) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                fams.push("cjk_fallback".to_owned());
+            }
+            break;
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
 fn apply_theme(ctx: &egui::Context, theme: Theme, force_transparent: bool) {
     let p = palette(theme);
     let see_through = matches!(theme, Theme::Fluent | Theme::Glass);
@@ -616,6 +644,8 @@ fn apply_theme(ctx: &egui::Context, theme: Theme, force_transparent: bool) {
 
     set_system_backdrop(p.backdrop);
 }
+
+
 
 // ============================================================
 // Model
@@ -1330,7 +1360,7 @@ impl eframe::App for MacroApp {
                 if !self.loop_play {
                     ui.horizontal(|ui| {
                         ui.label(s.play_count);
-                        ui.add(egui::DragValue::new(&mut self.play_count_limit).range(1..=1000).speed(1));
+                        ui.add(egui::DragValue::new(&mut self.play_count_limit).range(1..=9999).speed(1));
                     });
                     PLAY_COUNT_LIMIT.store(self.play_count_limit, Ordering::Relaxed);
                 }
@@ -1521,9 +1551,10 @@ fn main() -> anyhow::Result<()> {
         "Macro Recorder",
         options,
         Box::new(move |cc| {
-            // 1. ОБЯЗАТЕЛЬНО объявляем массив тем
+            setup_fonts(&cc.egui_ctx);   // <-- ВОТ ЭТА НОВАЯ СТРОКА
+
             let themes = [
-                Theme::Dark, Theme::Material3, Theme::Fluent, Theme::Catppuccin,
+                            Theme::Dark, Theme::Material3, Theme::Fluent, Theme::Catppuccin,
                 Theme::Nord, Theme::Dracula, Theme::Glass, Theme::Neumorphism,
             ];
 
