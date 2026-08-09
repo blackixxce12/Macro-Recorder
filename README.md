@@ -126,7 +126,7 @@ Two builds are available:
 | File | Requires | Notes |
 |---|---|---|
 | `macro_recorder.exe` | Any x86-64 CPU | Universal — runs everywhere |
-| `macro_recorder_optimized.exe` | CPU with AVX2 (Intel Haswell 2013+ / AMD Ryzen+) | Faster, smaller binary |
+| `MacroRecorder.v3.exe` | CPU with AVX2 (Intel Haswell 2013+ / AMD Ryzen+) | Faster, smaller binary |
 
 > ⚠️ **Antivirus note:** macro tools inject input, so some antiviruses may flag the unsigned exe as suspicious (false positive). This is normal for this kind of software — that's exactly why the source is open: feel free to build it yourself.
 
