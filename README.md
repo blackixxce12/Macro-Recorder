@@ -32,19 +32,21 @@ I play a lot of **Roblox** — especially anime tower defense games. If you've e
 
 One evening, after manually clicking the same "summon / upgrade / claim" buttons for the third hour in a row, my hand said *«no»*. So I did what everyone does — I downloaded **TinyTask**.
 
-It worked… but it felt like a relic from another era:
+It worked… for about 10 minutes. Then the cracks started showing:
 
-- ️ UI straight from the Windows XP days;
-- 🔁 loop forever **or nothing** — no «play exactly 5 times»;
-- 🐌 no playback speed control;
-- 📦 closed source — want a feature? *Want harder.*
+- 🦖 **UI straight out of Windows XP** — hasn't aged well since 2007;
+- 🐛 **Closed source Win32 blob** with known input-buffer bugs that silently drop events during long recordings (my 2-hour farm macro kept desyncing after ~40 minutes);
+- 🎨 **Zero customization** — same gray tray tool everyone else uses;
+- 🐌 **No speed control** — want to replay 2× faster to test a macro? *Too bad*;
+- 🚫 **No save-as-defaults** — every launch you re-configure it;
+- 🔒 **Proprietary format** — want to edit a macro by hand? *Want harder*.
 
 And then I thought: **I want my own macro recorder.** One that:
 
 - looks like a 2026 app, not a 2007 artifact;
-- loops **exactly N times** so I can sleep while my units farm;
-- stays **on top of the game window**;
-- and is **fully mine** — open for anyone to read, build and improve.
+- loops **exactly N times** *or* for a **set amount of time** (even shuts down the PC after);
+- stays **on top of the game window** with optional **translucent glass UI**;
+- and is **fully mine** — open for anyone to read, build and audit.
 
 That weekend project got slightly out of hand. 🦀
 
@@ -56,7 +58,7 @@ That weekend project got slightly out of hand. 🦀
 |---|---|
 | **Single .exe** | No installers, no .NET, no Python runtime — one file, double-click, done |
 | **Fearless concurrency** | One thread captures low-level hooks, one replays with microsecond timing, one draws the UI — and they never fight |
-| **Memory safety** | A tool that injects input into your system shouldn't crash mid-raid. Rust makes sure of that |
+| **Memory safety** | A tool that injects input into your system shouldn't crash mid-raid or overflow an event buffer. Rust makes sure of that — no mystery bugs from 17-year-old Win32 code |
 | **Tiny & instant** | With LTO + strip the whole app is a few MB and starts instantly |
 | **Honest reason** | I wanted a real excuse to learn Rust properly. Best way to learn — build something you actually use |
 
@@ -66,20 +68,25 @@ That weekend project got slightly out of hand. 🦀
 
 | Feature | TinyTask | Macro Recorder |
 |---|:---:|:---:|
-| License | Freeware, closed source | **MIT, fully open source** |
-| Era | 2007 vibes | 2026 |
-| UI | Classic tray tool | Modern GPU-rendered GUI, **8 themes** (incl. Windows 11 **Mica / Acrylic blur**) |
-| Languages | English | **EN + RU**, auto-detected |
+| License | Freeware, **closed source** | **MIT, fully open source** |
+| Era | 2007 vibes (still) | 2026 |
+| UI | Classic gray tray tool, WinForms-era | Modern GPU-rendered GUI, **8 themes** (incl. Windows 11 **Mica / Acrylic blur**), **transparent glass mode** |
+| Languages | English only | **6 languages** (EN, RU, UK, PT, ES, ZH) + auto-detection |
 | Input capture | Mouse + keyboard | Mouse + keyboard + **wheel + X1/X2 buttons** |
-| Loop mode | Infinite only | **Infinite or exactly N times** |
+| Loop mode | Infinite **or** N times | Infinite, **N times, or timed** (hours + minutes) |
+| Timed playback | ❌ | ✅ stop after H hours M minutes |
+| End action | ❌ | **Stop playback OR shut down the PC** |
 | Playback speed | Fixed | **0.1× – 3.0×** |
 | Recording timer | ❌ | ✅ live + final duration |
-| Playback counter | ❌ | ✅ |
-| Global hotkeys | Fixed | **F8 / F9 — work in any window**, even in-game |
-| Always on top | ✅ | ✅ with a toggle |
-| Macro format | Proprietary binary | **Human-readable JSON** |
+| Playback counter | ❌ | ✅ live counter in UI |
+| Global hotkeys | Fixed (F8/F9 equivalent) | **F8 / F9** — work in any window, even in-game |
+| Always on top | ✅ | ✅ toggleable |
+| UI transparency | ❌ | ✅ **full window translucency** |
+| Settings persistence | ❌ — reconfigure every launch | ✅ **save-as-default** via `config.json` |
+| Macro format | Proprietary binary, prone to corruption | **Human-readable JSON**, editable by hand |
 | High-DPI / multi-monitor | So-so | Per-monitor DPI aware, absolute-mouse fix |
-| Size | ~40 KB | ~10 MB *(yes, bigger — it ships a modern GPU UI and 8 themes; the 960 MB `target/` folder stays on my machine, promise)* |
+| Code quality | ~17 years of closed Win32 C with known buffer-overrun bugs | ~1500 lines of auditable Rust, zero unsafe beyond FFI |
+| Size | ~40 KB | ~10 MB *(ships a modern GPU UI, 8 themes and 6 translations — the 960 MB `target/` folder stays on my machine, promise)* |
 | Price | Free | **Free forever** |
 
 ---
@@ -88,14 +95,16 @@ That weekend project got slightly out of hand. 🦀
 
 - 🔴 **Record** everything: mouse moves, clicks, wheel, X-buttons, keyboard
 - ▶ **Play back** with precise timing (`spin_sleep` + microsecond scheduling)
-- 🔁 **Loop** forever or **exactly N times**
+- 🔁 **Loop** forever, **exactly N times**, or **until a time limit**
+- ⏱ **Time limit**: stop after H hours / M minutes, with optional **auto-shutdown**
 - ⚡ **Speed control** 0.1× – 3.0×
 - ⌨ **Global hotkeys**: `F8` record, `F9` play — work over any window
 - 📌 **Always on Top** mode for gaming
-- ⏱ Recording timer & 🔁 play counter right in the UI
+- 🪟 **Transparent UI** — glass-through window via DWM per-pixel alpha
 - 🎨 **8 themes**: Dark, Material Design 3, Fluent (Mica), Catppuccin, Nord, Dracula, Glassmorphism (Acrylic), Neumorphism
-- 🌍 **EN / RU** interface with system auto-detection
-- 💾 Save / load macros as **JSON**
+- 🌍 **6 languages**: English, Русский, Українська, Português, Español, 中文 — auto-detected from system, overridable
+- 💾 **Save settings as default** — every future launch remembers your theme / language / hotkeys
+- 📦 Save / load macros as **human-readable JSON**
 
 ---
 
@@ -110,7 +119,14 @@ That weekend project got slightly out of hand. 🦀
 
 ## 📥 Download
 
-Grab the latest `MacroRecorder.exe` from the **[Releases](../../releases)** page. No installation needed.
+Grab the latest `.exe` from the **[Releases](../../releases)** page. No installation needed.
+
+Two builds are available:
+
+| File | Requires | Notes |
+|---|---|---|
+| `macro_recorder.exe` | Any x86-64 CPU | Universal — runs everywhere |
+| `macro_recorder_optimized.exe` | CPU with AVX2 (Intel Haswell 2013+ / AMD Ryzen+) | Faster, smaller binary |
 
 > ⚠️ **Antivirus note:** macro tools inject input, so some antiviruses may flag the unsigned exe as suspicious (false positive). This is normal for this kind of software — that's exactly why the source is open: feel free to build it yourself.
 
@@ -123,4 +139,12 @@ Grab the latest `MacroRecorder.exe` from the **[Releases](../../releases)** page
 # 2. Clone & build
 git clone https://github.com/blackixxce12/MacroRecorder.git
 cd MacroRecorder
+
+# Universal build
 cargo build --release
+
+# Optimized build (AVX2, ~5-20% faster on modern CPUs)
+# In CMD:
+set RUSTFLAGS=-C target-cpu=x86-64-v3 && cargo build --release
+# In PowerShell:
+$env:RUSTFLAGS="-C target-cpu=x86-64-v3"; cargo build --release
