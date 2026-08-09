@@ -506,7 +506,8 @@ fn make_visuals(p: &Palette, see_through: bool, force_transparent: bool) -> egui
     // Прозрачная клиентская область: сквозь UI виден Mica/Acrylic или рабочий стол
     if see_through || force_transparent {
         v.window_fill = egui::Color32::TRANSPARENT;
-        v.panel_fill = egui::Color32::from_rgba_unmultiplied(24, 24, 24, 180); // ~70% непрозрачности
+        // Более светлая полупрозрачная панель для лучшей видимости на размытом фоне
+        v.panel_fill = egui::Color32::from_rgba_unmultiplied(30, 30, 30, 140); // ~55% непрозрачности
         v.extreme_bg_color = egui::Color32::TRANSPARENT;
         let no_shadow = egui::Shadow {
             offset: [0, 0],
@@ -570,6 +571,7 @@ extern "system" {
 const WCA_ACCENT_POLICY: u32 = 19;
 const ACCENT_DISABLED: u32 = 0;
 const ACCENT_ENABLE_TRANSPARENTGRADIENT: u32 = 2;
+const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 3; // Настоящее размытие (Acrylic)
 
 fn set_window_pixel_alpha(enabled: bool) {
     unsafe {
@@ -580,14 +582,32 @@ fn set_window_pixel_alpha(enabled: bool) {
         if hwnd.is_invalid() {
             return;
         }
+
+        // Сначала включаем Mica/Acrylic через DWM для фона
+        // DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (для тёмной темы)
+        let dark_mode: i32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(20), // DWMWA_USE_IMMERSIVE_DARK_MODE
+            &dark_mode as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+
+        // Включаем Acrylic blur для настоящего размытия фона
         let mut accent = AccentPolicy {
             accent_state: if enabled {
-                ACCENT_ENABLE_TRANSPARENTGRADIENT
+                ACCENT_ENABLE_ACRYLICBLURBEHIND // Размытие вместо простого градиента
             } else {
                 ACCENT_DISABLED
             },
-            accent_flags: 0,
-            gradient_color: 0,
+            accent_flags: if enabled { 0x20 } else { 0 }, // ACCENT_FLAG_BLUR_REGION_BEHIND
+            gradient_color: if enabled {
+                // Полупрозрачный чёрный для лучшей видимости UI
+                // Формат: 0xAABBGGRR (little-endian)
+                0xC0000000
+            } else {
+                0
+            },
             animation_id: 0,
         };
         let mut data = WindowCompositionAttributeData {
@@ -1467,7 +1487,7 @@ impl eframe::App for MacroApp {
                         }
                     }
                 });
-                
+
                 if ui.button(s.save_settings).clicked() {
                     let cfg = Config {
                         default_lang: self.lang_mode,
