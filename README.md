@@ -81,7 +81,7 @@ That weekend project got slightly out of hand. 🦀
 | Playback counter | ❌ | ✅ live counter in UI |
 | Global hotkeys | Fixed (F8/F9 equivalent) | **F8 / F9** — work in any window, even in-game |
 | Always on top | ✅ | ✅ toggleable |
-| UI transparency | ❌ | ✅ **full window translucency** |
+| UI transparency | ❌ | ✅ **full window translucency** (not yet)|
 | Settings persistence | ❌ — reconfigure every launch | ✅ **save-as-default** via `config.json` |
 | Macro format | Proprietary binary, prone to corruption | **Human-readable JSON**, editable by hand |
 | High-DPI / multi-monitor | So-so | Per-monitor DPI aware, absolute-mouse fix |
