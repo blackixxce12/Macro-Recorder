@@ -74,14 +74,14 @@ That weekend project got slightly out of hand. 🦀
 | Languages | English only | **6 languages** (EN, RU, UK, PT, ES, ZH) + auto-detection |
 | Input capture | Mouse + keyboard | Mouse + keyboard + **wheel + X1/X2 buttons** |
 | Loop mode | Infinite **or** N times | Infinite, **N times, or timed** (hours + minutes) |
-| Timed playback | ❌ | ✅ stop after H hours M minutes |
+| Timed playback | ❌ | ✅ stop after H hours M minutes S seconds |
 | End action | ❌ | **Stop playback OR shut down the PC** |
 | Playback speed | Fixed | **0.1× – 3.0×** |
 | Recording timer | ❌ | ✅ live + final duration |
 | Playback counter | ❌ | ✅ live counter in UI |
 | Global hotkeys | Fixed (F8/F9 equivalent) | **F8 / F9** — work in any window, even in-game |
 | Always on top | ✅ | ✅ toggleable |
-| UI transparency | ❌ | ✅ **full window translucency** (not yet)|
+| UI transparency | ❌ | ✅ **full window translucency** |
 | Settings persistence | ❌ — reconfigure every launch | ✅ **save-as-default** via `config.json` |
 | Macro format | Proprietary binary, prone to corruption | **Human-readable JSON**, editable by hand |
 | High-DPI / multi-monitor | So-so | Per-monitor DPI aware, absolute-mouse fix |
