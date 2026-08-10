@@ -86,7 +86,7 @@ That weekend project got slightly out of hand. 🦀
 | Macro format | Proprietary binary, prone to corruption | **Human-readable JSON**, editable by hand |
 | High-DPI / multi-monitor | So-so | Per-monitor DPI aware, absolute-mouse fix |
 | Code quality | ~17 years of closed Win32 C with known buffer-overrun bugs | ~1500 lines of auditable Rust, zero unsafe beyond FFI |
-| Size | ~40 KB | ~10 MB *(ships a modern GPU UI, 8 themes and 6 translations — the 960 MB `target/` folder stays on my machine, promise)* |
+| Size | ~40 KB | ~5 MB *(ships a modern GPU UI, 8 themes and 6 translations)* |
 | Price | Free | **Free forever** |
 
 ---
