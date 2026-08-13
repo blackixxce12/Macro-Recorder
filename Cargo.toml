@@ -1,31 +1,44 @@
-# Cargo.toml
-
 [package]
 name = "macro-recorder"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.97.1"
 description = "A modern, DPI-aware macro recorder with native Windows 11 Mica/Acrylic, Virtual Desktop isolation, and secure shutdown"
 license = "MIT"
 
 [dependencies]
 # GUI & Serialization
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui = "0.36"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+flate2 = "1.1.9"
 
 # Concurrency & Timing
-crossbeam-channel = "0.5"
-parking_lot = "0.12"
-spin_sleep = "1.2"
+crossbeam-channel = "0.5.16"
+parking_lot = "0.12.5"
+spin_sleep = "1.3.3"
 
 # Error Handling & Logging
-anyhow = "1.0"
+anyhow = "1.0.104"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "std"] }
+tracing-appender = "0.2.5"
+
+# Utilities
+rfd = "0.17.2"
+
+# Removed vs the previous draft:
+#   bincode-next - the gzip+JSON path already gives ~20-40x compression while staying
+#                  hand-editable and diffable, which is a selling point of this project.
+#                  Swap point if you still want it: `save_macro` / `load_macro` in main.rs.
+#   rand         - the only randomness needed is playback jitter; main.rs ships a
+#                  12-line xorshift64* generator instead (deterministic and unit-tested).
 
 # Windows API Bindings
 [target.'cfg(windows)'.dependencies]
+known-folders = "1.3"   # moved here: this crate is Windows-only
+windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
@@ -38,10 +51,13 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Globalization",
-    "Win32_System_Shutdown",      # Для InitiateSystemShutdownExW
-    "Win32_Security",             # Для AdjustTokenPrivileges (SeShutdownPrivilege)
-    "Win32_UI_Shell",             # Для IVirtualDesktopManager
-    "Win32_System_Com",           # Для CoInitializeEx, CoCreateInstance
+    "Win32_System_Shutdown",
+    "Win32_Security",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_System_Power",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
 ] }
 
 [profile.release]
@@ -49,4 +65,8 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+# B7: panic = "abort" is kept for size and predictability. catch_unwind is useless under
+# abort, so it was removed from the hook callbacks entirely; those paths are now written
+# to be panic-free (null-pointer guards, no unwrap, no slice indexing).
 panic = "abort"
+
