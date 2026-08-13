@@ -1,3 +1,5 @@
+// main.rs
+
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::Result;
@@ -23,6 +25,51 @@ mod win32 {
     pub use windows::Win32::UI::Input::KeyboardAndMouse::*;
     pub use windows::Win32::UI::WindowsAndMessaging::*;
     pub use windows::Win32::Globalization::GetUserDefaultUILanguage;
+    
+    pub use windows::Win32::System::Shutdown::*;
+    pub use windows::Win32::Security::*;
+    pub use windows::Win32::System::Threading::*;
+    pub use windows::Win32::UI::Shell::*;
+    pub use windows::Win32::System::Com::*;
+}
+
+// ============================================================================
+// Virtual Desktop Isolation (Windows 11)
+// ============================================================================
+
+#[cfg(windows)]
+mod virtual_desktop {
+    use super::win32::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static VDM: RefCell<Option<IVirtualDesktopManager>> = const { RefCell::new(None) };
+    }
+
+    pub fn init_thread() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if let Ok(vdm) = CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_ALL) {
+                VDM.with(|v| *v.borrow_mut() = Some(vdm));
+            }
+        }
+    }
+
+    pub fn is_app_on_active_desktop(hwnd: HWND) -> bool {
+        VDM.with(|v| {
+            if let Some(vdm) = v.borrow().as_ref() {
+                unsafe { vdm.IsWindowOnCurrentVirtualDesktop(hwnd).unwrap_or_default().as_bool() }
+            } else {
+                true 
+            }
+        })
+    }
+}
+
+#[cfg(not(windows))]
+mod virtual_desktop {
+    pub fn init_thread() {}
+    pub fn is_app_on_active_desktop(_: ()) -> bool { true }
 }
 
 // ============================================================================
@@ -49,19 +96,10 @@ struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            default_lang: 0,
-            default_theme: 0,
-            transparent_ui: true,
-            time_limit_enabled: false,
-            time_limit_h: 0,
-            time_limit_m: 0,
-            time_limit_s: 0,
-            action_on_completion: 0,
-            loop_play: true,
-            play_count_limit: 1,
-            speed: 1.0,
-            absolute_mouse: true,
-            always_on_top: true,
+            default_lang: 0, default_theme: 0, transparent_ui: true,
+            time_limit_enabled: false, time_limit_h: 0, time_limit_m: 0, time_limit_s: 0,
+            action_on_completion: 0, loop_play: true, play_count_limit: 1,
+            speed: 1.0, absolute_mouse: true, always_on_top: true,
         }
     }
 }
@@ -131,49 +169,36 @@ struct AppState {
 impl AppState {
     fn new(tx: Sender<MacroEvent>) -> Arc<Self> {
         Arc::new(Self {
-            recording: AtomicBool::new(false),
-            playing: AtomicBool::new(false),
-            stop_play: AtomicBool::new(false),
-            loop_play: AtomicBool::new(true),
-            absolute_mouse: AtomicBool::new(true),
-            rec_start_us: AtomicU64::new(0),
-            last_move_us: AtomicU64::new(0),
-            recorded_time_us: AtomicU64::new(0),
-            play_count: AtomicU64::new(0),
-            play_count_limit: AtomicU64::new(1),
-            time_limit_enabled: AtomicBool::new(false),
-            time_limit_us: AtomicU64::new(0),
-            action_on_completion: AtomicU64::new(0),
-            speed: Mutex::new(1.0),
-            last_x: Mutex::new(i32::MIN),
-            last_y: Mutex::new(i32::MIN),
-            macro_data: Mutex::new(Vec::new()),
-            event_tx: Some(tx),
+            recording: AtomicBool::new(false), playing: AtomicBool::new(false),
+            stop_play: AtomicBool::new(false), loop_play: AtomicBool::new(true),
+            absolute_mouse: AtomicBool::new(true), rec_start_us: AtomicU64::new(0),
+            last_move_us: AtomicU64::new(0), recorded_time_us: AtomicU64::new(0),
+            play_count: AtomicU64::new(0), play_count_limit: AtomicU64::new(1),
+            time_limit_enabled: AtomicBool::new(false), time_limit_us: AtomicU64::new(0),
+            action_on_completion: AtomicU64::new(0), speed: Mutex::new(1.0),
+            last_x: Mutex::new(i32::MIN), last_y: Mutex::new(i32::MIN),
+            macro_data: Mutex::new(Vec::new()), event_tx: Some(tx),
         })
     }
 }
 
 static EPOCH: OnceLock<Instant> = OnceLock::new();
-
 fn init_epoch() { EPOCH.set(Instant::now()).ok(); }
-
-fn now_us() -> u64 {
-    EPOCH.get().map(|e| e.elapsed().as_micros() as u64).unwrap_or(0)
-}
-
+fn now_us() -> u64 { EPOCH.get().map(|e| e.elapsed().as_micros() as u64).unwrap_or(0) }
 fn current_rec_time_us(state: &AppState) -> u64 {
     let start = state.rec_start_us.load(Ordering::Relaxed);
     now_us().saturating_sub(start)
 }
 
 // ============================================================================
-// Modern Windows Backdrop & DPI Management
+// Modern Windows Backdrop, DPI & Secure Shutdown
 // ============================================================================
 
 #[cfg(windows)]
 mod platform {
     use super::win32::*;
     use std::ffi::c_void;
+    use windows::core::PCWSTR;
 
     pub fn apply_system_backdrop(hwnd: HWND, use_acrylic: bool) {
         unsafe {
@@ -182,19 +207,15 @@ mod platform {
                 hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                 &dark_mode as *const i32 as *const c_void, std::mem::size_of::<i32>() as u32,
             );
-
             let backdrop_type: i32 = if use_acrylic { 3 } else { 2 };
             let result = DwmSetWindowAttribute(
-                hwnd, DWMWINDOWATTRIBUTE(38), // DWMWA_SYSTEMBACKDROP_TYPE
+                hwnd, DWMWINDOWATTRIBUTE(38),
                 &backdrop_type as *const i32 as *const c_void, std::mem::size_of::<i32>() as u32,
             );
-
             if result.is_err() {
                 let bb = DWM_BLURBEHIND {
-                    dwFlags: DWM_BB_ENABLE,
-                    fEnable: true.into(),
-                    hRgnBlur: HRGN::default(),
-                    fTransitionOnMaximized: false.into(),
+                    dwFlags: DWM_BB_ENABLE, fEnable: true.into(),
+                    hRgnBlur: HRGN::default(), fTransitionOnMaximized: false.into(),
                 };
                 let _ = DwmEnableBlurBehindWindow(hwnd, &bb);
             }
@@ -207,10 +228,8 @@ mod platform {
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
             let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
-
             let nx = ((x - vx) as f64 / vw as f64 * 65535.0).round() as i32;
             let ny = ((y - vy) as f64 / vh as f64 * 65535.0).round() as i32;
-
             let input = INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {
@@ -229,10 +248,38 @@ mod platform {
     pub fn end_high_res_timer() { unsafe { let _ = timeEndPeriod(1); } }
 
     pub fn initiate_system_shutdown(reason: &str) -> anyhow::Result<()> {
-        std::process::Command::new("shutdown")
-            .args(["/s", "/t", "60", "/c", reason])
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn shutdown command: {}", e))?;
+        unsafe {
+            let mut h_token = HANDLE::default();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut h_token).is_ok() {
+                let mut luid = LUID::default();
+                if LookupPrivilegeValueW(None, w!("SeShutdownPrivilege"), &mut luid).is_ok() {
+                    let mut tp = TOKEN_PRIVILEGES {
+                        PrivilegeCount: 1,
+                        Privileges: [LUID_AND_ATTRIBUTES {
+                            Luid: luid,
+                            Attributes: SE_PRIVILEGE_ENABLED,
+                        }],
+                    };
+                    let _ = AdjustTokenPrivileges(h_token, false, Some(&mut tp), 0, None, None);
+                }
+                let _ = CloseHandle(h_token);
+            }
+
+            let reason_wide: Vec<u16> = reason.encode_utf16().chain(std::iter::once(0)).collect();
+            
+            let res = InitiateSystemShutdownExW(
+                PCWSTR(std::ptr::null()),          
+                PCWSTR(reason_wide.as_ptr()),      
+                60,                                
+                true.into(),                       
+                false.into(),                      
+                SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED,
+            );
+            
+            if res.is_err() {
+                return Err(anyhow::anyhow!("Failed to initiate shutdown via API"));
+            }
+        }
         Ok(())
     }
 }
@@ -254,6 +301,9 @@ mod platform {
 
 fn playback_loop(state: Arc<AppState>, events: Vec<MacroEvent>) {
     if events.is_empty() { return; }
+    
+    #[cfg(windows)]
+    virtual_desktop::init_thread();
 
     platform::begin_high_res_timer();
 
@@ -270,7 +320,16 @@ fn playback_loop(state: Arc<AppState>, events: Vec<MacroEvent>) {
     let mut index: usize = 0;
     let mut count: u64 = 0;
 
+    #[cfg(windows)]
+    let app_hwnd = unsafe { win32::FindWindowW(None, win32::w!("Macro Recorder")).unwrap_or_default() };
+
     while !state.stop_play.load(Ordering::Relaxed) {
+        #[cfg(windows)]
+        if !virtual_desktop::is_app_on_active_desktop(app_hwnd) {
+            std::thread::sleep(Duration::from_millis(100));
+            continue; 
+        }
+
         if state.time_limit_enabled.load(Ordering::Relaxed) {
             let limit = state.time_limit_us.load(Ordering::Relaxed);
             if start.elapsed().as_micros() as u64 >= limit {
@@ -379,16 +438,17 @@ unsafe fn send_input_event(kind: &InputEventKind, state: &AppState) {
 }
 
 // ============================================================================
-// Input Hook Thread (with panic safety)
+// Input Hook Thread 
 // ============================================================================
 
 #[cfg(windows)]
 fn input_hook_thread(state: Arc<AppState>) {
     use win32::*;
+    
+    virtual_desktop::init_thread();
 
     unsafe {
         let hmod = GetModuleHandleW(None).map(|h| HINSTANCE(h.0)).unwrap_or_default();
-
         let kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_proc), Some(hmod), 0);
         let ms_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ms_proc), Some(hmod), 0);
 
@@ -399,7 +459,7 @@ fn input_hook_thread(state: Arc<AppState>) {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.message == 0x0312 { // WM_HOTKEY
+            if msg.message == 0x0312 {
                 match msg.wParam.0 as i32 {
                     1 => toggle_recording(&state),
                     2 => toggle_playback(&state),
@@ -419,90 +479,111 @@ fn input_hook_thread(state: Arc<AppState>) {
 
     #[cfg(windows)]
     unsafe extern "system" fn kb_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-        std::panic::catch_unwind(|| {
-            if code == 0 {
-                HOOK_STATE.with(|s| {
-                    if let Some(ref state) = *s.borrow() {
-                        if state.recording.load(Ordering::Relaxed) {
-                            unsafe {
-                                let data = &*(lp.0 as *const KBDLLHOOKSTRUCT);
-                                if data.flags.0 & LLKHF_INJECTED.0 == 0 {
-                                    let wm = wp.0 as u32;
-                                    let (down, valid) = match wm {
-                                        0x0100 | 0x0104 => (true, true),
-                                        0x0101 | 0x0105 => (false, true),
-                                        _ => (false, false),
-                                    };
-                                    if valid {
-                                        emit_event(state, InputEventKind::Key {
-                                            vk: data.vkCode as u16,
-                                            scan: data.scanCode as u16,
-                                            down,
-                                            extended: data.flags.0 & LLKHF_EXTENDED.0 != 0,
-                                        });
+        if code == 0 {
+            let mut should_record = false;
+            HOOK_STATE.with(|s| {
+                if let Some(ref state) = *s.borrow() {
+                    if state.recording.load(Ordering::Relaxed) {
+                        should_record = true;
+                    }
+                }
+            });
+
+            if should_record {
+                let hwnd = unsafe { win32::FindWindowW(None, win32::w!("Macro Recorder")).unwrap_or_default() };
+                if virtual_desktop::is_app_on_active_desktop(hwnd) {
+                    std::panic::catch_unwind(|| {
+                        HOOK_STATE.with(|s| {
+                            if let Some(ref state) = *s.borrow() {
+                                unsafe {
+                                    let data = &*(lp.0 as *const KBDLLHOOKSTRUCT);
+                                    if data.flags.0 & LLKHF_INJECTED.0 == 0 {
+                                        let wm = wp.0 as u32;
+                                        let (down, valid) = match wm {
+                                            0x0100 | 0x0104 => (true, true),
+                                            0x0101 | 0x0105 => (false, true),
+                                            _ => (false, false),
+                                        };
+                                        if valid {
+                                            emit_event(state, InputEventKind::Key {
+                                                vk: data.vkCode as u16, scan: data.scanCode as u16,
+                                                down, extended: data.flags.0 & LLKHF_EXTENDED.0 != 0,
+                                            });
+                                        }
                                     }
                                 }
                             }
-                        }
-                    }
-                });
+                        });
+                    }).ok();
+                }
             }
-        }).ok();
+        }
         unsafe { CallNextHookEx(None, code, wp, lp) }
     }
 
     #[cfg(windows)]
     unsafe extern "system" fn ms_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-        std::panic::catch_unwind(|| {
-            if code == 0 {
-                HOOK_STATE.with(|s| {
-                    if let Some(ref state) = *s.borrow() {
-                        if state.recording.load(Ordering::Relaxed) {
-                            unsafe {
-                                let data = &*(lp.0 as *const MSLLHOOKSTRUCT);
-                                if data.flags & LLMHF_INJECTED == 0 {
-                                    let x = data.pt.x;
-                                    let y = data.pt.y;
-                                    let wm = wp.0 as u32;
+        if code == 0 {
+            let mut should_record = false;
+            HOOK_STATE.with(|s| {
+                if let Some(ref state) = *s.borrow() {
+                    if state.recording.load(Ordering::Relaxed) {
+                        should_record = true;
+                    }
+                }
+            });
 
-                                    let kind = match wm {
-                                        0x0200 => { // WM_MOUSEMOVE
-                                            let now = current_rec_time_us(state);
-                                            let last = state.last_move_us.load(Ordering::Relaxed);
-                                            if last == 0 || now.saturating_sub(last) >= 5000 {
-                                                state.last_move_us.store(now, Ordering::Relaxed);
-                                                let mut lx = state.last_x.lock();
-                                                let mut ly = state.last_y.lock();
-                                                let (dx, dy) = if *lx == i32::MIN { (0, 0) } else { (x - *lx, y - *ly) };
-                                                *lx = x; *ly = y;
-                                                Some(InputEventKind::MouseMove { x, y, dx, dy })
-                                            } else { None }
-                                        }
-                                        0x0201 => Some(InputEventKind::MouseButton { button: MouseButton::Left, down: true, x, y }),
-                                        0x0202 => Some(InputEventKind::MouseButton { button: MouseButton::Left, down: false, x, y }),
-                                        0x0204 => Some(InputEventKind::MouseButton { button: MouseButton::Right, down: true, x, y }),
-                                        0x0205 => Some(InputEventKind::MouseButton { button: MouseButton::Right, down: false, x, y }),
-                                        0x0207 => Some(InputEventKind::MouseButton { button: MouseButton::Middle, down: true, x, y }),
-                                        0x0208 => Some(InputEventKind::MouseButton { button: MouseButton::Middle, down: false, x, y }),
-                                        0x020A => {
-                                            let delta = ((data.mouseData >> 16) & 0xFFFF) as i16 as i32;
-                                            Some(InputEventKind::MouseWheel { delta, x, y, horizontal: false })
-                                        }
-                                        0x020E => {
-                                            let delta = ((data.mouseData >> 16) & 0xFFFF) as i16 as i32;
-                                            Some(InputEventKind::MouseWheel { delta, x, y, horizontal: true })
-                                        }
-                                        _ => None,
-                                    };
+            if should_record {
+                let hwnd = unsafe { win32::FindWindowW(None, win32::w!("Macro Recorder")).unwrap_or_default() };
+                if virtual_desktop::is_app_on_active_desktop(hwnd) {
+                    std::panic::catch_unwind(|| {
+                        HOOK_STATE.with(|s| {
+                            if let Some(ref state) = *s.borrow() {
+                                unsafe {
+                                    let data = &*(lp.0 as *const MSLLHOOKSTRUCT);
+                                    if data.flags & LLMHF_INJECTED == 0 {
+                                        let x = data.pt.x;
+                                        let y = data.pt.y;
+                                        let wm = wp.0 as u32;
 
-                                    if let Some(k) = kind { emit_event(state, k); }
+                                        let kind = match wm {
+                                            0x0200 => {
+                                                let now = current_rec_time_us(state);
+                                                let last = state.last_move_us.load(Ordering::Relaxed);
+                                                if last == 0 || now.saturating_sub(last) >= 5000 {
+                                                    state.last_move_us.store(now, Ordering::Relaxed);
+                                                    let mut lx = state.last_x.lock();
+                                                    let mut ly = state.last_y.lock();
+                                                    let (dx, dy) = if *lx == i32::MIN { (0, 0) } else { (x - *lx, y - *ly) };
+                                                    *lx = x; *ly = y;
+                                                    Some(InputEventKind::MouseMove { x, y, dx, dy })
+                                                } else { None }
+                                            }
+                                            0x0201 => Some(InputEventKind::MouseButton { button: MouseButton::Left, down: true, x, y }),
+                                            0x0202 => Some(InputEventKind::MouseButton { button: MouseButton::Left, down: false, x, y }),
+                                            0x0204 => Some(InputEventKind::MouseButton { button: MouseButton::Right, down: true, x, y }),
+                                            0x0205 => Some(InputEventKind::MouseButton { button: MouseButton::Right, down: false, x, y }),
+                                            0x0207 => Some(InputEventKind::MouseButton { button: MouseButton::Middle, down: true, x, y }),
+                                            0x0208 => Some(InputEventKind::MouseButton { button: MouseButton::Middle, down: false, x, y }),
+                                            0x020A => {
+                                                let delta = ((data.mouseData >> 16) & 0xFFFF) as i16 as i32;
+                                                Some(InputEventKind::MouseWheel { delta, x, y, horizontal: false })
+                                            }
+                                            0x020E => {
+                                                let delta = ((data.mouseData >> 16) & 0xFFFF) as i16 as i32;
+                                                Some(InputEventKind::MouseWheel { delta, x, y, horizontal: true })
+                                            }
+                                            _ => None,
+                                        };
+                                        if let Some(k) = kind { emit_event(state, k); }
+                                    }
                                 }
                             }
-                        }
-                    }
-                });
+                        });
+                    }).ok();
+                }
             }
-        }).ok();
+        }
         unsafe { CallNextHookEx(None, code, wp, lp) }
     }
 }
@@ -515,9 +596,7 @@ std::thread_local! {
 fn emit_event(state: &AppState, kind: InputEventKind) {
     let t_us = current_rec_time_us(state);
     let event = MacroEvent { t_us, kind };
-    if let Some(ref tx) = state.event_tx {
-        let _ = tx.send(event);
-    }
+    if let Some(ref tx) = state.event_tx { let _ = tx.send(event); }
 }
 
 fn toggle_recording(state: &Arc<AppState>) {
@@ -563,7 +642,7 @@ fn collector_thread(rx: Receiver<MacroEvent>, state: Arc<AppState>) {
 }
 
 // ============================================================================
-// Localization
+// Localization & Strings
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq)]
@@ -612,6 +691,66 @@ const RU: Strings = Strings {
     save_settings: "💾 Сохранить настройки", settings_saved: "Настройки сохранены!", transparent_ui: "🪟 Прозрачный интерфейс",
 };
 
+const UK: Strings = Strings {
+    record: "🔴 Запис (F8)", stop_rec: "⏹ Зупинити запис", play: "▶ Відтворити (F9)", stop_play: "⏹ Зупинити",
+    rec_time: "⏱ Запис: {}…", rec_done: "⏱ Записано: {} (готово)", play_inf: "🔄 Відтворень: {} (∞)",
+    play_lim: "🔄 Відтворень: {} / {}", loop_cb: "Циклічне відтворення", play_count: "Кількість відтворень:",
+    speed: "Швидкість", abs_mouse: "Абсолютна миша (фікс DPI)", on_top: "📌 Завжди поверх вікон",
+    theme: "Тема:", language: "Мова:", lang_auto: "Авто (система)",
+    save: "💾 Зберегти", load: "📂 Завантажити", events: "📦 Подій: {}",
+    status_ready: "Готово [F8: запис | F9: плей]", status_rec: "Запис... [F8 — стоп]",
+    status_play: "Відтворення... [F9 — стоп]", saved: "Збережено в macro.json", loaded: "Завантажено з macro.json",
+    save_err: "Помилка збереження: {}", load_err: "Помилка завантаження: {}",
+    time_limit_cb: "⏱ Зупинити за таймером", time_limit_h: "Години", time_limit_m: "Хвилини", time_limit_s: "Секунди",
+    action_on_limit: "Дія за таймером:", action_stop: "Зупинити", action_shutdown: "Вимкнути систему",
+    save_settings: "💾 Зберегти налаштування", settings_saved: "Налаштування збережено!", transparent_ui: "🪟 Прозорий інтерфейс",
+};
+
+const PT: Strings = Strings {
+    record: "🔴 Gravar (F8)", stop_rec: "⏹ Parar Grav", play: "▶ Tocar (F9)", stop_play: "⏹ Parar Toc",
+    rec_time: "⏱ Gravando: {}…", rec_done: "⏱ Gravado: {} (pronto)", play_inf: "🔄 Reproduções: {} (∞)",
+    play_lim: "🔄 Reproduções: {} / {}", loop_cb: "Reprodução em loop", play_count: "Contagem:",
+    speed: "Velocidade", abs_mouse: "Mouse absoluto (fix DPI)", on_top: "📌 Sempre no topo",
+    theme: "Tema:", language: "Idioma:", lang_auto: "Auto (sistema)",
+    save: "💾 Salvar", load: "📂 Carregar", events: "📦 Eventos: {}",
+    status_ready: "Pronto [F8: Gravar | F9: Tocar]", status_rec: "Gravando... [F8 parar]",
+    status_play: "Tocando... [F9 parar]", saved: "Salvo em macro.json", loaded: "macro.json carregado",
+    save_err: "Erro ao salvar: {}", load_err: "Erro ao carregar: {}",
+    time_limit_cb: "⏱ Parar após limite", time_limit_h: "Horas", time_limit_m: "Minutos", time_limit_s: "Segundos",
+    action_on_limit: "Ação no limite:", action_stop: "Parar reprodução", action_shutdown: "Desligar sistema",
+    save_settings: "💾 Salvar configurações", settings_saved: "Configurações salvas!", transparent_ui: "🪟 Interface transparente",
+};
+
+const ES: Strings = Strings {
+    record: "🔴 Grabar (F8)", stop_rec: "⏹ Detener Grab", play: "▶ Repr. (F9)", stop_play: "⏹ Detener Repr",
+    rec_time: "⏱ Grabando: {}…", rec_done: "⏱ Grabado: {} (listo)", play_inf: "🔄 Reproducciones: {} (∞)",
+    play_lim: "🔄 Reproducciones: {} / {}", loop_cb: "Reproducción en bucle", play_count: "Conteo:",
+    speed: "Velocidad", abs_mouse: "Ratón absoluto (fijo DPI)", on_top: "📌 Siempre encima",
+    theme: "Tema:", language: "Idioma:", lang_auto: "Auto (sistema)",
+    save: "💾 Guardar", load: "📂 Cargar", events: "📦 Eventos: {}",
+    status_ready: "Listo [F8: Grabar | F9: Repr]", status_rec: "Grabando... [F8 detener]",
+    status_play: "Reproduciendo... [F9 detener]", saved: "Guardado en macro.json", loaded: "macro.json cargado",
+    save_err: "Error al guardar: {}", load_err: "Error al cargar: {}",
+    time_limit_cb: "⏱ Detener tras límite", time_limit_h: "Horas", time_limit_m: "Minutos", time_limit_s: "Segundos",
+    action_on_limit: "Acción al límite:", action_stop: "Detener reproducción", action_shutdown: "Apagar sistema",
+    save_settings: "💾 Guardar ajustes", settings_saved: "¡Ajustes guardados!", transparent_ui: "🪟 Interfaz transparente",
+};
+
+const ZH: Strings = Strings {
+    record: "🔴 录制 (F8)", stop_rec: "⏹ 停止录制", play: "▶ 播放 (F9)", stop_play: "⏹ 停止播放",
+    rec_time: "⏱ 录制中: {}…", rec_done: "⏱ 已录制: {} (完成)", play_inf: "🔄 播放次数: {} (∞)",
+    play_lim: "🔄 播放次数: {} / {}", loop_cb: "循环播放", play_count: "播放次数:",
+    speed: "速度", abs_mouse: "绝对鼠标 (修复DPI)", on_top: "📌 始终置顶",
+    theme: "主题:", language: "语言:", lang_auto: "自动 (系统)",
+    save: "💾 保存", load: "📂 加载", events: "📦 事件: {}",
+    status_ready: "就绪 [F8: 录制 | F9: 播放]", status_rec: "录制中... [F8 停止]",
+    status_play: "播放中... [F9 停止]", saved: "已保存至 macro.json", loaded: "已加载 macro.json",
+    save_err: "保存错误: {}", load_err: "加载错误: {}",
+    time_limit_cb: "⏱ 到达时限后停止", time_limit_h: "小时", time_limit_m: "分钟", time_limit_s: "秒",
+    action_on_limit: "到达时限操作:", action_stop: "停止播放", action_shutdown: "关闭系统",
+    save_settings: "💾 保存设置", settings_saved: "设置已保存!", transparent_ui: "🪟 透明界面",
+};
+
 fn detect_system_lang() -> Lang {
     #[cfg(windows)]
     unsafe {
@@ -621,24 +760,26 @@ fn detect_system_lang() -> Lang {
             0x0A => Lang::Es, 0x04 => Lang::Zh, _ => Lang::En,
         }
     }
-    #[cfg(not(windows))]
-    Lang::En
+    #[cfg(not(windows))] Lang::En
 }
 
 fn get_strings(lang_mode: usize, system_lang: Lang) -> &'static Strings {
     let lang = match lang_mode {
         1 => Lang::En, 2 => Lang::Ru, 3 => Lang::Uk,
-        4 => Lang::Pt, 5 => Lang::Es, 6 => Lang::Zh,
-        _ => system_lang,
+        4 => Lang::Pt, 5 => Lang::Es, 6 => Lang::Zh, _ => system_lang,
     };
     match lang {
         Lang::Ru => &RU,
+        Lang::Uk => &UK,
+        Lang::Pt => &PT,
+        Lang::Es => &ES,
+        Lang::Zh => &ZH,
         _ => &EN,
     }
 }
 
 // ============================================================================
-// Theme System
+// Theme System 
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq)]
@@ -650,27 +791,12 @@ const THEME_NAMES: [&str; 8] = [
 ];
 
 struct Palette {
-    dark: bool,
-    bg: egui::Color32,
-    panel: egui::Color32,
-    widget: egui::Color32,
-    widget_hover: egui::Color32,
-    widget_active: egui::Color32,
-    active_fg: egui::Color32,
-    border: egui::Color32,
-    hover_border: egui::Color32,
-    text: egui::Color32,
-    faint: egui::Color32,
-    accent: egui::Color32,
-    accent_text: egui::Color32,
-    widget_round: f32,
-    shadow_blur: u8,
-    shadow_offset: i8,
-    shadow_alpha: u8,
-    item_spacing_y: f32,
-    button_padding: f32,
-    animation_time: f32,
-    backdrop: i32,
+    dark: bool, bg: egui::Color32, panel: egui::Color32, widget: egui::Color32,
+    widget_hover: egui::Color32, widget_active: egui::Color32, active_fg: egui::Color32,
+    border: egui::Color32, hover_border: egui::Color32, text: egui::Color32, faint: egui::Color32,
+    accent: egui::Color32, focus_border: egui::Color32, 
+    widget_round: f32, shadow_blur: u8, shadow_offset: i8, shadow_alpha: u8,
+    item_spacing_y: f32, button_padding: f32, animation_time: f32, backdrop: i32,
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 { egui::Color32::from_rgb(r, g, b) }
@@ -682,22 +808,14 @@ fn get_system_accent_color() -> Option<egui::Color32> {
     unsafe {
         let mut key = HKEY::default();
         let path = windows::core::w!("Software\\Microsoft\\Windows\\DWM");
-        // FIX: windows 0.62 changed ulOptions to Option<u32>
         let res = RegOpenKeyExW(HKEY_CURRENT_USER, path, Some(0), KEY_READ, &mut key);
         if res.is_err() { return None; }
-
         let mut data: u32 = 0;
         let mut size: u32 = std::mem::size_of::<u32>() as u32;
         let value_name = windows::core::w!("AccentColor");
-        let res = RegQueryValueExW(
-            key, value_name, None, None,
-            Some(&mut data as *mut u32 as *mut u8),
-            Some(&mut size),
-        );
+        let res = RegQueryValueExW(key, value_name, None, None, Some(&mut data as *mut u32 as *mut u8), Some(&mut size));
         let _ = RegCloseKey(key);
-
         if res.is_ok() {
-            // Windows stores DWORD colors in 0xAABBGGRR format
             let r = (data & 0xFF) as u8;
             let g = ((data >> 8) & 0xFF) as u8;
             let b = ((data >> 16) & 0xFF) as u8;
@@ -706,59 +824,47 @@ fn get_system_accent_color() -> Option<egui::Color32> {
         None
     }
 }
-
-#[cfg(not(windows))]
-fn get_system_accent_color() -> Option<egui::Color32> { None }
+#[cfg(not(windows))] fn get_system_accent_color() -> Option<egui::Color32> { None }
 
 fn get_palette(theme: Theme) -> Palette {
     match theme {
         Theme::Dark => Palette {
-            dark: true, bg: rgb(16, 16, 16), panel: rgb(24, 24, 24), widget: rgb(42, 42, 42), widget_hover: rgb(58, 58, 58), widget_active: rgb(75, 75, 75), active_fg: rgb(255, 255, 255), border: rgb(70, 70, 70), hover_border: rgb(95, 95, 95), text: rgb(230, 230, 230), faint: rgb(130, 130, 130), accent: rgb(70, 130, 255), accent_text: rgb(255, 255, 255), widget_round: 4.0, shadow_blur: 4, shadow_offset: 1, shadow_alpha: 60, item_spacing_y: 5.0, button_padding: 3.0, animation_time: 0.15, backdrop: 1,
+            dark: true, bg: rgb(16, 16, 16), panel: rgb(24, 24, 24), widget: rgb(42, 42, 42), widget_hover: rgb(58, 58, 58), widget_active: rgb(75, 75, 75), active_fg: rgb(255, 255, 255), border: rgb(70, 70, 70), hover_border: rgb(95, 95, 95), text: rgb(230, 230, 230), faint: rgb(130, 130, 130), accent: rgb(70, 130, 255), focus_border: rgb(0, 200, 255), widget_round: 4.0, shadow_blur: 4, shadow_offset: 1, shadow_alpha: 60, item_spacing_y: 5.0, button_padding: 3.0, animation_time: 0.15, backdrop: 1,
         },
         Theme::OLED => Palette {
-            dark: true, bg: rgb(0, 0, 0), panel: rgb(0, 0, 0), widget: rgb(20, 20, 20), widget_hover: rgb(35, 35, 35), widget_active: rgb(50, 50, 50), active_fg: rgb(255, 255, 255), border: rgb(40, 40, 40), hover_border: rgb(80, 80, 80), text: rgb(240, 240, 240), faint: rgb(120, 120, 120), accent: rgb(0, 122, 204), accent_text: rgb(255, 255, 255), widget_round: 2.0, shadow_blur: 0, shadow_offset: 0, shadow_alpha: 0, item_spacing_y: 5.0, button_padding: 3.0, animation_time: 0.1, backdrop: 1,
+            dark: true, bg: rgb(0, 0, 0), panel: rgb(0, 0, 0), widget: rgb(20, 20, 20), widget_hover: rgb(35, 35, 35), widget_active: rgb(50, 50, 50), active_fg: rgb(255, 255, 255), border: rgb(40, 40, 40), hover_border: rgb(80, 80, 80), text: rgb(240, 240, 240), faint: rgb(120, 120, 120), accent: rgb(0, 122, 204), focus_border: rgb(0, 255, 255), widget_round: 2.0, shadow_blur: 0, shadow_offset: 0, shadow_alpha: 0, item_spacing_y: 5.0, button_padding: 3.0, animation_time: 0.1, backdrop: 1,
         },
         Theme::Material3 => {
             let sys_accent = get_system_accent_color().unwrap_or_else(|| rgb(208, 188, 255));
             Palette {
-                dark: true, bg: rgb(18, 17, 24), panel: rgb(18, 17, 24), widget: rgb(56, 48, 75), widget_hover: rgb(70, 60, 92), widget_active: sys_accent, active_fg: rgb(255, 255, 255), border: rgb(73, 69, 82), hover_border: sys_accent, text: rgb(230, 224, 233), faint: rgb(147, 143, 153), accent: sys_accent, accent_text: rgb(255, 255, 255), widget_round: 20.0, shadow_blur: 8, shadow_offset: 2, shadow_alpha: 80, item_spacing_y: 7.0, button_padding: 6.0, animation_time: 0.4, backdrop: 1,
+                dark: true, bg: rgb(18, 17, 24), panel: rgb(24, 23, 31), widget: rgb(32, 31, 42), widget_hover: rgb(40, 39, 52), widget_active: sys_accent, active_fg: rgb(255, 255, 255), border: rgb(73, 69, 82), hover_border: sys_accent, text: rgb(230, 224, 233), faint: rgb(147, 143, 153), accent: sys_accent, focus_border: rgb(255, 255, 0), widget_round: 20.0, shadow_blur: 0, shadow_offset: 0, shadow_alpha: 0, item_spacing_y: 7.0, button_padding: 6.0, animation_time: 0.4, backdrop: 1,
             }
         },
         Theme::Catppuccin => Palette {
-            dark: true, bg: rgb(17, 17, 27), panel: rgb(30, 30, 46), widget: rgb(49, 50, 68), widget_hover: rgb(69, 71, 90), widget_active: rgb(203, 166, 247), active_fg: rgb(17, 17, 27), border: rgb(88, 91, 112), hover_border: rgb(203, 166, 247), text: rgb(205, 214, 244), faint: rgb(166, 172, 200), accent: rgb(203, 166, 247), accent_text: rgb(17, 17, 27), widget_round: 10.0, shadow_blur: 6, shadow_offset: 2, shadow_alpha: 90, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.25, backdrop: 1,
+            dark: true, bg: rgb(17, 17, 27), panel: rgb(30, 30, 46), widget: rgb(49, 50, 68), widget_hover: rgb(69, 71, 90), widget_active: rgb(203, 166, 247), active_fg: rgb(17, 17, 27), border: rgb(88, 91, 112), hover_border: rgb(203, 166, 247), text: rgb(205, 214, 244), faint: rgb(166, 172, 200), accent: rgb(203, 166, 247), focus_border: rgb(250, 178, 102), widget_round: 10.0, shadow_blur: 6, shadow_offset: 2, shadow_alpha: 90, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.25, backdrop: 1,
         },
         Theme::Nord => Palette {
-            dark: true, bg: rgb(46, 52, 64), panel: rgb(46, 52, 64), widget: rgb(59, 66, 82), widget_hover: rgb(67, 76, 94), widget_active: rgb(136, 192, 208), active_fg: rgb(46, 52, 64), border: rgb(76, 86, 106), hover_border: rgb(136, 192, 208), text: rgb(216, 222, 233), faint: rgb(148, 155, 168), accent: rgb(136, 192, 208), accent_text: rgb(46, 52, 64), widget_round: 6.0, shadow_blur: 5, shadow_offset: 1, shadow_alpha: 80, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.2, backdrop: 1,
+            dark: true, bg: rgb(46, 52, 64), panel: rgb(46, 52, 64), widget: rgb(59, 66, 82), widget_hover: rgb(67, 76, 94), widget_active: rgb(136, 192, 208), active_fg: rgb(46, 52, 64), border: rgb(76, 86, 106), hover_border: rgb(136, 192, 208), text: rgb(216, 222, 233), faint: rgb(148, 155, 168), accent: rgb(136, 192, 208), focus_border: rgb(143, 188, 187), widget_round: 6.0, shadow_blur: 5, shadow_offset: 1, shadow_alpha: 80, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.2, backdrop: 1,
         },
         Theme::Dracula => Palette {
-            dark: true, bg: rgb(40, 42, 54), panel: rgb(40, 42, 54), widget: rgb(68, 71, 90), widget_hover: rgb(80, 83, 105), widget_active: rgb(255, 121, 198), active_fg: rgb(40, 42, 54), border: rgb(98, 114, 164), hover_border: rgb(255, 121, 198), text: rgb(248, 248, 242), faint: rgb(135, 140, 160), accent: rgb(255, 121, 198), accent_text: rgb(40, 42, 54), widget_round: 8.0, shadow_blur: 6, shadow_offset: 2, shadow_alpha: 90, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.25, backdrop: 1,
+            dark: true, bg: rgb(40, 42, 54), panel: rgb(40, 42, 54), widget: rgb(68, 71, 90), widget_hover: rgb(80, 83, 105), widget_active: rgb(255, 121, 198), active_fg: rgb(40, 42, 54), border: rgb(98, 114, 164), hover_border: rgb(255, 121, 198), text: rgb(248, 248, 242), faint: rgb(135, 140, 160), accent: rgb(255, 121, 198), focus_border: rgb(189, 147, 249), widget_round: 8.0, shadow_blur: 6, shadow_offset: 2, shadow_alpha: 90, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.25, backdrop: 1,
         },
         Theme::Glass => Palette {
-            dark: true, bg: rgb(24, 28, 40), panel: rgba(40, 46, 64, 110), widget: rgba(255, 255, 255, 45), widget_hover: rgba(255, 255, 255, 75), widget_active: rgba(120, 180, 255, 200), active_fg: rgb(255, 255, 255), border: rgba(255, 255, 255, 110), hover_border: rgba(255, 255, 255, 170), text: rgb(240, 245, 255), faint: rgb(190, 200, 220), accent: rgb(120, 180, 255), accent_text: rgb(255, 255, 255), widget_round: 14.0, shadow_blur: 12, shadow_offset: 3, shadow_alpha: 100, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.3, backdrop: 3,
+            dark: true, bg: rgb(24, 28, 40), panel: rgba(40, 46, 64, 110), widget: rgba(255, 255, 255, 45), widget_hover: rgba(255, 255, 255, 75), widget_active: rgba(120, 180, 255, 200), active_fg: rgb(255, 255, 255), border: rgba(255, 255, 255, 110), hover_border: rgba(255, 255, 255, 170), text: rgb(240, 245, 255), faint: rgb(190, 200, 220), accent: rgb(120, 180, 255), focus_border: rgb(255, 255, 255), widget_round: 14.0, shadow_blur: 12, shadow_offset: 3, shadow_alpha: 100, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.3, backdrop: 3,
         },
         Theme::Neumorphism => Palette {
-            dark: false, bg: rgb(224, 229, 236), panel: rgb(224, 229, 236), widget: rgb(224, 229, 236), widget_hover: rgb(231, 236, 243), widget_active: rgb(93, 120, 255), active_fg: rgb(255, 255, 255), border: rgb(224, 229, 236), hover_border: rgb(224, 229, 236), text: rgb(60, 70, 90), faint: rgb(120, 130, 150), accent: rgb(93, 120, 255), accent_text: rgb(255, 255, 255), widget_round: 12.0, shadow_blur: 10, shadow_offset: 5, shadow_alpha: 110, item_spacing_y: 6.0, button_padding: 5.0, animation_time: 0.25, backdrop: 1,
+            dark: false, bg: rgb(224, 229, 236), panel: rgb(224, 229, 236), widget: rgb(224, 229, 236), widget_hover: rgb(231, 236, 243), widget_active: rgb(93, 120, 255), active_fg: rgb(255, 255, 255), border: rgb(224, 229, 236), hover_border: rgb(224, 229, 236), text: rgb(60, 70, 90), faint: rgb(120, 130, 150), accent: rgb(93, 120, 255), focus_border: rgb(255, 100, 100), widget_round: 12.0, shadow_blur: 10, shadow_offset: 5, shadow_alpha: 110, item_spacing_y: 6.0, button_padding: 5.0, animation_time: 0.25, backdrop: 1,
         },
     }
 }
 
 fn make_shadow(p: &Palette) -> egui::Shadow {
-    egui::Shadow {
-        offset: [p.shadow_offset, p.shadow_offset],
-        blur: p.shadow_blur,
-        spread: 0,
-        color: egui::Color32::from_black_alpha(p.shadow_alpha),
-    }
+    egui::Shadow { offset: [p.shadow_offset, p.shadow_offset], blur: p.shadow_blur, spread: 0, color: egui::Color32::from_black_alpha(p.shadow_alpha) }
 }
 
 fn apply_theme(ctx: &egui::Context, theme: Theme, transparent_ui: bool) {
     let p = get_palette(theme);
-    
-    let mut visuals = if p.dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    };
+    let mut visuals = if p.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
 
     visuals.window_fill = p.panel;
     visuals.panel_fill = p.panel;
@@ -767,13 +873,11 @@ fn apply_theme(ctx: &egui::Context, theme: Theme, transparent_ui: bool) {
     visuals.popup_shadow = make_shadow(&p);
     visuals.hyperlink_color = p.accent;
     visuals.selection.bg_fill = p.accent;
-    visuals.selection.stroke = egui::Stroke::new(1.0, p.accent_text);
+    visuals.selection.stroke = egui::Stroke::new(2.0, p.focus_border); 
 
     let states = [
-        &mut visuals.widgets.noninteractive,
-        &mut visuals.widgets.inactive,
-        &mut visuals.widgets.hovered,
-        &mut visuals.widgets.active,
+        &mut visuals.widgets.noninteractive, &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered, &mut visuals.widgets.active,
     ];
     for w in states {
         w.corner_radius = p.widget_round.into();
@@ -784,9 +888,11 @@ fn apply_theme(ctx: &egui::Context, theme: Theme, transparent_ui: bool) {
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, p.faint);
     visuals.widgets.inactive.bg_fill = p.widget;
     visuals.widgets.hovered.bg_fill = p.widget_hover;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, p.hover_border);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.5, p.hover_border);
     visuals.widgets.active.bg_fill = p.widget_active;
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, p.active_fg);
+    
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0, p.focus_border);
 
     let is_transparent_theme = matches!(theme, Theme::Glass);
     if transparent_ui || is_transparent_theme {
@@ -809,9 +915,7 @@ fn apply_theme(ctx: &egui::Context, theme: Theme, transparent_ui: bool) {
     #[cfg(windows)]
     if (is_transparent_theme || transparent_ui) && p.backdrop > 1 {
         let hwnd_res = unsafe { win32::FindWindowW(None, win32::w!("Macro Recorder")) };
-        if let Ok(hwnd) = hwnd_res {
-            platform::apply_system_backdrop(hwnd, p.backdrop == 3);
-        }
+        if let Ok(hwnd) = hwnd_res { platform::apply_system_backdrop(hwnd, p.backdrop == 3); }
     }
 }
 
@@ -819,41 +923,22 @@ fn apply_theme(ctx: &egui::Context, theme: Theme, transparent_ui: bool) {
 // Main Application
 // ============================================================================
 
-struct MacroApp {
-    state: Arc<AppState>,
-    config: AppConfig,
-    system_lang: Lang,
-    status_msg: String,
-}
+struct MacroApp { state: Arc<AppState>, config: AppConfig, system_lang: Lang, status_msg: String }
 
 impl MacroApp {
     fn new(cc: &eframe::CreationContext<'_>, state: Arc<AppState>, config: AppConfig) -> Self {
         setup_fonts(&cc.egui_ctx);
-        let theme = [Theme::Dark, Theme::OLED, Theme::Material3, Theme::Catppuccin,
-                     Theme::Nord, Theme::Dracula, Theme::Glass, Theme::Neumorphism]
+        let theme = [Theme::Dark, Theme::OLED, Theme::Material3, Theme::Catppuccin, Theme::Nord, Theme::Dracula, Theme::Glass, Theme::Neumorphism]
             .get(config.default_theme).copied().unwrap_or(Theme::Dark);
         apply_theme(&cc.egui_ctx, theme, config.transparent_ui);
-
-        Self {
-            state,
-            config,
-            system_lang: detect_system_lang(),
-            status_msg: String::new(),
-        }
+        Self { state, config, system_lang: detect_system_lang(), status_msg: String::new() }
     }
-
-    fn strs(&self) -> &'static Strings {
-        get_strings(self.config.default_lang, self.system_lang)
-    }
+    fn strs(&self) -> &'static Strings { get_strings(self.config.default_lang, self.system_lang) }
 }
 
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let candidates = [
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "C:\\Windows\\Fonts\\meiryo.ttc",
-    ];
+    let candidates = ["C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\simhei.ttf", "C:\\Windows\\Fonts\\meiryo.ttc"];
     for path in candidates {
         if let Ok(data) = std::fs::read(path) {
             fonts.font_data.insert("cjk".into(), egui::FontData::from_owned(data).into());
@@ -875,7 +960,6 @@ impl eframe::App for MacroApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Macro Recorder");
                 ui.separator();
-
                 ui.horizontal(|ui| {
                     if ui.button(s.record).clicked() { toggle_recording(&self.state); }
                     if ui.button(s.stop_rec).clicked() { self.state.recording.store(false, Ordering::Relaxed); }
@@ -885,18 +969,16 @@ impl eframe::App for MacroApp {
                     if ui.button(s.stop_play).clicked() { self.state.stop_play.store(true, Ordering::Relaxed); }
                 });
 
-                if recording {
-                    ui.label(s.rec_time.replace("{}", &format_us(current_rec_time_us(&self.state))));
-                } else {
+                if recording { ui.label(s.rec_time.replace("{}", &format_us(current_rec_time_us(&self.state)))); }
+                else {
                     let rt = self.state.recorded_time_us.load(Ordering::Relaxed);
                     if rt > 0 { ui.label(s.rec_done.replace("{}", &format_us(rt))); }
                 }
 
                 if playing || self.state.play_count.load(Ordering::Relaxed) > 0 {
                     let c = self.state.play_count.load(Ordering::Relaxed);
-                    if self.state.loop_play.load(Ordering::Relaxed) {
-                        ui.label(s.play_inf.replace("{}", &c.to_string()));
-                    } else {
+                    if self.state.loop_play.load(Ordering::Relaxed) { ui.label(s.play_inf.replace("{}", &c.to_string())); }
+                    else {
                         let l = self.state.play_count_limit.load(Ordering::Relaxed);
                         ui.label(s.play_lim.replacen("{}", &c.to_string(), 1).replacen("{}", &l.to_string(), 1));
                     }
@@ -907,10 +989,8 @@ impl eframe::App for MacroApp {
 
                 let mut lp = self.config.loop_play;
                 if ui.checkbox(&mut lp, s.loop_cb).changed() {
-                    self.config.loop_play = lp;
-                    self.state.loop_play.store(lp, Ordering::Relaxed);
+                    self.config.loop_play = lp; self.state.loop_play.store(lp, Ordering::Relaxed);
                 }
-
                 if !lp {
                     ui.horizontal(|ui| {
                         ui.label(s.play_count);
@@ -921,18 +1001,13 @@ impl eframe::App for MacroApp {
 
                 let mut tle = self.config.time_limit_enabled;
                 if ui.checkbox(&mut tle, s.time_limit_cb).changed() {
-                    self.config.time_limit_enabled = tle;
-                    self.state.time_limit_enabled.store(tle, Ordering::Relaxed);
+                    self.config.time_limit_enabled = tle; self.state.time_limit_enabled.store(tle, Ordering::Relaxed);
                 }
-
                 if tle {
                     ui.horizontal(|ui| {
-                        ui.label(s.time_limit_h);
-                        ui.add(egui::DragValue::new(&mut self.config.time_limit_h).range(0..=100));
-                        ui.label(s.time_limit_m);
-                        ui.add(egui::DragValue::new(&mut self.config.time_limit_m).range(0..=59));
-                        ui.label(s.time_limit_s);
-                        ui.add(egui::DragValue::new(&mut self.config.time_limit_s).range(0..=59));
+                        ui.label(s.time_limit_h); ui.add(egui::DragValue::new(&mut self.config.time_limit_h).range(0..=100));
+                        ui.label(s.time_limit_m); ui.add(egui::DragValue::new(&mut self.config.time_limit_m).range(0..=59));
+                        ui.label(s.time_limit_s); ui.add(egui::DragValue::new(&mut self.config.time_limit_s).range(0..=59));
                     });
                     let us = (self.config.time_limit_h * 3600 + self.config.time_limit_m * 60 + self.config.time_limit_s) * 1_000_000;
                     self.state.time_limit_us.store(us, Ordering::Relaxed);
@@ -950,87 +1025,65 @@ impl eframe::App for MacroApp {
 
                 let mut am = self.config.absolute_mouse;
                 if ui.checkbox(&mut am, s.abs_mouse).changed() {
-                    self.config.absolute_mouse = am;
-                    self.state.absolute_mouse.store(am, Ordering::Relaxed);
+                    self.config.absolute_mouse = am; self.state.absolute_mouse.store(am, Ordering::Relaxed);
                 }
 
                 if ui.checkbox(&mut self.config.transparent_ui, s.transparent_ui).changed() {
-                    let themes = [Theme::Dark, Theme::OLED, Theme::Material3, Theme::Catppuccin,
-                                  Theme::Nord, Theme::Dracula, Theme::Glass, Theme::Neumorphism];
+                    let themes = [Theme::Dark, Theme::OLED, Theme::Material3, Theme::Catppuccin, Theme::Nord, Theme::Dracula, Theme::Glass, Theme::Neumorphism];
                     let t = themes.get(self.config.default_theme).copied().unwrap_or(Theme::Dark);
                     apply_theme(ui.ctx(), t, self.config.transparent_ui);
                 }
 
                 if ui.checkbox(&mut self.config.always_on_top, s.on_top).changed() {
-                    let level = if self.config.always_on_top {
-                        egui::viewport::WindowLevel::AlwaysOnTop
-                    } else {
-                        egui::viewport::WindowLevel::Normal
-                    };
+                    let level = if self.config.always_on_top { egui::viewport::WindowLevel::AlwaysOnTop } else { egui::viewport::WindowLevel::Normal };
                     ui.ctx().send_viewport_cmd(egui::viewport::ViewportCommand::WindowLevel(level));
                 }
 
                 ui.separator();
-
                 ui.horizontal(|ui| {
                     ui.label(s.theme);
-                    egui::ComboBox::from_id_salt("theme")
-                        .selected_text(THEME_NAMES[self.config.default_theme])
-                        .show_ui(ui, |ui| {
-                            for (i, name) in THEME_NAMES.iter().enumerate() {
-                                if ui.selectable_label(self.config.default_theme == i, *name).clicked() {
-                                    self.config.default_theme = i;
-                                    let themes = [Theme::Dark, Theme::OLED, Theme::Material3, Theme::Catppuccin,
-                                                  Theme::Nord, Theme::Dracula, Theme::Glass, Theme::Neumorphism];
-                                    apply_theme(ui.ctx(), themes[i], self.config.transparent_ui);
-                                }
+                    egui::ComboBox::from_id_salt("theme").selected_text(THEME_NAMES[self.config.default_theme]).show_ui(ui, |ui| {
+                        for (i, name) in THEME_NAMES.iter().enumerate() {
+                            if ui.selectable_label(self.config.default_theme == i, *name).clicked() {
+                                self.config.default_theme = i;
+                                let themes = [Theme::Dark, Theme::OLED, Theme::Material3, Theme::Catppuccin, Theme::Nord, Theme::Dracula, Theme::Glass, Theme::Neumorphism];
+                                apply_theme(ui.ctx(), themes[i], self.config.transparent_ui);
                             }
-                        });
+                        }
+                    });
                 });
 
                 ui.horizontal(|ui| {
                     ui.label(s.language);
-                    egui::ComboBox::from_id_salt("lang")
-                        .selected_text(match self.config.default_lang {
-                            1 => "English", 2 => "Русский", 3 => "Українська",
-                            4 => "Português", 5 => "Español", 6 => "中文", _ => s.lang_auto,
-                        })
-                        .show_ui(ui, |ui| {
-                            for (i, name) in [s.lang_auto, "English", "Русский", "Українська", "Português", "Español", "中文"].iter().enumerate() {
-                                if ui.selectable_label(self.config.default_lang == i, *name).clicked() {
-                                    self.config.default_lang = i;
-                                }
-                            }
-                        });
+                    egui::ComboBox::from_id_salt("lang").selected_text(match self.config.default_lang {
+                        1 => "English", 2 => "Русский", 3 => "Українська", 4 => "Português", 5 => "Español", 6 => "中文", _ => s.lang_auto,
+                    }).show_ui(ui, |ui| {
+                        for (i, name) in [s.lang_auto, "English", "Русский", "Українська", "Português", "Español", "中文"].iter().enumerate() {
+                            if ui.selectable_label(self.config.default_lang == i, *name).clicked() { self.config.default_lang = i; }
+                        }
+                    });
                 });
 
                 ui.separator();
-
                 ui.horizontal(|ui| {
                     if ui.button(s.save).clicked() {
                         let res: anyhow::Result<()> = (|| {
                             let data = self.state.macro_data.lock().clone();
                             let json = serde_json::to_string_pretty(&data)?;
-                            std::fs::write(MACRO_PATH, json)?;
-                            Ok(())
+                            std::fs::write(MACRO_PATH, json)?; Ok(())
                         })();
-                        match res {
-                            Ok(_) => self.status_msg = s.saved.into(),
-                            Err(e) => self.status_msg = s.save_err.replace("{}", &e.to_string()),
-                        }
+                        match res { Ok(_) => self.status_msg = s.saved.into(), Err(e) => self.status_msg = s.save_err.replace("{}", &e.to_string()) }
                     }
                     if ui.button(s.load).clicked() {
                         let res: anyhow::Result<Vec<MacroEvent>> = (|| {
                             let text = std::fs::read_to_string(MACRO_PATH)?;
-                            let events = serde_json::from_str(&text)?;
-                            Ok(events)
+                            let events = serde_json::from_str(&text)?; Ok(events)
                         })();
                         match res {
                             Ok(events) => {
                                 let dur = events.last().map(|e: &MacroEvent| e.t_us).unwrap_or(0);
                                 self.state.recorded_time_us.store(dur, Ordering::Relaxed);
-                                *self.state.macro_data.lock() = events;
-                                self.status_msg = s.loaded.into();
+                                *self.state.macro_data.lock() = events; self.status_msg = s.loaded.into();
                             }
                             Err(e) => self.status_msg = s.load_err.replace("{}", &e.to_string()),
                         }
@@ -1045,16 +1098,11 @@ impl eframe::App for MacroApp {
                 }
 
                 ui.separator();
-
                 let ec = self.state.macro_data.lock().len();
                 ui.label(s.events.replace("{}", &ec.to_string()));
 
-                let status = if recording { s.status_rec }
-                             else if playing { s.status_play }
-                             else if !self.status_msg.is_empty() { &self.status_msg }
-                             else { s.status_ready };
+                let status = if recording { s.status_rec } else if playing { s.status_play } else if !self.status_msg.is_empty() { &self.status_msg } else { s.status_ready };
                 ui.label(format!("ℹ {}", status));
-
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             });
         });
@@ -1077,16 +1125,11 @@ fn format_us(us: u64) -> String {
 // ============================================================================
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
     init_epoch();
-
+    
     #[cfg(windows)]
-    unsafe {
-        let _ = win32::SetProcessDpiAwarenessContext(win32::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
+    unsafe { let _ = win32::SetProcessDpiAwarenessContext(win32::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); }
 
     let (tx, rx) = unbounded();
     let state = AppState::new(tx);
@@ -1095,25 +1138,14 @@ fn main() -> Result<()> {
     std::thread::spawn(move || collector_thread(rx, st));
 
     #[cfg(windows)]
-    {
-        let st = state.clone();
-        std::thread::spawn(move || input_hook_thread(st));
-    }
+    { let st = state.clone(); std::thread::spawn(move || input_hook_thread(st)); }
 
     let config = load_config();
 
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([420.0, 640.0])
-        .with_transparent(true);
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([420.0, 640.0]).with_transparent(true);
+    if config.always_on_top { viewport = viewport.with_always_on_top(); }
 
-    if config.always_on_top {
-        viewport = viewport.with_always_on_top();
-    }
-
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
 
     let st = state.clone();
     eframe::run_native(
