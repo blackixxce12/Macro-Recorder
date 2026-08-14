@@ -578,8 +578,8 @@ macro-recorder.exe --play "D:\macros\farm.mrz" --loops 20 --speed 1.5 --no-gui
 ```bash
 # 1. Установите Rust (1.97.1+, edition 2024): https://rustup.rs
 # 2. Клонируйте и соберите
-git clone https://github.com/blackixxce12/Micro-Recorder.git
-cd Micro-Recorder
+git clone https://github.com/blackixxce12/Macro-Recorder.git
+cd Macro-Recorder
 
 # Универсальная сборка
 cargo build --release
