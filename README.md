@@ -42,7 +42,7 @@
 | 🌍 **External translations** | Drop `lang/xx.json` next to the exe to override any string without rebuilding |
 
 <details>
-<summary>1.2 brought</summary>
+<summary>1.3 brought</summary>
 
 Pause/resume with a proper schedule clock · rebindable hotkeys + emergency stop · X1/X2 capture ·
 Open/Save dialogs and recent files · gzip `.mrz` macros · shutdown/restart/sleep/hibernate/log-off ·
@@ -135,7 +135,7 @@ That weekend project got slightly out of hand. 🦀
 
 ### Full comparison
 
-| | **TinyTask 1.77** | **Macro Recorder 1.2** |
+| | **TinyTask 1.77** | **Macro Recorder 1.3** |
 |---|---|---|
 | **License** | Freeware, **closed source** (proprietary) | **MIT, fully open source** |
 | **Implementation** | Pure C + raw Win32, self-contained **32-bit** exe | Rust 2024 + `windows-rs`, **64-bit** exe |
@@ -150,7 +150,7 @@ That weekend project got slightly out of hand. 🦀
 | **Mouse wheel** | ⚠️ documented as unavailable with some mice | ✅ **vertical + horizontal** |
 | **X1 / X2 side buttons** | ❌ | ✅ recorded and replayed |
 | **Ignores its own injected input** | not documented | ✅ `LLKHF_INJECTED` / `LLMHF_INJECTED` filtered |
-| **Hotkeys excluded from recordings** | ✅ by design | ✅ (fixed in 1.2) |
+| **Hotkeys excluded from recordings** | ✅ by design | ✅ (fixed in 1.3) |
 | **Repeat playback** | ✅ continuous **or** N times | ✅ continuous **or** N times (1–9999) |
 | **Delay between loops** | ❌ (bake it into the recording) | ✅ 0–600 000 ms |
 | **Pause / resume** | ❌ | ✅ without losing the position |
