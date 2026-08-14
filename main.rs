@@ -36,7 +36,7 @@ mod win32 {
     pub use windows::Win32::Graphics::Dwm::*;
     // Explicit imports instead of a glob: several Gdi names collide with
     // WindowsAndMessaging and would become ambiguous at the use site.
-    pub use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, HBRUSH, HDC, HRGN, ReleaseDC};
+    pub use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, HRGN, ReleaseDC};
     pub use windows::Win32::Media::*;
     pub use windows::Win32::Security::*;
     pub use windows::Win32::System::Com::*;
@@ -232,6 +232,9 @@ impl Hotkey {
         Self { vk, ctrl: false, alt: false, shift: false }
     }
     fn label(&self) -> String {
+        if self.vk == 0 {
+            return "—".into();
+        }
         let mut s = String::new();
         if self.ctrl {
             s.push_str("Ctrl+");
@@ -250,6 +253,7 @@ impl Hotkey {
 /// Human name for a virtual-key code.
 fn vk_name(vk: u32) -> String {
     match vk {
+        0x00 => "—".into(),
         0x08 => "Backspace".into(),
         0x09 => "Tab".into(),
         0x0D => "Enter".into(),
@@ -3558,10 +3562,12 @@ fn hotkey_row(
     ui.horizontal_wrapped(|ui| {
         ui.label(label);
 
+        // Left cell is the action, right cell is the current value: neither can end
+        // up blank, and the two no longer say the same thing twice.
         let capturing = CAPTURE_SLOT.load(Ordering::Relaxed) == slot;
-        let text = if capturing { s.hk_press.to_string() } else { hk.label() };
-        let button = egui::Button::new(text).min_size(egui::vec2(140.0, 0.0));
-        if ui.add(button).on_hover_text(s.hk_bind).clicked() {
+        let text = if capturing { s.hk_press } else { s.hk_bind };
+        let button = egui::Button::new(text).min_size(egui::vec2(110.0, 0.0));
+        if ui.add(button).clicked() {
             if capturing {
                 end_capture();
             } else {
@@ -3570,8 +3576,8 @@ fn hotkey_row(
         }
 
         egui::ComboBox::from_id_salt(salt)
-            .selected_text("▾")
-            .width(46.0)
+            .selected_text(vk_name(hk.vk))
+            .width(112.0)
             .show_ui(ui, |ui| {
                 for (name, vk) in HOTKEY_CHOICES {
                     if ui.selectable_label(hk.vk == vk, name).clicked() && hk.vk != vk {
