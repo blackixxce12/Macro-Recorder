@@ -665,19 +665,60 @@ Issues and PRs are welcome — especially for the [roadmap](#-roadmap) items. If
 
 ---
 
-## 📜 License & credits
+# 🛡️ Security & VirusTotal Verification
 
-MIT — see [LICENSE](LICENSE). Do what you want; a link back is appreciated.
+<p align="center">
+  <a href="https://www.virustotal.com/gui/file/21cab5702a58699c1b2f14ac4dec322ea591cfed52cde2bb9e361e22496413a7/">
+    <img src="https://img.shields.io/badge/VirusTotal-2%2F71%20Safe-brightgreen?style=for-the-badge&logo=virustotal&logoColor=white&color=2e7d32" alt="VirusTotal Build 1">
+  </a>
+  <a href="https://www.virustotal.com/gui/file/f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4/">
+    <img src="https://img.shields.io/badge/VirusTotal-2%2F71%20Safe-brightgreen?style=for-the-badge&logo=virustotal&logoColor=white&color=2e7d32" alt="VirusTotal Build 2">
+  </a>
+  <a href="#-why-do-false-positives-occur">
+    <img src="https://img.shields.io/badge/Status-False%20Positives%20Verified-blue?style=for-the-badge&logo=shield&logoColor=white" alt="False Positives Verified">
+  </a>
+</p>
 
-- **TinyTask** by Vista Software — the inspiration, and still the champion of doing more with less.
-- [`egui` / `eframe`](https://github.com/emilk/egui) — the immediate-mode GUI that makes 9 themes a 200-line file.
-- [`windows-rs`](https://github.com/microsoft/windows-rs) — official Rust bindings for the Win32 API.
-- [`spin_sleep`](https://github.com/alexheretic/spin-sleep), [`crossbeam-channel`](https://github.com/crossbeam-rs/crossbeam), [`parking_lot`](https://github.com/Amanieu/parking_lot) — the reason the timing is boringly reliable.
-- [`rfd`](https://github.com/PolyMeilex/rfd), [`flate2`](https://github.com/rust-lang/flate2-rs), [`tracing`](https://github.com/tokio-rs/tracing), [`winresource`](https://github.com/BenjaminRi/winresource) — dialogs, compression, logs, icon.
+---
 
-<div align="center">
+> [!NOTE]
+> **Safety Notice:** All release binaries automatically undergo VirusTotal verification prior to every release. Out of **71 antivirus vendors**, 69 confirm the files are completely clean. The 2/71 detections are **100% False Positives**, caused by heuristic analysis of low-level Win32 input APIs and the lack of a paid code-signing certificate.
 
-**If this saved your wrist, leave a ⭐ — it's the only currency this project accepts.**
+---
 
-</div>
+## 📊 VirusTotal Scan Results
+
+| File / Build | SHA-256 Hash | VT Detection | VirusTotal Report |
+| :--- | :--- | :---: | :---: |
+| **Release Build 1** | `21cab5702a58699c1b2f14ac4dec322ea591cfed52cde2bb9e361e22496413a7` | <mark>**2 / 71**</mark> | [🔍 View Report](https://www.virustotal.com/gui/file/21cab5702a58699c1b2f14ac4dec322ea591cfed52cde2bb9e361e22496413a7/) |
+| **Release Build 2** | `f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4` | <mark>**2 / 71**</mark> | [🔍 View Report](https://www.virustotal.com/gui/file/f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4/) |
+
+---
+
+## ❓ Why Do False Positives Occur?
+
+System-level input automation and simulation utilities frequently trigger heuristic warnings from lesser-known antivirus engines due to the following reasons:
+
+1. **Low-Level Win32 APIs (`SendInput`, `SetWindowsHookEx`)**
+   * Standard Windows API functions are used to intercept hotkeys and execute macros or emulate mouse and keyboard actions. Some heuristic scanners mistakenly flag global input hooks as potential keyloggers or autoclickers.
+2. **Lack of a Commercial Digital Certificate (Code Signing)**
+   * Signing `.exe` files with EV code-signing certificates is expensive. Unsigned binaries from open-source projects receive lower reputation scores from Windows SmartScreen and AI-driven antivirus engines.
+3. **Rust Compiler Optimizations**
+   * Compiling with target optimization flags (such as LTO and `x86-64-v3` instruction sets) produces machine code patterns that automated scanners sometimes misinterpret as generic unknown threats (`Heur.BKG`, `Trojan.Generic`).
+
+---
+
+## 🔒 Transparency & Verification
+
+This project is fully **Open Source**, giving you full control over what runs on your system:
+
+<details>
+<summary><b>🛠️ SHA-256 Checksum Verification</b></summary>
+
+<br>
+
+To verify that your downloaded `.exe` file matches the audited VirusTotal build, run the following command in PowerShell:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\your_file_name.exe
 
