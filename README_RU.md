@@ -729,22 +729,3 @@ Issues и PR приветствуются — особенно по пункта
 
 ```powershell
 Get-FileHash -Algorithm SHA256 .\имя_файла.exe (обычный или v3)
-
----
-
-## 📜 Лицензия и благодарности
-
-MIT — см. [LICENSE](LICENSE). Делайте что хотите; ссылка обратно приветствуется.
-
-- **TinyTask** от Vista Software — источник вдохновения и до сих пор чемпион по принципу «сделать больше меньшим».
-- [`egui` / `eframe`](https://github.com/emilk/egui) — immediate-mode GUI, благодаря которому 9 тем умещаются в 200 строк.
-- [`windows-rs`](https://github.com/microsoft/windows-rs) — официальные Rust-биндинги к Win32 API.
-- [`spin_sleep`](https://github.com/alexheretic/spin-sleep), [`crossbeam-channel`](https://github.com/crossbeam-rs/crossbeam), [`parking_lot`](https://github.com/Amanieu/parking_lot) — причина, по которой тайминги скучно-надёжны.
-- [`rfd`](https://github.com/PolyMeilex/rfd), [`flate2`](https://github.com/rust-lang/flate2-rs), [`tracing`](https://github.com/tokio-rs/tracing), [`winresource`](https://github.com/BenjaminRi/winresource) — диалоги, сжатие, логи, иконка.
-
-<div align="center">
-
-**Если это спасло вашу кисть — поставьте ⭐, это единственная валюта, которую принимает проект.**
-
-</div>
-
