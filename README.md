@@ -17,7 +17,7 @@
 
 [📥 Download](../../releases) • [✨ Features](#-features) • [🆚 vs TinyTask](#-macro-recorder-vs-tinytask) • [🧠 How it works](#-how-it-works) • [🇷🇺 Русская версия](README_RU.md)
 
-<img src="screenshots/screenshot.png" width="330" alt="Macro Recorder window">
+<img src="screenshot.png" width="330" alt="Macro Recorder window">
 
 </div>
 
