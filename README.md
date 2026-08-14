@@ -661,7 +661,7 @@ Yes — the built-in editor covers deleting, cropping, inserting pauses and resc
 
 ## 🤝 Contributing
 
-Issues and PRs are welcome — especially for the [roadmap](#-roadmap) items. If you're reporting a playback bug, please attach the macro file (or a trimmed version of it), the relevant part of `logs/macro-recorder.log.*`, and your Windows version, display scaling and monitor layout.
+Issues and PRs are welcome. If you're reporting a playback bug, please attach the macro file (or a trimmed version of it), the relevant part of `logs/macro-recorder.log.*`, and your Windows version, display scaling and monitor layout.
 
 ---
 
