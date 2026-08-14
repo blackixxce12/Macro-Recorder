@@ -1,10 +1,11 @@
 [package]
 name = "macro-recorder"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "A modern, DPI-aware macro recorder with native Windows 11 Mica/Acrylic, Virtual Desktop isolation, and secure shutdown"
 license = "MIT"
+build = "build.rs"
 
 [dependencies]
 # GUI & Serialization
@@ -34,6 +35,12 @@ rfd = "0.17.2"
 #                  Swap point if you still want it: `save_macro` / `load_macro` in main.rs.
 #   rand         - the only randomness needed is playback jitter; main.rs ships a
 #                  12-line xorshift64* generator instead (deterministic and unit-tested).
+
+# Embeds assets/icon.ico into the .exe (Explorer / taskbar icon).
+# Requires a resource compiler: rc.exe from the Windows SDK (MSVC) or windres.exe (GNU).
+# If it is missing the build still succeeds - you just get a warning and no exe icon.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 # Windows API Bindings
 [target.'cfg(windows)'.dependencies]
