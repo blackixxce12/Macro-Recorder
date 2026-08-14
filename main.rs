@@ -1,29 +1,30 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! # Macro Recorder 1.2
+//! # Macro Recorder
 //!
 //! A DPI-aware macro recorder for Windows.
 //!
-//! Thread layout (unchanged from 1.1, but hardened):
-//!   * UI thread          - eframe/egui
-//!   * hook thread        - WH_KEYBOARD_LL + WH_MOUSE_LL + RegisterHotKey + message loop
-//!   * collector thread   - crossbeam channel -> Vec<MacroEvent>
-//!   * playback thread    - spin_sleep + timeBeginPeriod(1) + SendInput
+//! Threads:
+//!   * UI          - eframe/egui
+//!   * hooks       - WH_KEYBOARD_LL + WH_MOUSE_LL + hotkeys + tray window + message loop
+//!   * collector   - crossbeam channel -> Vec<MacroEvent>
+//!   * playback    - spin_sleep + timeBeginPeriod(1) + SendInput
 //!
 //! Everything shared lives in `Arc<AppState>` (atomics + parking_lot).
 //!
 //! Notes for maintainers:
-//!   * `panic = "abort"` in release, so `catch_unwind` is useless -> the hook callbacks are
-//!     written to be panic-free (no unwrap, no indexing, null-pointer guards).
-//!   * The hook callbacks must stay cheap. No COM, no window enumeration, no blocking locks
-//!     in the hot path: Windows silently unhooks a callback that exceeds LowLevelHooksTimeout.
+//!   * `panic = "abort"` in release, so the hook callbacks are written to be panic-free
+//!     (no unwrap, no indexing, null-pointer guards) rather than relying on catch_unwind.
+//!   * The hook callbacks must stay cheap: Windows silently unhooks a callback that
+//!     exceeds LowLevelHooksTimeout. No COM, no window enumeration in the hot path.
 
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -33,7 +34,9 @@ mod win32 {
     pub use windows::Win32::Foundation::*;
     pub use windows::Win32::Globalization::GetUserDefaultUILanguage;
     pub use windows::Win32::Graphics::Dwm::*;
-    pub use windows::Win32::Graphics::Gdi::HRGN;
+    // Explicit imports instead of a glob: several Gdi names collide with
+    // WindowsAndMessaging and would become ambiguous at the use site.
+    pub use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, HBRUSH, HDC, HRGN, ReleaseDC};
     pub use windows::Win32::Media::*;
     pub use windows::Win32::Security::*;
     pub use windows::Win32::System::Com::*;
@@ -56,26 +59,38 @@ mod win32 {
 const APP_TITLE: &str = "Macro Recorder";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Hotkey ids passed to RegisterHotKey.
+/// Window icon as raw 128x128 RGBA (no PNG decoder needed at runtime).
+/// See `assets/README.md` to regenerate.
+const ICON_RGBA: &[u8] = include_bytes!("../assets/icon.rgba");
+const ICON_SIZE: u32 = 128;
+
 const HK_ID_RECORD: i32 = 1;
 const HK_ID_PLAY: i32 = 2;
 const HK_ID_STOP: i32 = 3;
+const HK_ID_PAUSE: i32 = 4;
 
-/// Custom thread messages for the hook thread.
-const WM_APP_REHOTKEY: u32 = 0x8001; // WM_APP + 1
-const WM_HOTKEY_ID: u32 = 0x0312; // WM_HOTKEY
+const WM_HOTKEY_ID: u32 = 0x0312;
+const WM_APP_REHOTKEY: u32 = 0x8001;
+const WM_APP_TRAY: u32 = 0x8002;
+/// Temporarily drops all global hotkeys so the key being bound can reach the window.
+const WM_APP_HK_OFF: u32 = 0x8003;
 
-/// Maximum time a single sleep chunk may last inside the playback loop (B2).
-/// Bounds the worst-case reaction time to Stop / Pause.
+const TRAY_ID_SHOW: u32 = 101;
+const TRAY_ID_RECORD: u32 = 102;
+const TRAY_ID_PLAY: u32 = 103;
+const TRAY_ID_STOP: u32 = 104;
+const TRAY_ID_EXIT: u32 = 105;
+
+/// Longest single sleep inside the playback loop: bounds Stop/Pause latency.
 const SLEEP_CHUNK_US: u64 = 15_000;
-/// Below this threshold we busy-wait instead of sleeping.
 const SPIN_THRESHOLD_US: u64 = 2_000;
-/// Refresh interval for the cached virtual-screen metrics.
 const METRICS_TTL_US: u64 = 500_000;
-/// Refresh interval for the cached "are we on the active virtual desktop" answer.
 const DESKTOP_TTL_US: u64 = 200_000;
-/// Sanity limit for a loaded macro.
+const PIXEL_CHECK_TTL_US: u64 = 250_000;
 const MAX_EVENTS: usize = 4_000_000;
+
+/// Footer magic for macros appended to a copy of this executable.
+const PAYLOAD_MAGIC: &[u8; 8] = b"MRPAYLD1";
 
 // ============================================================================
 // Small utilities
@@ -97,18 +112,14 @@ fn format_us(us: u64) -> String {
     if h > 0 { format!("{h:02}:{m:02}:{s:02}") } else { format!("{m:02}:{s:02}") }
 }
 
-/// Tiny xorshift64* PRNG.
-///
-/// Deliberately dependency-free: the only randomness we need is timing jitter,
-/// and a self-contained generator keeps this testable and reproducible.
+/// xorshift64* - the only randomness we need is playback jitter, so no dependency.
 struct Rng(u64);
 
 impl Rng {
     fn new() -> Self {
-        let seed = now_us() ^ 0x9E37_79B9_7F4A_7C15 ^ (std::process::id() as u64) << 32;
+        let seed = now_us() ^ 0x9E37_79B9_7F4A_7C15 ^ ((std::process::id() as u64) << 32);
         Self(if seed == 0 { 0x2545_F491_4F6C_DD1D } else { seed })
     }
-
     fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
@@ -117,15 +128,17 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-
-    /// Uniform value in `0..bound` (returns 0 when `bound == 0`).
     fn below(&mut self, bound: u64) -> u64 {
         if bound == 0 { 0 } else { self.next_u64() % bound }
     }
 }
 
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 // ============================================================================
-// Paths (B5) - portable next to the exe, otherwise %APPDATA%
+// Paths
 // ============================================================================
 
 mod paths {
@@ -151,7 +164,6 @@ mod paths {
 
     #[cfg(windows)]
     fn roaming_dir() -> Option<PathBuf> {
-        // VERIFY: known-folders 1.3 exposes `get_known_folder_path(KnownFolder) -> Option<PathBuf>`.
         known_folders::get_known_folder_path(known_folders::KnownFolder::RoamingAppData)
             .map(|p| p.join("MacroRecorder"))
     }
@@ -161,9 +173,7 @@ mod paths {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/macro-recorder"))
     }
 
-    /// Directory that holds config, macros and logs.
-    ///
-    /// Order: portable (exe directory, if writable) -> %APPDATA%\MacroRecorder -> cwd.
+    /// Portable (next to the exe) when possible, otherwise %APPDATA%.
     pub fn data_dir() -> &'static Path {
         DATA_DIR.get_or_init(|| {
             if let Some(dir) = exe_dir() {
@@ -183,15 +193,22 @@ mod paths {
     pub fn config_path() -> PathBuf {
         data_dir().join("config.json")
     }
-
     pub fn default_macro_path() -> PathBuf {
         data_dir().join("macro.json")
     }
-
-    pub fn log_dir() -> PathBuf {
-        let dir = data_dir().join("logs");
+    pub fn sub_dir(name: &str) -> PathBuf {
+        let dir = data_dir().join(name);
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+    pub fn log_dir() -> PathBuf {
+        sub_dir("logs")
+    }
+    pub fn profiles_dir() -> PathBuf {
+        sub_dir("profiles")
+    }
+    pub fn lang_dir() -> PathBuf {
+        sub_dir("lang")
     }
 }
 
@@ -214,7 +231,6 @@ impl Hotkey {
     const fn plain(vk: u32) -> Self {
         Self { vk, ctrl: false, alt: false, shift: false }
     }
-
     fn label(&self) -> String {
         let mut s = String::new();
         if self.ctrl {
@@ -226,92 +242,204 @@ impl Hotkey {
         if self.shift {
             s.push_str("Shift+");
         }
-        s.push_str(vk_name(self.vk));
+        s.push_str(&vk_name(self.vk));
         s
     }
 }
 
-/// Keys offered in the hotkey pickers. Deliberately conservative: keys that are
-/// rarely typed inside a macro and rarely stolen by other applications.
-const HOTKEY_CHOICES: [(&str, u32); 22] = [
-    ("F1", 0x70),
-    ("F2", 0x71),
-    ("F3", 0x72),
-    ("F4", 0x73),
-    ("F5", 0x74),
-    ("F6", 0x75),
-    ("F7", 0x76),
-    ("F8", 0x77),
-    ("F9", 0x78),
-    ("F10", 0x79),
-    ("F11", 0x7A),
-    ("F12", 0x7B),
-    ("Pause", 0x13),
-    ("ScrollLock", 0x91),
-    ("Insert", 0x2D),
-    ("Home", 0x24),
-    ("End", 0x23),
-    ("PageUp", 0x21),
-    ("PageDown", 0x22),
-    ("Num *", 0x6A),
-    ("Num -", 0x6D),
-    ("Num +", 0x6B),
+/// Human name for a virtual-key code.
+fn vk_name(vk: u32) -> String {
+    match vk {
+        0x08 => "Backspace".into(),
+        0x09 => "Tab".into(),
+        0x0D => "Enter".into(),
+        0x10 => "Shift".into(),
+        0x11 => "Ctrl".into(),
+        0x12 => "Alt".into(),
+        0x13 => "Pause".into(),
+        0x14 => "CapsLock".into(),
+        0x1B => "Esc".into(),
+        0x20 => "Space".into(),
+        0x21 => "PageUp".into(),
+        0x22 => "PageDown".into(),
+        0x23 => "End".into(),
+        0x24 => "Home".into(),
+        0x25 => "Left".into(),
+        0x26 => "Up".into(),
+        0x27 => "Right".into(),
+        0x28 => "Down".into(),
+        0x2C => "PrintScreen".into(),
+        0x2D => "Insert".into(),
+        0x2E => "Delete".into(),
+        0x30..=0x39 => char::from(b'0' + (vk - 0x30) as u8).to_string(),
+        0x41..=0x5A => char::from(b'A' + (vk - 0x41) as u8).to_string(),
+        0x5B => "LWin".into(),
+        0x5C => "RWin".into(),
+        0x60..=0x69 => format!("Num{}", vk - 0x60),
+        0x6A => "Num*".into(),
+        0x6B => "Num+".into(),
+        0x6D => "Num-".into(),
+        0x6E => "Num.".into(),
+        0x6F => "Num/".into(),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        0x90 => "NumLock".into(),
+        0x91 => "ScrollLock".into(),
+        0xBA => ";".into(),
+        0xBB => "=".into(),
+        0xBC => ",".into(),
+        0xBD => "-".into(),
+        0xBE => ".".into(),
+        0xBF => "/".into(),
+        0xC0 => "`".into(),
+        0xDB => "[".into(),
+        0xDC => "\\".into(),
+        0xDD => "]".into(),
+        0xDE => "'".into(),
+        _ => format!("VK 0x{vk:02X}"),
+    }
+}
+
+/// Hot-path copies of the hotkey virtual keys.
+///
+/// The keyboard hook fires *before* WM_HOTKEY is dispatched, so without this filter
+/// every hotkey press would be recorded into the macro.
+static HK_VK: [AtomicU32; 4] = [
+    AtomicU32::new(0x75), // F6 record
+    AtomicU32::new(0x76), // F7 play
+    AtomicU32::new(0x78), // F9 emergency stop
+    AtomicU32::new(0x77), // F8 pause
 ];
 
-fn vk_name(vk: u32) -> &'static str {
-    HOTKEY_CHOICES.iter().find(|(_, v)| *v == vk).map(|(n, _)| *n).unwrap_or("?")
-}
-
-/// Hot-path copies of the hotkey virtual-key codes.
-///
-/// The keyboard hook fires *before* Windows dispatches WM_HOTKEY, so without this
-/// filter every F8/F9 press would end up inside the recording (B9).
-static HK_VK: [AtomicU32; 3] =
-    [AtomicU32::new(0x77), AtomicU32::new(0x78), AtomicU32::new(0x13)];
-
-/// Bit mask of hotkeys that failed to register (R2). Bit 0 = record, 1 = play, 2 = stop.
+/// Bit mask of hotkeys that failed to register.
 static HK_FAILED: AtomicU32 = AtomicU32::new(0);
-
-/// Thread id of the hook thread, used to post re-registration requests.
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
-fn publish_hotkeys(cfg: &AppConfig) {
-    HK_VK[0].store(cfg.hotkey_record.vk, Ordering::Relaxed);
-    HK_VK[1].store(cfg.hotkey_play.vk, Ordering::Relaxed);
-    HK_VK[2].store(cfg.hotkey_stop.vk, Ordering::Relaxed);
-    *PENDING_HOTKEYS.lock() = [cfg.hotkey_record, cfg.hotkey_play, cfg.hotkey_stop];
-}
-
-static PENDING_HOTKEYS: Mutex<[Hotkey; 3]> = Mutex::new([
-    Hotkey::plain(0x77),
+static PENDING_HOTKEYS: Mutex<[Hotkey; 4]> = Mutex::new([
+    Hotkey::plain(0x75),
+    Hotkey::plain(0x76),
     Hotkey::plain(0x78),
-    Hotkey::plain(0x13),
+    Hotkey::plain(0x77),
 ]);
 
-fn is_hotkey_vk(vk: u32) -> bool {
-    HK_VK.iter().any(|a| a.load(Ordering::Relaxed) == vk)
+/// 0 = idle, 1..=4 = capture the next key press for that hotkey slot.
+static CAPTURE_SLOT: AtomicU32 = AtomicU32::new(0);
+static CAPTURED_KEY: Mutex<Option<Hotkey>> = Mutex::new(None);
+
+/// Keys offered in the dropdown next to each binding.
+///
+/// "Press a key" covers everything, but a plain list is guaranteed to work even if
+/// the window never sees the key press - including keys egui does not report at all
+/// (Pause, ScrollLock, NumPad).
+const HOTKEY_CHOICES: [(&str, u32); 26] = [
+    ("—", 0x00),
+    ("F1", 0x70), ("F2", 0x71), ("F3", 0x72), ("F4", 0x73),
+    ("F5", 0x74), ("F6", 0x75), ("F7", 0x76), ("F8", 0x77),
+    ("F9", 0x78), ("F10", 0x79), ("F11", 0x7A), ("F12", 0x7B),
+    ("Pause", 0x13), ("ScrollLock", 0x91), ("Insert", 0x2D), ("Delete", 0x2E),
+    ("Home", 0x24), ("End", 0x23), ("PageUp", 0x21), ("PageDown", 0x22),
+    ("Num0", 0x60), ("Num1", 0x61), ("Num*", 0x6A), ("Num-", 0x6D), ("Num+", 0x6B),
+];
+
+/// Starts binding mode for one hotkey slot.
+fn begin_capture(slot: u32) {
+    CAPTURE_SLOT.store(slot, Ordering::Relaxed);
+    *CAPTURED_KEY.lock() = None;
+    // Without this the currently bound keys are eaten by RegisterHotKey and would
+    // never arrive as window input, so F6-F9 could not be rebound onto each other.
+    request_hotkey_message(WM_APP_HK_OFF);
 }
 
-/// Ask the hook thread to re-register the hotkeys with the current configuration.
-fn request_hotkey_refresh() {
+/// Leaves binding mode and puts the global hotkeys back.
+fn end_capture() {
+    CAPTURE_SLOT.store(0, Ordering::Relaxed);
+    request_hotkey_message(WM_APP_REHOTKEY);
+}
+
+/// Maps an egui key to a Windows virtual-key code.
+///
+/// This is the capture path used while the window has focus; the low-level hook
+/// covers the rest (and keys egui never reports).
+fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
+    use egui::Key as K;
+    Some(match key {
+        K::A => 0x41, K::B => 0x42, K::C => 0x43, K::D => 0x44, K::E => 0x45,
+        K::F => 0x46, K::G => 0x47, K::H => 0x48, K::I => 0x49, K::J => 0x4A,
+        K::K => 0x4B, K::L => 0x4C, K::M => 0x4D, K::N => 0x4E, K::O => 0x4F,
+        K::P => 0x50, K::Q => 0x51, K::R => 0x52, K::S => 0x53, K::T => 0x54,
+        K::U => 0x55, K::V => 0x56, K::W => 0x57, K::X => 0x58, K::Y => 0x59,
+        K::Z => 0x5A,
+        K::Num0 => 0x30, K::Num1 => 0x31, K::Num2 => 0x32, K::Num3 => 0x33,
+        K::Num4 => 0x34, K::Num5 => 0x35, K::Num6 => 0x36, K::Num7 => 0x37,
+        K::Num8 => 0x38, K::Num9 => 0x39,
+        K::F1 => 0x70, K::F2 => 0x71, K::F3 => 0x72, K::F4 => 0x73,
+        K::F5 => 0x74, K::F6 => 0x75, K::F7 => 0x76, K::F8 => 0x77,
+        K::F9 => 0x78, K::F10 => 0x79, K::F11 => 0x7A, K::F12 => 0x7B,
+        K::Tab => 0x09, K::Backspace => 0x08, K::Enter => 0x0D, K::Space => 0x20,
+        K::Insert => 0x2D, K::Delete => 0x2E, K::Home => 0x24, K::End => 0x23,
+        K::PageUp => 0x21, K::PageDown => 0x22,
+        K::ArrowUp => 0x26, K::ArrowDown => 0x28,
+        K::ArrowLeft => 0x25, K::ArrowRight => 0x27,
+        _ => return None,
+    })
+}
+
+/// Pulls a binding out of this frame's window input, if binding mode is active.
+fn capture_from_window(ctx: &egui::Context) -> Option<Hotkey> {
+    ctx.input(|i| {
+        for ev in &i.events {
+            if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+                if *key == egui::Key::Escape {
+                    return Some(Hotkey::plain(0)); // treated as "cancel" by the caller
+                }
+                if let Some(vk) = egui_key_to_vk(*key) {
+                    return Some(Hotkey {
+                        vk,
+                        ctrl: modifiers.ctrl,
+                        alt: modifiers.alt,
+                        shift: modifiers.shift,
+                    });
+                }
+            }
+        }
+        None
+    })
+}
+
+fn publish_hotkeys(cfg: &AppConfig) {
+    let hk = [cfg.hotkey_record, cfg.hotkey_play, cfg.hotkey_stop, cfg.hotkey_pause];
+    for (i, k) in hk.iter().enumerate() {
+        HK_VK[i].store(k.vk, Ordering::Relaxed);
+    }
+    *PENDING_HOTKEYS.lock() = hk;
+}
+
+fn is_hotkey_vk(vk: u32) -> bool {
+    HK_VK.iter().any(|a| {
+        let v = a.load(Ordering::Relaxed);
+        v != 0 && v == vk
+    })
+}
+
+fn request_hotkey_message(msg: u32) {
     #[cfg(windows)]
     {
         let tid = HOOK_THREAD_ID.load(Ordering::Relaxed);
         if tid != 0 {
             unsafe {
-                let _ = win32::PostThreadMessageW(
-                    tid,
-                    WM_APP_REHOTKEY,
-                    win32::WPARAM(0),
-                    win32::LPARAM(0),
-                );
+                let _ = win32::PostThreadMessageW(tid, msg, win32::WPARAM(0), win32::LPARAM(0));
             }
         }
     }
+    #[cfg(not(windows))]
+    let _ = msg;
+}
+
+fn request_hotkey_refresh() {
+    request_hotkey_message(WM_APP_REHOTKEY);
 }
 
 // ============================================================================
-// Configuration & persistence
+// Configuration
 // ============================================================================
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -322,6 +450,8 @@ pub struct AppConfig {
     pub default_theme: usize,
     pub transparent_ui: bool,
     pub always_on_top: bool,
+    pub tray_enabled: bool,
+    pub close_to_tray: bool,
 
     // playback
     pub loop_play: bool,
@@ -330,10 +460,12 @@ pub struct AppConfig {
     pub absolute_mouse: bool,
     pub repeat_delay_ms: u64,
     pub jitter_pct: u64,
+    pub use_window_anchor: bool,
 
     // recording
     pub capture_mouse_moves: bool,
     pub mouse_sample_ms: u64,
+    pub record_window_anchor: bool,
 
     // time limit
     pub time_limit_enabled: bool,
@@ -343,10 +475,22 @@ pub struct AppConfig {
     pub action_on_completion: usize,
     pub shutdown_delay_s: u64,
 
+    // pixel stop condition
+    pub pixel_enabled: bool,
+    pub pixel_x: i32,
+    pub pixel_y: i32,
+    pub pixel_r: u8,
+    pub pixel_g: u8,
+    pub pixel_b: u8,
+    pub pixel_tolerance: u32,
+    /// 0 = stop when the pixel matches, 1 = stop when it stops matching.
+    pub pixel_mode: usize,
+
     // hotkeys
     pub hotkey_record: Hotkey,
     pub hotkey_play: Hotkey,
     pub hotkey_stop: Hotkey,
+    pub hotkey_pause: Hotkey,
 
     // files
     pub recent_files: Vec<String>,
@@ -360,6 +504,8 @@ impl Default for AppConfig {
             default_theme: 0,
             transparent_ui: true,
             always_on_top: true,
+            tray_enabled: true,
+            close_to_tray: true,
 
             loop_play: true,
             play_count_limit: 1,
@@ -367,9 +513,11 @@ impl Default for AppConfig {
             absolute_mouse: true,
             repeat_delay_ms: 0,
             jitter_pct: 0,
+            use_window_anchor: false,
 
             capture_mouse_moves: true,
             mouse_sample_ms: 5,
+            record_window_anchor: false,
 
             time_limit_enabled: false,
             time_limit_h: 0,
@@ -378,9 +526,19 @@ impl Default for AppConfig {
             action_on_completion: 0,
             shutdown_delay_s: 60,
 
-            hotkey_record: Hotkey::plain(0x77), // F8
-            hotkey_play: Hotkey::plain(0x78),   // F9
-            hotkey_stop: Hotkey::plain(0x13),   // Pause/Break
+            pixel_enabled: false,
+            pixel_x: 0,
+            pixel_y: 0,
+            pixel_r: 255,
+            pixel_g: 0,
+            pixel_b: 0,
+            pixel_tolerance: 20,
+            pixel_mode: 0,
+
+            hotkey_record: Hotkey::plain(0x75), // F6
+            hotkey_play: Hotkey::plain(0x76),   // F7
+            hotkey_pause: Hotkey::plain(0x77),  // F8
+            hotkey_stop: Hotkey::plain(0x78),   // F9
 
             recent_files: Vec::new(),
             compress_on_save: false,
@@ -402,6 +560,8 @@ impl AppConfig {
         self.time_limit_s = self.time_limit_s.min(59);
         self.action_on_completion = self.action_on_completion.min(EndAction::COUNT - 1);
         self.shutdown_delay_s = self.shutdown_delay_s.min(600);
+        self.pixel_tolerance = self.pixel_tolerance.min(255);
+        self.pixel_mode = self.pixel_mode.min(1);
         self.recent_files.truncate(8);
     }
 
@@ -417,8 +577,8 @@ impl AppConfig {
     }
 }
 
-fn load_config() -> AppConfig {
-    let mut cfg = std::fs::read_to_string(paths::config_path())
+fn load_config_from(path: &Path) -> AppConfig {
+    let mut cfg = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<AppConfig>(&s).ok())
         .unwrap_or_default();
@@ -426,15 +586,47 @@ fn load_config() -> AppConfig {
     cfg
 }
 
-fn save_config(cfg: &AppConfig) -> Result<()> {
+fn load_config() -> AppConfig {
+    load_config_from(&paths::config_path())
+}
+
+fn save_config_to(path: &Path, cfg: &AppConfig) -> Result<()> {
     let json = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(paths::config_path(), json)
-        .with_context(|| format!("writing {}", paths::config_path().display()))?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
+fn save_config(cfg: &AppConfig) -> Result<()> {
+    save_config_to(&paths::config_path(), cfg)
+}
+
+/// Named setting profiles stored in `<data>/profiles/<name>.json`.
+fn list_profiles() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(paths::profiles_dir()) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("json") {
+                if let Some(stem) = p.file_stem().and_then(|x| x.to_str()) {
+                    out.push(stem.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn profile_path(name: &str) -> PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .collect();
+    paths::profiles_dir().join(format!("{}.json", safe.trim()))
+}
+
 // ============================================================================
-// Macro event model & storage
+// Macro model & storage
 // ============================================================================
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -460,17 +652,30 @@ pub struct MacroEvent {
     pub kind: InputEventKind,
 }
 
+/// Position of the window that was in the foreground when recording started.
+///
+/// Lets playback re-anchor absolute coordinates if that window has since moved.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WindowAnchor {
+    pub title: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
 /// Macro container, format version 2.
 ///
-/// v1 files were a bare `[MacroEvent, ...]` array and are still accepted on load;
-/// the only thing they lose is the trailing pause of the recording (B8).
+/// v1 files were a bare `[MacroEvent, ...]` array and are still accepted on load.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MacroData {
     #[serde(default = "format_version")]
     pub version: u32,
-    /// Full length of the recording, including any trailing idle time.
+    /// Full recording length, including trailing idle time.
     #[serde(default)]
     pub duration_us: u64,
+    #[serde(default)]
+    pub anchor: Option<WindowAnchor>,
     pub events: Vec<MacroEvent>,
 }
 
@@ -480,23 +685,18 @@ fn format_version() -> u32 {
 
 impl MacroData {
     fn new(events: Vec<MacroEvent>, duration_us: u64) -> Self {
-        Self { version: 2, duration_us, events }
+        Self { version: 2, duration_us, anchor: None, events }
     }
-
     fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
-
     fn last_t(&self) -> u64 {
         self.events.last().map(|e| e.t_us).unwrap_or(0)
     }
-
-    /// Length of one playback cycle in recorded (un-scaled) microseconds.
     fn cycle_len_us(&self) -> u64 {
         self.duration_us.max(self.last_t()).max(1)
     }
-
-    /// Sorts non-monotonic timestamps and rejects obviously broken files (R5).
+    /// Sorts non-monotonic timestamps and rejects obviously broken files.
     fn normalize(&mut self) -> Result<()> {
         if self.events.is_empty() {
             anyhow::bail!("macro contains no events");
@@ -504,8 +704,7 @@ impl MacroData {
         if self.events.len() > MAX_EVENTS {
             anyhow::bail!("macro contains {} events (limit {MAX_EVENTS})", self.events.len());
         }
-        let monotonic = self.events.windows(2).all(|w| w[0].t_us <= w[1].t_us);
-        if !monotonic {
+        if !self.events.windows(2).all(|w| w[0].t_us <= w[1].t_us) {
             warn!("macro timestamps are not monotonic - sorting");
             self.events.sort_by_key(|e| e.t_us);
         }
@@ -517,7 +716,6 @@ impl MacroData {
     }
 }
 
-/// `.mrz` / `.gz` are gzipped compact JSON, everything else is plain JSON.
 fn is_compressed_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
@@ -525,39 +723,34 @@ fn is_compressed_path(path: &Path) -> bool {
     )
 }
 
+fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    enc.write_all(bytes)?;
+    Ok(enc.finish()?)
+}
+
+fn gunzip(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(bytes).read_to_end(&mut out)?;
+    Ok(out)
+}
+
 fn save_macro(path: &Path, data: &MacroData) -> Result<()> {
-    if is_compressed_path(path) {
-        use std::io::Write as _;
-        let raw = serde_json::to_vec(data)?;
-        let mut enc =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-        enc.write_all(&raw)?;
-        let compressed = enc.finish()?;
-        std::fs::write(path, compressed)
+    let bytes = if is_compressed_path(path) {
+        gzip(&serde_json::to_vec(data)?)?
     } else {
-        std::fs::write(path, serde_json::to_vec_pretty(data)?)
-    }
-    .with_context(|| format!("writing {}", path.display()))?;
+        serde_json::to_vec_pretty(data)?
+    };
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
-fn load_macro(path: &Path) -> Result<MacroData> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-
-    let text = if is_compressed_path(path) {
-        use std::io::Read as _;
-        let mut out = String::new();
-        flate2::read::GzDecoder::new(&bytes[..]).read_to_string(&mut out)?;
-        out
-    } else {
-        String::from_utf8(bytes).context("macro file is not valid UTF-8")?
-    };
-
-    // v2 object first, then fall back to the v1 bare array.
-    let mut data = match serde_json::from_str::<MacroData>(&text) {
+fn parse_macro(text: &str) -> Result<MacroData> {
+    let mut data = match serde_json::from_str::<MacroData>(text) {
         Ok(d) => d,
-        Err(obj_err) => match serde_json::from_str::<Vec<MacroEvent>>(&text) {
+        Err(obj_err) => match serde_json::from_str::<Vec<MacroEvent>>(text) {
             Ok(events) => {
                 let dur = events.last().map(|e| e.t_us).unwrap_or(0);
                 info!("loaded legacy v1 macro ({} events)", events.len());
@@ -568,6 +761,176 @@ fn load_macro(path: &Path) -> Result<MacroData> {
     };
     data.normalize()?;
     Ok(data)
+}
+
+fn load_macro(path: &Path) -> Result<MacroData> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = if is_compressed_path(path) {
+        String::from_utf8(gunzip(&bytes)?)?
+    } else {
+        String::from_utf8(bytes).context("macro file is not valid UTF-8")?
+    };
+    parse_macro(&text)
+}
+
+// ---------------------------------------------------------------------------
+// AutoHotkey export
+// ---------------------------------------------------------------------------
+
+/// Writes an AutoHotkey v2 script that reproduces the macro.
+///
+/// Coordinates are emitted in screen space (`CoordMode "Mouse", "Screen"`), and the
+/// gaps between events become `Sleep` calls, so the timing survives the trip.
+fn export_ahk(path: &Path, data: &MacroData, loops: u64) -> Result<()> {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(data.events.len() * 48);
+    s.push_str("#Requires AutoHotkey v2.0\n");
+    s.push_str("; Generated by Macro Recorder\n");
+    s.push_str("CoordMode \"Mouse\", \"Screen\"\n");
+    s.push_str("SetKeyDelay -1, -1\nSetMouseDelay -1\n\n");
+    s.push_str("Esc::ExitApp\n\n");
+    if loops == 0 {
+        s.push_str("Loop {\n");
+    } else {
+        let _ = writeln!(s, "Loop {loops} {{");
+    }
+
+    let mut prev = 0u64;
+    for ev in &data.events {
+        let gap_ms = (ev.t_us.saturating_sub(prev)) / 1000;
+        if gap_ms > 0 {
+            let _ = writeln!(s, "    Sleep {gap_ms}");
+        }
+        prev = ev.t_us;
+        match ev.kind {
+            InputEventKind::MouseMove { x, y, .. } => {
+                let _ = writeln!(s, "    MouseMove {x}, {y}, 0");
+            }
+            InputEventKind::MouseButton { button, down, x, y } => {
+                let name = match button {
+                    MouseButton::Left => "Left",
+                    MouseButton::Right => "Right",
+                    MouseButton::Middle => "Middle",
+                    MouseButton::X1 => "X1",
+                    MouseButton::X2 => "X2",
+                };
+                let state = if down { "D" } else { "U" };
+                let _ = writeln!(s, "    Click {x}, {y}, \"{name}\", \"{state}\"");
+            }
+            InputEventKind::MouseWheel { delta, horizontal, .. } => {
+                let dir = match (horizontal, delta >= 0) {
+                    (false, true) => "WheelUp",
+                    (false, false) => "WheelDown",
+                    (true, true) => "WheelRight",
+                    (true, false) => "WheelLeft",
+                };
+                let n = (delta.abs() / 120).max(1);
+                let _ = writeln!(s, "    Click \"{dir}\", {n}");
+            }
+            InputEventKind::Key { vk, down, .. } => {
+                let state = if down { "down" } else { "up" };
+                // vk<hex> is always valid in AHK and sidesteps name mapping entirely.
+                let _ = writeln!(s, "    Send \"{{vk{vk:02X} {state}}}\"");
+            }
+        }
+    }
+
+    let tail_ms = data.duration_us.saturating_sub(prev) / 1000;
+    if tail_ms > 0 {
+        let _ = writeln!(s, "    Sleep {tail_ms}");
+    }
+    s.push_str("}\n");
+
+    std::fs::write(path, s).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Self-running executable export
+// ---------------------------------------------------------------------------
+
+/// Playback settings baked into an exported executable.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Payload {
+    #[serde(default)]
+    loops: u64,
+    #[serde(default = "one_f64")]
+    speed: f64,
+    #[serde(default)]
+    absolute_mouse: bool,
+    #[serde(default)]
+    repeat_delay_ms: u64,
+    #[serde(default)]
+    macro_data: MacroData,
+}
+
+fn one_f64() -> f64 {
+    1.0
+}
+
+/// Returns the offset where an appended payload starts, if this image has one.
+fn payload_offset(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    let tail = &bytes[bytes.len() - 8..];
+    if tail != PAYLOAD_MAGIC {
+        return None;
+    }
+    let mut len = [0u8; 8];
+    len.copy_from_slice(&bytes[bytes.len() - 16..bytes.len() - 8]);
+    let len = u64::from_le_bytes(len) as usize;
+    let start = bytes.len().checked_sub(16 + len)?;
+    Some(start)
+}
+
+/// Copies this executable and appends the macro, producing a standalone player.
+///
+/// A PE image ignores trailing bytes, which is the same trick self-extracting
+/// archives use - no compiler or linker is involved.
+fn export_self_running_exe(dest: &Path, payload: &Payload) -> Result<()> {
+    let exe = std::env::current_exe().context("locating the current executable")?;
+    let mut bytes = std::fs::read(&exe).with_context(|| format!("reading {}", exe.display()))?;
+    if let Some(off) = payload_offset(&bytes) {
+        bytes.truncate(off); // never nest payloads
+    }
+    let blob = gzip(&serde_json::to_vec(payload)?)?;
+    bytes.extend_from_slice(&blob);
+    bytes.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(PAYLOAD_MAGIC);
+    std::fs::write(dest, bytes).with_context(|| format!("writing {}", dest.display()))?;
+    Ok(())
+}
+
+/// Reads a payload appended to our own image, if any.
+///
+/// Only the 16-byte footer is read on a normal launch, so the usual startup path
+/// never pulls the whole multi-megabyte image off disk.
+fn read_self_payload() -> Option<Payload> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let exe = std::env::current_exe().ok()?;
+    let mut file = std::fs::File::open(&exe).ok()?;
+    let size = file.metadata().ok()?.len();
+    if size < 16 {
+        return None;
+    }
+
+    let mut footer = [0u8; 16];
+    file.seek(SeekFrom::End(-16)).ok()?;
+    file.read_exact(&mut footer).ok()?;
+    if &footer[8..] != PAYLOAD_MAGIC {
+        return None;
+    }
+    let len = u64::from_le_bytes(footer[..8].try_into().ok()?);
+    let start = size.checked_sub(16 + len)?;
+
+    let mut blob = vec![0u8; len as usize];
+    file.seek(SeekFrom::Start(start)).ok()?;
+    file.read_exact(&mut blob).ok()?;
+
+    let json = gunzip(&blob).ok()?;
+    serde_json::from_slice::<Payload>(&json).ok()
 }
 
 // ============================================================================
@@ -586,7 +949,6 @@ pub enum EndAction {
 
 impl EndAction {
     const COUNT: usize = 6;
-
     fn from_index(i: usize) -> Self {
         match i {
             1 => Self::Shutdown,
@@ -600,7 +962,7 @@ impl EndAction {
 }
 
 // ============================================================================
-// Virtual Desktop isolation (Windows 11)
+// Virtual desktop isolation
 // ============================================================================
 
 #[cfg(windows)]
@@ -611,7 +973,6 @@ mod virtual_desktop {
 
     thread_local! {
         static VDM: RefCell<Option<IVirtualDesktopManager>> = const { RefCell::new(None) };
-        /// (last check timestamp, cached answer) - see B4.
         static CACHE: RefCell<(u64, bool)> = const { RefCell::new((0, true)) };
     }
 
@@ -636,15 +997,12 @@ mod virtual_desktop {
         })
     }
 
-    /// Throttled variant used by the hooks and the playback loop.
-    ///
-    /// A COM round-trip per keystroke is exactly the kind of thing that gets a
-    /// low-level hook killed by the system, so the answer is cached.
+    /// Throttled: a COM round-trip per keystroke would get the hook killed.
     pub fn is_app_on_active_desktop_cached(hwnd: HWND) -> bool {
         let now = now_us();
         CACHE.with(|c| {
             let mut c = c.borrow_mut();
-            if now.saturating_sub(c.0) >= DESKTOP_TTL_US || c.0 == 0 {
+            if c.0 == 0 || now.saturating_sub(c.0) >= DESKTOP_TTL_US {
                 c.0 = now;
                 c.1 = query(hwnd);
             }
@@ -668,23 +1026,17 @@ mod virtual_desktop {
 #[cfg(windows)]
 mod platform {
     use super::win32::*;
-    use super::{APP_TITLE, EndAction, METRICS_TTL_US, now_us};
+    use super::{APP_TITLE, EndAction, METRICS_TTL_US, WindowAnchor, now_us, wide};
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicU64, Ordering};
 
-    /// Cached main-window handle (B4). Resolved at most once per second.
     static HWND_CACHE: AtomicIsize = AtomicIsize::new(0);
     static HWND_LAST_TRY: AtomicU64 = AtomicU64::new(0);
-
-    /// Cached virtual-screen metrics (R6).
     static VS: [AtomicI32; 4] =
         [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(1), AtomicI32::new(1)];
     static VS_LAST: AtomicU64 = AtomicU64::new(0);
 
-    /// Finds (and caches) our own top-level window.
-    ///
-    /// Verified against the process id so a foreign window with the same caption
-    /// can never be picked up.
+    /// Our own top-level window, cached and validated against the process id.
     pub fn app_hwnd() -> HWND {
         let cached = HWND_CACHE.load(Ordering::Relaxed);
         if cached != 0 {
@@ -694,7 +1046,6 @@ mod platform {
             }
             HWND_CACHE.store(0, Ordering::Relaxed);
         }
-
         let now = now_us();
         let last = HWND_LAST_TRY.load(Ordering::Relaxed);
         if last != 0 && now.saturating_sub(last) < 1_000_000 {
@@ -703,7 +1054,7 @@ mod platform {
         HWND_LAST_TRY.store(now, Ordering::Relaxed);
 
         unsafe {
-            let title: Vec<u16> = APP_TITLE.encode_utf16().chain(std::iter::once(0)).collect();
+            let title = wide(APP_TITLE);
             if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
                 if !hwnd.0.is_null() {
                     let mut pid = 0u32;
@@ -730,7 +1081,7 @@ mod platform {
                 &dark_mode as *const i32 as *const c_void,
                 std::mem::size_of::<i32>() as u32,
             );
-            // DWMWA_SYSTEMBACKDROP_TYPE = 38: 1 = none, 2 = Mica, 3 = Acrylic, 4 = Tabbed.
+            // DWMWA_SYSTEMBACKDROP_TYPE: 1 = none, 2 = Mica, 3 = Acrylic, 4 = Tabbed.
             let backdrop_type: i32 = backdrop;
             let result = DwmSetWindowAttribute(
                 hwnd,
@@ -739,7 +1090,6 @@ mod platform {
                 std::mem::size_of::<i32>() as u32,
             );
             if result.is_err() && backdrop > 1 {
-                // Windows 10 fallback.
                 let bb = DWM_BLURBEHIND {
                     dwFlags: DWM_BB_ENABLE,
                     fEnable: true.into(),
@@ -771,10 +1121,7 @@ mod platform {
         )
     }
 
-    /// Normalizes a screen pixel to the 0..=65535 range SendInput expects.
-    ///
-    /// Uses `w - 1` as the denominator (R6) so the right/bottom-most pixel is
-    /// actually reachable; the classic `/ w` formula can never emit 65535.
+    /// `w - 1` as the denominator so the right/bottom-most pixel stays reachable.
     pub fn normalize_abs(x: i32, y: i32, vx: i32, vy: i32, vw: i32, vh: i32) -> (i32, i32) {
         let dx = (vw - 1).max(1) as f64;
         let dy = (vh - 1).max(1) as f64;
@@ -811,14 +1158,79 @@ mod platform {
             let _ = timeBeginPeriod(1);
         }
     }
-
     pub fn end_high_res_timer() {
         unsafe {
             let _ = timeEndPeriod(1);
         }
     }
 
-    /// Enables SeShutdownPrivilege for the current process.
+    /// Colour of a screen pixel, or None if the read failed.
+    pub fn screen_pixel(x: i32, y: i32) -> Option<(u8, u8, u8)> {
+        unsafe {
+            let hdc = GetDC(None);
+            if hdc.is_invalid() {
+                return None;
+            }
+            let c = GetPixel(hdc, x, y);
+            ReleaseDC(None, hdc);
+            if c.0 == 0xFFFF_FFFF {
+                return None;
+            }
+            Some(((c.0 & 0xFF) as u8, ((c.0 >> 8) & 0xFF) as u8, ((c.0 >> 16) & 0xFF) as u8))
+        }
+    }
+
+    pub fn cursor_pos() -> (i32, i32) {
+        unsafe {
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            (p.x, p.y)
+        }
+    }
+
+    /// Title + rect of the foreground window, skipping our own.
+    pub fn foreground_anchor() -> Option<WindowAnchor> {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() || hwnd == app_hwnd() {
+                return None;
+            }
+            let mut buf = [0u16; 256];
+            let len = GetWindowTextW(hwnd, &mut buf);
+            if len <= 0 {
+                return None;
+            }
+            let title = String::from_utf16_lossy(&buf[..len as usize]);
+            let mut r = RECT::default();
+            if GetWindowRect(hwnd, &mut r).is_err() {
+                return None;
+            }
+            Some(WindowAnchor {
+                title,
+                x: r.left,
+                y: r.top,
+                w: r.right - r.left,
+                h: r.bottom - r.top,
+            })
+        }
+    }
+
+    /// Current position of the anchored window, if it is still around.
+    pub fn find_window_rect(title: &str) -> Option<(i32, i32)> {
+        unsafe {
+            let w = wide(title);
+            let hwnd = FindWindowW(None, PCWSTR(w.as_ptr())).ok()?;
+            if hwnd.0.is_null() {
+                return None;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(hwnd, &mut r).is_err() {
+                return None;
+            }
+            Some((r.left, r.top))
+        }
+    }
+
     unsafe fn enable_shutdown_privilege() {
         unsafe {
             let mut token = HANDLE::default();
@@ -835,7 +1247,10 @@ mod platform {
             if LookupPrivilegeValueW(None, w!("SeShutdownPrivilege"), &mut luid).is_ok() {
                 let mut tp = TOKEN_PRIVILEGES {
                     PrivilegeCount: 1,
-                    Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+                    Privileges: [LUID_AND_ATTRIBUTES {
+                        Luid: luid,
+                        Attributes: SE_PRIVILEGE_ENABLED,
+                    }],
                 };
                 let _ = AdjustTokenPrivileges(token, false, Some(&mut tp), 0, None, None);
             }
@@ -843,29 +1258,25 @@ mod platform {
         }
     }
 
-    /// Executes the configured end-of-run action.
-    ///
-    /// Shutdown / reboot use a visible countdown, so `shutdown /a` can still abort it.
     pub fn run_end_action(action: EndAction, delay_s: u32, reason: &str) -> anyhow::Result<()> {
         unsafe {
             match action {
                 EndAction::Stop => Ok(()),
                 EndAction::Shutdown | EndAction::Reboot => {
                     enable_shutdown_privilege();
-                    let msg: Vec<u16> =
-                        reason.encode_utf16().chain(std::iter::once(0)).collect();
+                    let msg = wide(reason);
                     let reboot = matches!(action, EndAction::Reboot);
-                    let res = InitiateSystemShutdownExW(
+                    InitiateSystemShutdownExW(
                         PCWSTR::null(),
                         PCWSTR(msg.as_ptr()),
                         delay_s,
-                        true.into(),   // force apps closed
-                        reboot.into(), // reboot afterwards
+                        true.into(),
+                        reboot.into(),
                         SHTDN_REASON_MAJOR_OTHER
                             | SHTDN_REASON_MINOR_OTHER
                             | SHTDN_REASON_FLAG_PLANNED,
-                    );
-                    res.map_err(|e| anyhow::anyhow!("InitiateSystemShutdownExW failed: {e}"))
+                    )
+                    .map_err(|e| anyhow::anyhow!("InitiateSystemShutdownExW failed: {e}"))
                 }
                 EndAction::LogOff => {
                     enable_shutdown_privilege();
@@ -878,13 +1289,11 @@ mod platform {
                 EndAction::Sleep | EndAction::Hibernate => {
                     enable_shutdown_privilege();
                     let hibernate = matches!(action, EndAction::Hibernate);
-                    // windows 0.62: fn SetSuspendState(bhibernate: bool, bforce: bool,
-                    //                                  bwakeupeventsdisabled: bool) -> bool
                     if SetSuspendState(hibernate, true, false) {
                         Ok(())
                     } else {
                         Err(anyhow::anyhow!(
-                            "SetSuspendState failed (hibernation may be disabled on this system)"
+                            "SetSuspendState failed (hibernation may be disabled)"
                         ))
                     }
                 }
@@ -892,7 +1301,6 @@ mod platform {
         }
     }
 
-    /// Returns false when another instance already holds the mutex (R1).
     pub fn acquire_single_instance() -> bool {
         unsafe {
             match CreateMutexW(None, true, w!("Local\\MacroRecorder_SingleInstance_v1")) {
@@ -901,11 +1309,9 @@ mod platform {
                         let _ = CloseHandle(handle);
                         false
                     } else {
-                        // The handle is intentionally never closed: the mutex has to stay
-                        // owned for the whole process lifetime. `HANDLE` is a Copy wrapper
-                        // around a raw handle with no Drop impl, so simply letting it go out
-                        // of scope leaves the kernel object open until the process exits -
-                        // `mem::forget` would have been a no-op here.
+                        // Never closed on purpose: the mutex must live as long as the
+                        // process. HANDLE has no Drop, so letting it fall out of scope
+                        // leaves the kernel object open.
                         true
                     }
                 }
@@ -914,9 +1320,35 @@ mod platform {
         }
     }
 
+    /// Hides or restores our own top-level window.
+    pub fn set_window_hidden(hidden: bool) {
+        unsafe {
+            let hwnd = app_hwnd();
+            if hwnd.0.is_null() {
+                return;
+            }
+            if hidden {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            } else {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+    }
+
+    /// Asks the main window to close, exactly the way the ✕ button does.
+    pub fn request_app_close() {
+        unsafe {
+            let hwnd = app_hwnd();
+            if !hwnd.0.is_null() {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
     pub fn focus_existing_instance() {
         unsafe {
-            let title: Vec<u16> = APP_TITLE.encode_utf16().chain(std::iter::once(0)).collect();
+            let title = wide(APP_TITLE);
             if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
                 if !hwnd.0.is_null() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -926,28 +1358,16 @@ mod platform {
         }
     }
 
-    /// Attaches to the parent console so `--help` / `--no-gui` can print something
-    /// even though the release build is a GUI subsystem binary.
-    ///
-    /// `AttachConsole` is resolved at runtime instead of being linked directly: that
-    /// keeps the crate free of the `Win32_System_Console` feature, so this file builds
-    /// against any feature set that already covers the rest of the app.
-    ///
-    /// Must run before the first `println!` - Rust caches the std handles on first use,
-    /// and `AttachConsole` is what populates them for a GUI-subsystem process.
+    /// Resolved dynamically so the crate needs no Win32_System_Console feature.
     pub fn attach_parent_console() {
         const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
         unsafe {
             let Ok(kernel32) = GetModuleHandleW(w!("kernel32.dll")) else {
                 return;
             };
-            let Some(sym) =
-                GetProcAddress(kernel32, PCSTR(b"AttachConsole\0".as_ptr()))
-            else {
+            let Some(sym) = GetProcAddress(kernel32, PCSTR(b"AttachConsole\0".as_ptr())) else {
                 return;
             };
-            // FARPROC is `Option<unsafe extern "system" fn() -> isize>`; re-type it to the
-            // real AttachConsole signature: BOOL AttachConsole(DWORD dwProcessId).
             let attach: unsafe extern "system" fn(u32) -> i32 = std::mem::transmute(sym);
             let _ = attach(ATTACH_PARENT_PROCESS);
         }
@@ -962,16 +1382,30 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use super::EndAction;
+    use super::{EndAction, WindowAnchor};
 
     pub fn app_hwnd() {}
     pub fn apply_system_backdrop(_: (), _: i32) {}
     pub unsafe fn send_absolute_mouse_move(_: i32, _: i32) {}
     pub fn begin_high_res_timer() {}
     pub fn end_high_res_timer() {}
+    pub fn screen_pixel(_: i32, _: i32) -> Option<(u8, u8, u8)> {
+        None
+    }
+    pub fn cursor_pos() -> (i32, i32) {
+        (0, 0)
+    }
+    pub fn foreground_anchor() -> Option<WindowAnchor> {
+        None
+    }
+    pub fn find_window_rect(_: &str) -> Option<(i32, i32)> {
+        None
+    }
     pub fn acquire_single_instance() -> bool {
         true
     }
+    pub fn set_window_hidden(_: bool) {}
+    pub fn request_app_close() {}
     pub fn focus_existing_instance() {}
     pub fn attach_parent_console() {}
     pub fn set_dpi_awareness() {}
@@ -984,8 +1418,36 @@ mod platform {
 }
 
 // ============================================================================
-// Shared application state
+// Shared state
 // ============================================================================
+
+/// Mirrors the main window visibility so the tray menu can label itself correctly.
+static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(true);
+/// Set by "Exit" so the close-to-tray rule lets that one close through.
+static ALLOW_CLOSE: AtomicBool = AtomicBool::new(false);
+
+/// Shows or hides the main window.
+///
+/// Uses `ShowWindow` rather than a viewport command: the tray lives on the hook
+/// thread, and a hidden window stops painting, so anything routed through the UI
+/// thread would never bring it back.
+fn set_window_visible(visible: bool) {
+    WINDOW_VISIBLE.store(visible, Ordering::Relaxed);
+    platform::set_window_hidden(!visible);
+}
+
+fn toggle_main_window() {
+    set_window_visible(!WINDOW_VISIBLE.load(Ordering::Relaxed));
+}
+
+/// Quits for real, even when the close button is set to minimize to tray.
+fn quit_application() {
+    ALLOW_CLOSE.store(true, Ordering::Relaxed);
+    // The window has to be up for winit to deliver the close, and it doubles as the
+    // only visible sign that Exit was registered.
+    set_window_visible(true);
+    platform::request_app_close();
+}
 
 pub struct AppState {
     // lifecycle
@@ -993,10 +1455,10 @@ pub struct AppState {
     pub playing: AtomicBool,
     pub paused: AtomicBool,
     pub stop_play: AtomicBool,
-    /// Incremented on every playback start; an older thread sees the mismatch and exits (B6).
     pub play_generation: AtomicU64,
-    /// Set while playback is held back by the virtual-desktop gate (UI feedback).
     pub held_by_desktop: AtomicBool,
+    /// Set when playback ended because the pixel condition fired.
+    pub pixel_triggered: AtomicBool,
 
     // playback settings
     pub loop_play: AtomicBool,
@@ -1005,17 +1467,27 @@ pub struct AppState {
     pub absolute_mouse: AtomicBool,
     pub repeat_delay_ms: AtomicU64,
     pub jitter_pct: AtomicU64,
+    pub use_window_anchor: AtomicBool,
     pub speed: Mutex<f64>,
 
     // recording settings
     pub capture_mouse_moves: AtomicBool,
     pub mouse_sample_us: AtomicU64,
+    pub record_window_anchor: AtomicBool,
 
     // time limit
     pub time_limit_enabled: AtomicBool,
     pub time_limit_us: AtomicU64,
     pub action_on_completion: AtomicU64,
     pub shutdown_delay_s: AtomicU64,
+
+    // pixel condition
+    pub pixel_enabled: AtomicBool,
+    pub pixel_x: AtomicI32,
+    pub pixel_y: AtomicI32,
+    pub pixel_rgb: AtomicU32,
+    pub pixel_tolerance: AtomicU32,
+    pub pixel_mode: AtomicU32,
 
     // recording bookkeeping
     pub rec_start_us: AtomicU64,
@@ -1039,6 +1511,7 @@ impl AppState {
             stop_play: AtomicBool::new(false),
             play_generation: AtomicU64::new(0),
             held_by_desktop: AtomicBool::new(false),
+            pixel_triggered: AtomicBool::new(false),
 
             loop_play: AtomicBool::new(true),
             play_count: AtomicU64::new(0),
@@ -1046,15 +1519,24 @@ impl AppState {
             absolute_mouse: AtomicBool::new(true),
             repeat_delay_ms: AtomicU64::new(0),
             jitter_pct: AtomicU64::new(0),
+            use_window_anchor: AtomicBool::new(false),
             speed: Mutex::new(1.0),
 
             capture_mouse_moves: AtomicBool::new(true),
             mouse_sample_us: AtomicU64::new(5_000),
+            record_window_anchor: AtomicBool::new(true),
 
             time_limit_enabled: AtomicBool::new(false),
             time_limit_us: AtomicU64::new(0),
             action_on_completion: AtomicU64::new(0),
             shutdown_delay_s: AtomicU64::new(60),
+
+            pixel_enabled: AtomicBool::new(false),
+            pixel_x: AtomicI32::new(0),
+            pixel_y: AtomicI32::new(0),
+            pixel_rgb: AtomicU32::new(0xFF_0000),
+            pixel_tolerance: AtomicU32::new(20),
+            pixel_mode: AtomicU32::new(0),
 
             rec_start_us: AtomicU64::new(0),
             last_move_us: AtomicU64::new(0),
@@ -1069,26 +1551,35 @@ impl AppState {
     }
 }
 
-/// Applies every persisted setting to the live state (B1).
+/// Pushes every persisted setting into the live state.
 ///
-/// This used to happen only inside `if checkbox(..).changed()`, which meant a saved
-/// time limit or `loop_play = false` was silently ignored until the user toggled
-/// the widget by hand.
+/// Called at startup and once per UI frame, so the running engine can never drift
+/// from what the user sees.
 fn apply_config_to_state(cfg: &AppConfig, state: &AppState) {
     state.loop_play.store(cfg.loop_play, Ordering::Relaxed);
     state.play_count_limit.store(cfg.play_count_limit, Ordering::Relaxed);
     state.absolute_mouse.store(cfg.absolute_mouse, Ordering::Relaxed);
     state.repeat_delay_ms.store(cfg.repeat_delay_ms, Ordering::Relaxed);
     state.jitter_pct.store(cfg.jitter_pct, Ordering::Relaxed);
+    state.use_window_anchor.store(cfg.use_window_anchor, Ordering::Relaxed);
     *state.speed.lock() = cfg.speed;
 
     state.capture_mouse_moves.store(cfg.capture_mouse_moves, Ordering::Relaxed);
     state.mouse_sample_us.store(cfg.mouse_sample_ms * 1_000, Ordering::Relaxed);
+    state.record_window_anchor.store(cfg.record_window_anchor, Ordering::Relaxed);
 
     state.time_limit_enabled.store(cfg.time_limit_enabled, Ordering::Relaxed);
     state.time_limit_us.store(cfg.time_limit_us(), Ordering::Relaxed);
     state.action_on_completion.store(cfg.action_on_completion as u64, Ordering::Relaxed);
     state.shutdown_delay_s.store(cfg.shutdown_delay_s, Ordering::Relaxed);
+
+    state.pixel_enabled.store(cfg.pixel_enabled, Ordering::Relaxed);
+    state.pixel_x.store(cfg.pixel_x, Ordering::Relaxed);
+    state.pixel_y.store(cfg.pixel_y, Ordering::Relaxed);
+    let rgb = ((cfg.pixel_r as u32) << 16) | ((cfg.pixel_g as u32) << 8) | cfg.pixel_b as u32;
+    state.pixel_rgb.store(rgb, Ordering::Relaxed);
+    state.pixel_tolerance.store(cfg.pixel_tolerance, Ordering::Relaxed);
+    state.pixel_mode.store(cfg.pixel_mode as u32, Ordering::Relaxed);
 }
 
 fn current_rec_time_us(state: &AppState) -> u64 {
@@ -1099,7 +1590,7 @@ fn current_rec_time_us(state: &AppState) -> u64 {
 // Playback engine
 // ============================================================================
 
-/// Tracks what playback currently holds down, so nothing stays stuck (B3).
+/// Tracks what playback is holding down so nothing can stay stuck.
 #[derive(Default)]
 struct PressedInputs {
     keys: Vec<(u16, u16, bool)>,
@@ -1117,7 +1608,6 @@ impl PressedInputs {
             self.keys.retain(|k| *k != key);
         }
     }
-
     fn note_button(&mut self, button: MouseButton, down: bool) {
         if down {
             if !self.buttons.contains(&button) {
@@ -1127,12 +1617,10 @@ impl PressedInputs {
             self.buttons.retain(|b| *b != button);
         }
     }
-
     fn is_empty(&self) -> bool {
         self.keys.is_empty() && self.buttons.is_empty()
     }
 
-    /// Releases everything still held, newest first.
     #[cfg(windows)]
     fn release_all(&mut self, state: &AppState) {
         while let Some((vk, scan, extended)) = self.keys.pop() {
@@ -1141,6 +1629,7 @@ impl PressedInputs {
                     &InputEventKind::Key { vk, scan, down: false, extended },
                     state,
                     &mut PressedInputs::default(),
+                    (0, 0),
                 );
             }
         }
@@ -1150,6 +1639,7 @@ impl PressedInputs {
                     &InputEventKind::MouseButton { button, down: false, x: 0, y: 0 },
                     state,
                     &mut PressedInputs::default(),
+                    (0, 0),
                 );
             }
         }
@@ -1162,8 +1652,26 @@ impl PressedInputs {
     }
 }
 
-/// Sleeps until `due_us` on the playback clock, waking up often enough to notice
-/// Stop and Pause (B2). Returns false if playback should abort.
+/// True when the configured pixel condition currently says "stop".
+fn pixel_condition_met(state: &AppState) -> bool {
+    if !state.pixel_enabled.load(Ordering::Relaxed) {
+        return false;
+    }
+    let (x, y) = (state.pixel_x.load(Ordering::Relaxed), state.pixel_y.load(Ordering::Relaxed));
+    let Some((r, g, b)) = platform::screen_pixel(x, y) else {
+        return false;
+    };
+    let want = state.pixel_rgb.load(Ordering::Relaxed);
+    let (wr, wg, wb) = (((want >> 16) & 0xFF) as i32, ((want >> 8) & 0xFF) as i32, (want & 0xFF) as i32);
+    let tol = state.pixel_tolerance.load(Ordering::Relaxed) as i32;
+    let matches = (r as i32 - wr).abs() <= tol
+        && (g as i32 - wg).abs() <= tol
+        && (b as i32 - wb).abs() <= tol;
+    if state.pixel_mode.load(Ordering::Relaxed) == 0 { matches } else { !matches }
+}
+
+/// Sleeps until `due_us`, waking often enough to notice Stop and Pause.
+/// Returns false when playback should abort.
 fn wait_until(
     state: &AppState,
     generation: u64,
@@ -1177,15 +1685,13 @@ fn wait_until(
             return false;
         }
         if state.paused.load(Ordering::Relaxed) {
-            return true; // let the main loop handle the pause bookkeeping
+            return true;
         }
-
         let now = elapsed_us();
         if now >= due_us {
             return true;
         }
         let remaining = due_us - now;
-
         if remaining > SPIN_THRESHOLD_US {
             let chunk = remaining.saturating_sub(1_000).min(SLEEP_CHUNK_US);
             std::thread::sleep(Duration::from_micros(chunk.max(1)));
@@ -1204,11 +1710,28 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
 
     virtual_desktop::init_thread();
     platform::begin_high_res_timer();
+    state.pixel_triggered.store(false, Ordering::Relaxed);
 
     let speed = (*state.speed.lock()).clamp(0.05, 10.0);
     let repeat_delay_us = state.repeat_delay_ms.load(Ordering::Relaxed) * 1_000;
     let jitter_pct = state.jitter_pct.load(Ordering::Relaxed);
     let cycle_us = ((data.cycle_len_us() as f64 / speed) as u64) + repeat_delay_us;
+
+    // Re-anchor absolute coordinates if the target window has moved since recording.
+    let offset = match (state.use_window_anchor.load(Ordering::Relaxed), data.anchor.as_ref()) {
+        (true, Some(anchor)) => match platform::find_window_rect(&anchor.title) {
+            Some((x, y)) => {
+                let off = (x - anchor.x, y - anchor.y);
+                info!("anchored to '{}': offset {:?}", anchor.title, off);
+                off
+            }
+            None => {
+                warn!("anchor window '{}' not found - playing unshifted", anchor.title);
+                (0, 0)
+            }
+        },
+        _ => (0, 0),
+    };
 
     let loop_play = state.loop_play.load(Ordering::Relaxed);
     let max_count = if loop_play {
@@ -1227,14 +1750,16 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
     let mut index: usize = 0;
     let mut count: u64 = 0;
     let mut prev_scaled_t: u64 = 0;
+    let mut last_pixel_check: u64 = 0;
 
-    // Monotonic playback clock that excludes paused time (F3 / fixes the
-    // virtual-desktop fast-forward: holding no longer accumulates schedule debt).
+    // Playback clock that excludes paused time.
     macro_rules! elapsed_us {
         () => {
             (start.elapsed().as_micros() as u64).saturating_sub(paused_us)
         };
     }
+
+    let mut finish_action: Option<EndAction> = None;
 
     loop {
         if state.stop_play.load(Ordering::Relaxed)
@@ -1243,14 +1768,11 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
             break;
         }
 
-        // ---- pause / virtual-desktop gate ----------------------------------
+        // ---- pause / virtual-desktop gate ---------------------------------
         let on_desktop = virtual_desktop::is_app_on_active_desktop_cached(platform::app_hwnd());
         state.held_by_desktop.store(!on_desktop, Ordering::Relaxed);
-        let should_hold = state.paused.load(Ordering::Relaxed) || !on_desktop;
-
-        if should_hold {
+        if state.paused.load(Ordering::Relaxed) || !on_desktop {
             if pause_started.is_none() {
-                // Never leave a key or a button held down while suspended.
                 if !pressed.is_empty() {
                     pressed.release_all(&state);
                 }
@@ -1262,22 +1784,30 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
             paused_us = paused_us.saturating_add(p.elapsed().as_micros() as u64);
         }
 
+        let now_running = elapsed_us!();
+
+        // ---- pixel stop condition -----------------------------------------
+        if state.pixel_enabled.load(Ordering::Relaxed)
+            && now_running.saturating_sub(last_pixel_check) >= PIXEL_CHECK_TTL_US
+        {
+            last_pixel_check = now_running;
+            if pixel_condition_met(&state) {
+                info!("pixel condition met - stopping");
+                state.pixel_triggered.store(true, Ordering::Relaxed);
+                finish_action = Some(EndAction::from_index(
+                    state.action_on_completion.load(Ordering::Relaxed) as usize,
+                ));
+                break;
+            }
+        }
+
         // ---- time limit ----------------------------------------------------
         if state.time_limit_enabled.load(Ordering::Relaxed) {
             let limit = state.time_limit_us.load(Ordering::Relaxed);
-            if limit > 0 && elapsed_us!() >= limit {
-                let action =
-                    EndAction::from_index(state.action_on_completion.load(Ordering::Relaxed) as usize);
-                pressed.release_all(&state);
-                // The loop breaks right after, so this can only ever fire once.
-                if action != EndAction::Stop {
-                    let delay = state.shutdown_delay_s.load(Ordering::Relaxed) as u32;
-                    match platform::run_end_action(action, delay, "Macro Recorder: time limit reached.")
-                    {
-                        Ok(()) => info!("end action {action:?} requested"),
-                        Err(e) => warn!("end action failed: {e}"),
-                    }
-                }
+            if limit > 0 && now_running >= limit {
+                finish_action = Some(EndAction::from_index(
+                    state.action_on_completion.load(Ordering::Relaxed) as usize,
+                ));
                 break;
             }
         }
@@ -1301,7 +1831,7 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
         let mut due = cycle_start_us + scaled_t;
 
         if jitter_pct > 0 {
-            // Positive-only jitter keeps the sequence ordered and never fires early.
+            // Positive-only jitter keeps the order intact and never fires early.
             let gap = scaled_t.saturating_sub(prev_scaled_t);
             let max_off = gap.saturating_mul(jitter_pct) / 100;
             due = due.saturating_add(rng.below(max_off.min(250_000) + 1));
@@ -1310,16 +1840,13 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
         if !wait_until(&state, generation, due, &|| elapsed_us!()) {
             break;
         }
-        if state.paused.load(Ordering::Relaxed) {
-            continue; // handled at the top of the loop
-        }
-        if elapsed_us!() < due {
-            continue; // woke up early (pause toggled) - re-evaluate
+        if state.paused.load(Ordering::Relaxed) || elapsed_us!() < due {
+            continue;
         }
 
         #[cfg(windows)]
         unsafe {
-            send_input_event(&ev.kind, &state, &mut pressed);
+            send_input_event(&ev.kind, &state, &mut pressed, offset);
         }
 
         prev_scaled_t = scaled_t;
@@ -1330,7 +1857,16 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
     platform::end_high_res_timer();
     state.held_by_desktop.store(false, Ordering::Relaxed);
 
-    // Only the current generation is allowed to clear the flag (B6).
+    if let Some(action) = finish_action {
+        if action != EndAction::Stop {
+            let delay = state.shutdown_delay_s.load(Ordering::Relaxed) as u32;
+            match platform::run_end_action(action, delay, "Macro Recorder: run finished.") {
+                Ok(()) => info!("end action {action:?} requested"),
+                Err(e) => warn!("end action failed: {e}"),
+            }
+        }
+    }
+
     if state.play_generation.load(Ordering::Relaxed) == generation {
         state.paused.store(false, Ordering::Relaxed);
         state.playing.store(false, Ordering::Relaxed);
@@ -1339,7 +1875,12 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
 }
 
 #[cfg(windows)]
-unsafe fn send_input_event(kind: &InputEventKind, state: &AppState, pressed: &mut PressedInputs) {
+unsafe fn send_input_event(
+    kind: &InputEventKind,
+    state: &AppState,
+    pressed: &mut PressedInputs,
+    offset: (i32, i32),
+) {
     use win32::*;
     unsafe {
         match kind {
@@ -1375,7 +1916,7 @@ unsafe fn send_input_event(kind: &InputEventKind, state: &AppState, pressed: &mu
             }
             InputEventKind::MouseMove { x, y, dx, dy } => {
                 if state.absolute_mouse.load(Ordering::Relaxed) {
-                    platform::send_absolute_mouse_move(*x, *y);
+                    platform::send_absolute_mouse_move(*x + offset.0, *y + offset.1);
                 } else {
                     let input = INPUT {
                         r#type: INPUT_MOUSE,
@@ -1395,7 +1936,7 @@ unsafe fn send_input_event(kind: &InputEventKind, state: &AppState, pressed: &mu
             }
             InputEventKind::MouseButton { button, down, x, y } => {
                 if state.absolute_mouse.load(Ordering::Relaxed) && (*x != 0 || *y != 0) {
-                    platform::send_absolute_mouse_move(*x, *y);
+                    platform::send_absolute_mouse_move(*x + offset.0, *y + offset.1);
                 }
                 let (flags, data) = match (button, down) {
                     (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
@@ -1461,8 +2002,7 @@ fn stop_recording(state: &AppState) {
     if state.recording.swap(false, Ordering::Relaxed) {
         let dur = current_rec_time_us(state);
         state.recorded_time_us.store(dur, Ordering::Relaxed);
-        // Give the collector a moment to drain, then stamp the true duration (B8).
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(30)); // let the collector drain
         let mut data = state.macro_data.lock();
         data.duration_us = dur.max(data.last_t());
         data.version = 2;
@@ -1474,11 +2014,17 @@ fn start_recording(state: &Arc<AppState>) {
     if state.playing.load(Ordering::Relaxed) {
         return;
     }
+    let anchor = if state.record_window_anchor.load(Ordering::Relaxed) {
+        platform::foreground_anchor()
+    } else {
+        None
+    };
     {
         let mut data = state.macro_data.lock();
         data.events.clear();
         data.duration_us = 0;
         data.version = 2;
+        data.anchor = anchor;
     }
     *state.last_x.lock() = i32::MIN;
     *state.last_y.lock() = i32::MIN;
@@ -1512,15 +2058,16 @@ fn start_playback(state: &Arc<AppState>) {
     state.playing.store(true, Ordering::Relaxed);
 
     let s = state.clone();
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("playback".into())
         .spawn(move || playback_loop(s, data, generation))
-        .map(|_| ())
-        .unwrap_or_else(|e| {
+    {
+        Ok(_) => info!("playback started (generation {generation})"),
+        Err(e) => {
             warn!("failed to spawn playback thread: {e}");
             state.playing.store(false, Ordering::Relaxed);
-        });
-    info!("playback started (generation {generation})");
+        }
+    }
 }
 
 fn stop_playback(state: &AppState) {
@@ -1547,7 +2094,6 @@ fn toggle_pause(state: &AppState) {
     }
 }
 
-/// Emergency stop: kills both recording and playback.
 fn stop_everything(state: &Arc<AppState>) {
     stop_playback(state);
     stop_recording(state);
@@ -1565,6 +2111,201 @@ fn collector_thread(rx: Receiver<MacroEvent>, state: Arc<AppState>) {
 }
 
 // ============================================================================
+// Tray icon (Windows)
+// ============================================================================
+
+#[cfg(windows)]
+mod tray {
+    use super::win32::*;
+    use super::*;
+    use std::ffi::c_void;
+    use std::sync::atomic::AtomicIsize;
+
+    static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+    static TRAY_ADDED: AtomicBool = AtomicBool::new(false);
+
+    fn icon_handle(hinst: HINSTANCE) -> HICON {
+        unsafe {
+            // Resource id 1 is what winresource assigns to the embedded icon.
+            if let Ok(icon) = LoadIconW(Some(hinst), PCWSTR(1 as *const u16)) {
+                if !icon.is_invalid() {
+                    return icon;
+                }
+            }
+            LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+        }
+    }
+
+    fn notify_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+            uCallbackMessage: WM_APP_TRAY,
+            hIcon: icon,
+            ..Default::default()
+        };
+        let tip = wide(APP_TITLE);
+        let n = tip.len().min(nid.szTip.len());
+        nid.szTip[..n].copy_from_slice(&tip[..n]);
+        nid
+    }
+
+    /// Creates the message-only window that owns the tray icon.
+    pub fn init() {
+        unsafe {
+            let hinst = GetModuleHandleW(None).map(|h| HINSTANCE(h.0)).unwrap_or_default();
+            let class = w!("MacroRecorderTrayWnd");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(wndproc),
+                hInstance: hinst,
+                lpszClassName: class,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+
+            let hwnd = match CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class,
+                w!("Macro Recorder Tray"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                Some(hinst),
+                None,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("tray window could not be created: {e}");
+                    return;
+                }
+            };
+            TRAY_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+
+            let nid = notify_data(hwnd, icon_handle(hinst));
+            if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+                TRAY_ADDED.store(true, Ordering::Relaxed);
+                info!("tray icon added");
+            } else {
+                warn!("Shell_NotifyIconW(NIM_ADD) failed");
+            }
+        }
+    }
+
+    /// True once the icon is actually in the notification area.
+    pub fn is_active() -> bool {
+        TRAY_ADDED.load(Ordering::Relaxed)
+    }
+
+    pub fn shutdown() {
+        if !TRAY_ADDED.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        unsafe {
+            let hwnd = HWND(TRAY_HWND.load(Ordering::Relaxed) as *mut c_void);
+            let nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: 1,
+                ..Default::default()
+            };
+            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    unsafe fn show_menu(hwnd: HWND) {
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else {
+                return;
+            };
+            let show_label = if WINDOW_VISIBLE.load(Ordering::Relaxed) {
+                w!("Hide window")
+            } else {
+                w!("Show window")
+            };
+            let _ = AppendMenuW(menu, MF_STRING, TRAY_ID_SHOW as usize, show_label);
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, TRAY_ID_RECORD as usize, w!("Record / stop"));
+            let _ = AppendMenuW(menu, MF_STRING, TRAY_ID_PLAY as usize, w!("Play / stop"));
+            let _ = AppendMenuW(menu, MF_STRING, TRAY_ID_STOP as usize, w!("Emergency stop"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, TRAY_ID_EXIT as usize, w!("Exit"));
+
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            // Required so the menu closes when the user clicks elsewhere.
+            let _ = SetForegroundWindow(hwnd);
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                pt.x,
+                pt.y,
+                Some(0),
+                hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+
+            let state = GLOBAL_STATE.get();
+            match cmd.0 as u32 {
+                TRAY_ID_SHOW => toggle_main_window(),
+                TRAY_ID_RECORD => {
+                    if let Some(s) = state {
+                        toggle_recording(s);
+                    }
+                }
+                TRAY_ID_PLAY => {
+                    if let Some(s) = state {
+                        toggle_playback(s);
+                    }
+                }
+                TRAY_ID_STOP => {
+                    if let Some(s) = state {
+                        stop_everything(s);
+                    }
+                }
+                TRAY_ID_EXIT => quit_application(),
+                _ => {}
+            }
+        }
+    }
+
+    unsafe extern "system" fn wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+    ) -> LRESULT {
+        unsafe {
+            if msg == WM_APP_TRAY {
+                match lp.0 as u32 {
+                    0x0202 => toggle_main_window(), // WM_LBUTTONUP
+                    0x0205 | 0x007B => show_menu(hwnd), // WM_RBUTTONUP / WM_CONTEXTMENU
+                    _ => {}
+                }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod tray {
+    pub fn init() {}
+    pub fn shutdown() {}
+    pub fn is_active() -> bool {
+        false
+    }
+}
+
+// ============================================================================
 // Input hooks
 // ============================================================================
 
@@ -1575,7 +2316,7 @@ static GLOBAL_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 pub enum HookMode {
     /// Full recorder: low-level hooks + hotkeys.
     Full,
-    /// Headless playback: hotkeys only, no input capture.
+    /// Headless playback: hotkeys only.
     HotkeysOnly,
 }
 
@@ -1583,11 +2324,15 @@ pub enum HookMode {
 unsafe fn register_hotkeys() {
     use win32::*;
     let hk = *PENDING_HOTKEYS.lock();
+    let ids = [HK_ID_RECORD, HK_ID_PLAY, HK_ID_STOP, HK_ID_PAUSE];
     let mut failed = 0u32;
     unsafe {
-        for (idx, id) in [HK_ID_RECORD, HK_ID_PLAY, HK_ID_STOP].into_iter().enumerate() {
+        for (idx, id) in ids.into_iter().enumerate() {
             let _ = UnregisterHotKey(None, id);
             let key = hk[idx];
+            if key.vk == 0 {
+                continue; // unbound
+            }
             let mut mods = MOD_NOREPEAT;
             if key.ctrl {
                 mods |= MOD_CONTROL;
@@ -1608,7 +2353,7 @@ unsafe fn register_hotkeys() {
 }
 
 #[cfg(windows)]
-fn input_hook_thread(state: Arc<AppState>, mode: HookMode) {
+fn input_hook_thread(state: Arc<AppState>, mode: HookMode, with_tray: bool) {
     use win32::*;
 
     virtual_desktop::init_thread();
@@ -1627,6 +2372,9 @@ fn input_hook_thread(state: Arc<AppState>, mode: HookMode) {
         };
 
         register_hotkeys();
+        if with_tray {
+            tray::init();
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1635,9 +2383,16 @@ fn input_hook_thread(state: Arc<AppState>, mode: HookMode) {
                     HK_ID_RECORD => toggle_recording(&state),
                     HK_ID_PLAY => toggle_playback(&state),
                     HK_ID_STOP => stop_everything(&state),
+                    HK_ID_PAUSE => toggle_pause(&state),
                     _ => {}
                 },
                 WM_APP_REHOTKEY => register_hotkeys(),
+                WM_APP_HK_OFF => {
+                    for id in [HK_ID_RECORD, HK_ID_PLAY, HK_ID_STOP, HK_ID_PAUSE] {
+                        let _ = UnregisterHotKey(None, id);
+                    }
+                    HK_FAILED.store(0, Ordering::Relaxed);
+                }
                 _ => {
                     let _ = TranslateMessage(&msg);
                     let _ = DispatchMessageW(&msg);
@@ -1645,7 +2400,8 @@ fn input_hook_thread(state: Arc<AppState>, mode: HookMode) {
             }
         }
 
-        for id in [HK_ID_RECORD, HK_ID_PLAY, HK_ID_STOP] {
+        tray::shutdown();
+        for id in [HK_ID_RECORD, HK_ID_PLAY, HK_ID_STOP, HK_ID_PAUSE] {
             let _ = UnregisterHotKey(None, id);
         }
         if let Some(h) = kb_hook {
@@ -1658,9 +2414,7 @@ fn input_hook_thread(state: Arc<AppState>, mode: HookMode) {
     info!("hook thread exited");
 }
 
-/// True when the hooks should currently record.
-///
-/// Cheap by construction: one atomic load plus a cached desktop check (B4).
+/// Cheap by construction: one atomic load plus a cached desktop answer.
 #[cfg(windows)]
 fn should_record() -> Option<&'static Arc<AppState>> {
     let state = GLOBAL_STATE.get()?;
@@ -1673,29 +2427,72 @@ fn should_record() -> Option<&'static Arc<AppState>> {
     Some(state)
 }
 
+/// Handles "press any key to bind". Returns true if the key was consumed.
 #[cfg(windows)]
-unsafe extern "system" fn kb_proc(code: i32, wp: win32::WPARAM, lp: win32::LPARAM) -> win32::LRESULT {
+unsafe fn handle_key_capture(vk: u32, down: bool) -> bool {
+    use win32::*;
+    if CAPTURE_SLOT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    if !down {
+        return true; // swallow the matching key-up too
+    }
+    // Modifiers alone are not a binding.
+    if matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C) {
+        return true;
+    }
+    if vk == 0x1B {
+        CAPTURE_SLOT.store(0, Ordering::Relaxed); // Esc cancels
+        return true;
+    }
+    unsafe {
+        // GetAsyncKeyState, not GetKeyState: the hook thread has no input queue of
+        // its own, so the synchronous variant would always report "not pressed".
+        let down_state = |k: i32| (GetAsyncKeyState(k) as u16 & 0x8000) != 0;
+        *CAPTURED_KEY.lock() = Some(Hotkey {
+            vk,
+            ctrl: down_state(0x11),
+            alt: down_state(0x12),
+            shift: down_state(0x10),
+        });
+    }
+    true
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn kb_proc(
+    code: i32,
+    wp: win32::WPARAM,
+    lp: win32::LPARAM,
+) -> win32::LRESULT {
     use win32::*;
     if code == 0 && lp.0 != 0 {
-        if let Some(state) = should_record() {
-            unsafe {
-                let data = &*(lp.0 as *const KBDLLHOOKSTRUCT);
-                if data.flags.0 & LLKHF_INJECTED.0 == 0 && !is_hotkey_vk(data.vkCode) {
-                    let (down, valid) = match wp.0 as u32 {
-                        0x0100 | 0x0104 => (true, true),  // WM_KEYDOWN / WM_SYSKEYDOWN
-                        0x0101 | 0x0105 => (false, true), // WM_KEYUP / WM_SYSKEYUP
-                        _ => (false, false),
-                    };
-                    if valid {
-                        emit_event(
-                            state,
-                            InputEventKind::Key {
-                                vk: data.vkCode as u16,
-                                scan: data.scanCode as u16,
-                                down,
-                                extended: data.flags.0 & LLKHF_EXTENDED.0 != 0,
-                            },
-                        );
+        unsafe {
+            let data = &*(lp.0 as *const KBDLLHOOKSTRUCT);
+            if data.flags.0 & LLKHF_INJECTED.0 == 0 {
+                let wm = wp.0 as u32;
+                let (down, valid) = match wm {
+                    0x0100 | 0x0104 => (true, true),
+                    0x0101 | 0x0105 => (false, true),
+                    _ => (false, false),
+                };
+                if valid {
+                    // Binding mode swallows the key so it never reaches the app below.
+                    if handle_key_capture(data.vkCode, down) {
+                        return LRESULT(1);
+                    }
+                    if !is_hotkey_vk(data.vkCode) {
+                        if let Some(state) = should_record() {
+                            emit_event(
+                                state,
+                                InputEventKind::Key {
+                                    vk: data.vkCode as u16,
+                                    scan: data.scanCode as u16,
+                                    down,
+                                    extended: data.flags.0 & LLKHF_EXTENDED.0 != 0,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -1705,7 +2502,11 @@ unsafe extern "system" fn kb_proc(code: i32, wp: win32::WPARAM, lp: win32::LPARA
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn ms_proc(code: i32, wp: win32::WPARAM, lp: win32::LPARAM) -> win32::LRESULT {
+unsafe extern "system" fn ms_proc(
+    code: i32,
+    wp: win32::WPARAM,
+    lp: win32::LPARAM,
+) -> win32::LRESULT {
     use win32::*;
     if code == 0 && lp.0 != 0 {
         if let Some(state) = should_record() {
@@ -1715,7 +2516,6 @@ unsafe extern "system" fn ms_proc(code: i32, wp: win32::WPARAM, lp: win32::LPARA
                     let (x, y) = (data.pt.x, data.pt.y);
                     let kind = match wp.0 as u32 {
                         0x0200 => {
-                            // WM_MOUSEMOVE - throttled to the configured sample interval.
                             if !state.capture_mouse_moves.load(Ordering::Relaxed) {
                                 None
                             } else {
@@ -1772,12 +2572,12 @@ unsafe extern "system" fn ms_proc(code: i32, wp: win32::WPARAM, lp: win32::LPARA
                             x,
                             y,
                         }),
-                        // WM_XBUTTONDOWN / WM_XBUTTONUP (F1): the button index lives
-                        // in the high word of mouseData.
+                        // WM_XBUTTONDOWN / WM_XBUTTONUP: index is the high word.
                         0x020B | 0x020C => {
                             let down = wp.0 as u32 == 0x020B;
                             let which = (data.mouseData >> 16) & 0xFFFF;
-                            let button = if which == 2 { MouseButton::X2 } else { MouseButton::X1 };
+                            let button =
+                                if which == 2 { MouseButton::X2 } else { MouseButton::X1 };
                             Some(InputEventKind::MouseButton { button, down, x, y })
                         }
                         0x020A => {
@@ -1814,512 +2614,365 @@ enum Lang {
     Zh,
 }
 
-struct Strings {
-    // transport
-    record: &'static str,
-    stop_rec: &'static str,
-    play: &'static str,
-    pause: &'static str,
-    resume: &'static str,
-    stop_play: &'static str,
-    // status
-    rec_time: &'static str,
-    rec_done: &'static str,
-    play_inf: &'static str,
-    play_lim: &'static str,
-    events: &'static str,
-    duration: &'static str,
-    status_ready: &'static str,
-    status_rec: &'static str,
-    status_play: &'static str,
-    status_paused: &'static str,
-    status_held: &'static str,
-    // sections
-    sec_playback: &'static str,
-    sec_recording: &'static str,
-    sec_limit: &'static str,
-    sec_appearance: &'static str,
-    sec_hotkeys: &'static str,
-    sec_files: &'static str,
-    // playback settings
-    loop_cb: &'static str,
-    play_count: &'static str,
-    speed: &'static str,
-    repeat_delay: &'static str,
-    jitter: &'static str,
-    abs_mouse: &'static str,
-    // recording settings
-    capture_moves: &'static str,
-    sample_rate: &'static str,
-    // limit
-    time_limit_cb: &'static str,
-    time_limit_h: &'static str,
-    time_limit_m: &'static str,
-    time_limit_s: &'static str,
-    action_on_limit: &'static str,
-    action_stop: &'static str,
-    action_shutdown: &'static str,
-    action_reboot: &'static str,
-    action_sleep: &'static str,
-    action_hibernate: &'static str,
-    action_logoff: &'static str,
-    shutdown_delay: &'static str,
-    // appearance
-    theme: &'static str,
-    language: &'static str,
-    lang_auto: &'static str,
-    transparent_ui: &'static str,
-    on_top: &'static str,
-    // hotkeys
-    hk_record: &'static str,
-    hk_play: &'static str,
-    hk_stop: &'static str,
-    hk_failed: &'static str,
-    // files
-    save: &'static str,
-    save_as: &'static str,
-    load: &'static str,
-    open_file: &'static str,
-    clear: &'static str,
-    recent: &'static str,
-    compress: &'static str,
-    data_dir: &'static str,
-    save_settings: &'static str,
-    // messages
-    saved: &'static str,
-    loaded: &'static str,
-    cleared: &'static str,
-    settings_saved: &'static str,
-    save_err: &'static str,
-    load_err: &'static str,
-    no_macro: &'static str,
+/// Generates the `Strings` struct plus the plumbing for external translation files,
+/// so adding a field costs exactly one line here.
+macro_rules! define_strings {
+    ($($field:ident),* $(,)?) => {
+        #[derive(Clone, Copy)]
+        pub struct Strings { $(pub $field: &'static str),* }
+
+        impl Strings {
+            /// Applies key/value overrides loaded from `lang/<code>.json`.
+            fn with_overrides(mut self, map: &BTreeMap<String, String>) -> Self {
+                $(
+                    if let Some(v) = map.get(stringify!($field)) {
+                        if !v.is_empty() {
+                            // Leaked on purpose: language tables live for the whole process.
+                            self.$field = Box::leak(v.clone().into_boxed_str());
+                        }
+                    }
+                )*
+                self
+            }
+            /// Dumps the table so users can start a translation from a filled template.
+            fn to_map(&self) -> BTreeMap<&'static str, &'static str> {
+                let mut m = BTreeMap::new();
+                $( m.insert(stringify!($field), self.$field); )*
+                m
+            }
+        }
+    };
 }
 
+define_strings!(
+    record, stop_rec, play, pause, resume, stop_play,
+    rec_time, rec_done, play_inf, play_lim, events, duration,
+    status_ready, status_rec, status_play, status_paused, status_held, status_pixel,
+    sec_playback, sec_recording, sec_limit, sec_pixel, sec_appearance, sec_hotkeys,
+    sec_files, sec_editor, sec_profiles,
+    loop_cb, play_count, speed, repeat_delay, jitter, abs_mouse, anchor_use,
+    capture_moves, sample_rate, anchor_rec, anchor_of, anchor_none,
+    time_limit_cb, time_limit_h, time_limit_m, time_limit_s, action_on_limit,
+    action_stop, action_shutdown, action_reboot, action_sleep, action_hibernate, action_logoff,
+    shutdown_delay,
+    pixel_cb, pixel_pick, pixel_picking, pixel_tol, pixel_match, pixel_differ,
+    theme, language, lang_auto, transparent_ui, on_top, tray_cb, close_tray_cb, lang_template,
+    hk_record, hk_play, hk_pause, hk_stop, hk_failed, hk_bind, hk_press, hk_clear,
+    save, save_as, load, open_file, clear, recent, compress, data_dir, save_settings,
+    export_exe, export_ahk,
+    ed_from, ed_to, ed_delete, ed_crop, ed_insert, ed_scale, ed_drop_moves, ed_zero, ed_undo,
+    prof_name, prof_save, prof_load, prof_delete,
+    saved, loaded, cleared, settings_saved, save_err, load_err, no_macro, exported, done,
+);
+
 const EN: Strings = Strings {
-    record: "🔴 Record",
-    stop_rec: "⏹ Stop Rec",
-    play: "▶ Play",
-    pause: "⏸ Pause",
-    resume: "⏵ Resume",
-    stop_play: "⏹ Stop Play",
-    rec_time: "⏱ Recording: {}…",
-    rec_done: "⏱ Recorded: {} (done)",
-    play_inf: "🔄 Plays: {} (∞)",
-    play_lim: "🔄 Plays: {} / {}",
-    events: "📦 Events: {}",
-    duration: "⏳ Length: {}",
-    status_ready: "Ready",
-    status_rec: "Recording…",
-    status_play: "Playing…",
-    status_paused: "Paused",
-    status_held: "Held — app is on another virtual desktop",
-    sec_playback: "▶ Playback",
-    sec_recording: "🎬 Recording",
-    sec_limit: "⏱ Time limit",
-    sec_appearance: "🎨 Appearance",
-    sec_hotkeys: "⌨ Hotkeys",
-    sec_files: "📁 Files",
-    loop_cb: "Loop playback",
-    play_count: "Play count:",
-    speed: "Speed",
-    repeat_delay: "Delay between loops (ms)",
-    jitter: "Timing jitter (%)",
-    abs_mouse: "Absolute mouse (DPI fix)",
-    capture_moves: "Capture mouse movement",
-    sample_rate: "Movement sampling (ms)",
-    time_limit_cb: "Stop after time limit",
-    time_limit_h: "H",
-    time_limit_m: "M",
-    time_limit_s: "S",
-    action_on_limit: "Action on limit:",
-    action_stop: "Stop",
-    action_shutdown: "Shut down",
-    action_reboot: "Restart",
-    action_sleep: "Sleep",
-    action_hibernate: "Hibernate",
-    action_logoff: "Log off",
+    record: "🔴 Record", stop_rec: "⏹ Stop rec", play: "▶ Play", pause: "⏸ Pause",
+    resume: "▶ Resume", stop_play: "⏹ Stop",
+    rec_time: "⏱ Recording: {}…", rec_done: "⏱ Recorded: {}", play_inf: "🔄 Plays: {} (∞)",
+    play_lim: "🔄 Plays: {} / {}", events: "📦 Events: {}", duration: "⏳ Length: {}",
+    status_ready: "Ready", status_rec: "Recording…", status_play: "Playing…",
+    status_paused: "Paused", status_held: "Held — another virtual desktop",
+    status_pixel: "Stopped by the pixel condition",
+    sec_playback: "▶ Playback", sec_recording: "🎬 Recording", sec_limit: "⏱ Time limit",
+    sec_pixel: "🎯 Pixel condition", sec_appearance: "🎨 Appearance", sec_hotkeys: "⌨ Hotkeys",
+    sec_files: "📁 Files", sec_editor: "✂ Editor", sec_profiles: "📋 Profiles",
+    loop_cb: "Loop playback", play_count: "Play count:", speed: "Speed",
+    repeat_delay: "Delay between loops (ms)", jitter: "Timing jitter (%)",
+    abs_mouse: "Absolute mouse (DPI fix)", anchor_use: "Follow the anchored window",
+    capture_moves: "Capture mouse movement", sample_rate: "Movement sampling (ms)",
+    anchor_rec: "Remember the target window", anchor_of: "⚓ Anchor: {}", anchor_none: "none",
+    time_limit_cb: "Stop after time limit", time_limit_h: "H", time_limit_m: "M",
+    time_limit_s: "S", action_on_limit: "Then:",
+    action_stop: "Stop", action_shutdown: "Shut down", action_reboot: "Restart",
+    action_sleep: "Sleep", action_hibernate: "Hibernate", action_logoff: "Log off",
     shutdown_delay: "Shutdown countdown (s)",
-    theme: "Theme:",
-    language: "Language:",
-    lang_auto: "Auto (system)",
-    transparent_ui: "🪟 Transparent UI",
-    on_top: "📌 Always on Top",
-    hk_record: "Record:",
-    hk_play: "Play / Stop:",
-    hk_stop: "Emergency stop:",
-    hk_failed: "⚠ Some hotkeys are taken by another app",
-    save: "💾 Save",
-    save_as: "💾 Save as…",
-    load: "📂 Load",
-    open_file: "📂 Open…",
-    clear: "🗑 Clear",
-    recent: "Recent:",
-    compress: "Compress saved macros (.mrz)",
-    data_dir: "📁 Data folder:",
-    save_settings: "💾 Save Settings",
-    saved: "Saved: {}",
-    loaded: "Loaded: {}",
-    cleared: "Macro cleared",
-    settings_saved: "Settings saved",
-    save_err: "Save error: {}",
-    load_err: "Load error: {}",
-    no_macro: "No macro loaded",
+    pixel_cb: "Stop on a screen pixel", pixel_pick: "🎯 Pick in 3 s",
+    pixel_picking: "Hover the target… {} s", pixel_tol: "Tolerance",
+    pixel_match: "when it matches", pixel_differ: "when it differs",
+    theme: "Theme:", language: "Language:", lang_auto: "Auto (system)",
+    transparent_ui: "🌓 Transparent UI", on_top: "📌 Always on Top",
+    tray_cb: "Tray icon", close_tray_cb: "Close button minimizes to tray",
+    lang_template: "🌍 Export language template",
+    hk_record: "Record:", hk_play: "Play / stop:", hk_pause: "Pause:",
+    hk_stop: "Emergency stop:", hk_failed: "⚠ Some hotkeys are taken by another app",
+    hk_bind: "Bind", hk_press: "press a key… (Esc cancels)", hk_clear: "Clear",
+    save: "💾 Save", save_as: "💾 Save as…", load: "📂 Load", open_file: "📂 Open…",
+    clear: "🗑 Clear", recent: "Recent:", compress: "Compress macros (.mrz)",
+    data_dir: "📁 Data folder:", save_settings: "💾 Save settings",
+    export_exe: "⚙ Export .exe", export_ahk: "📜 Export .ahk",
+    ed_from: "from", ed_to: "to", ed_delete: "Delete", ed_crop: "Keep only",
+    ed_insert: "Insert pause (ms)", ed_scale: "Scale time ×", ed_drop_moves: "Drop moves",
+    ed_zero: "Trim lead-in", ed_undo: "⏪ Undo",
+    prof_name: "Name:", prof_save: "Save", prof_load: "Load", prof_delete: "Delete",
+    saved: "Saved: {}", loaded: "Loaded: {}", cleared: "Macro cleared",
+    settings_saved: "Settings saved", save_err: "Save error: {}", load_err: "Load error: {}",
+    no_macro: "No macro loaded", exported: "Exported: {}", done: "Done",
 };
 
 const RU: Strings = Strings {
-    record: "🔴 Запись",
-    stop_rec: "⏹ Стоп запись",
-    play: "▶ Воспроизвести",
-    pause: "⏸ Пауза",
-    resume: "⏵ Продолжить",
-    stop_play: "⏹ Стоп",
-    rec_time: "⏱ Запись: {}…",
-    rec_done: "⏱ Записано: {} (готово)",
-    play_inf: "🔄 Проигрываний: {} (∞)",
-    play_lim: "🔄 Проигрываний: {} / {}",
-    events: "📦 Событий: {}",
-    duration: "⏳ Длительность: {}",
-    status_ready: "Готов",
-    status_rec: "Идёт запись…",
-    status_play: "Воспроизведение…",
-    status_paused: "Пауза",
-    status_held: "Удержание — окно на другом рабочем столе",
-    sec_playback: "▶ Воспроизведение",
-    sec_recording: "🎬 Запись",
-    sec_limit: "⏱ Лимит времени",
-    sec_appearance: "🎨 Оформление",
-    sec_hotkeys: "⌨ Горячие клавиши",
-    sec_files: "📁 Файлы",
-    loop_cb: "Циклическое воспроизведение",
-    play_count: "Проигрываний:",
-    speed: "Скорость",
-    repeat_delay: "Пауза между циклами (мс)",
-    jitter: "Джиттер таймингов (%)",
-    abs_mouse: "Абсолютная мышь (фикс DPI)",
-    capture_moves: "Записывать движения мыши",
-    sample_rate: "Шаг выборки движений (мс)",
-    time_limit_cb: "Остановиться по таймеру",
-    time_limit_h: "Ч",
-    time_limit_m: "М",
-    time_limit_s: "С",
-    action_on_limit: "Действие по таймеру:",
-    action_stop: "Остановить",
-    action_shutdown: "Выключить",
-    action_reboot: "Перезагрузить",
-    action_sleep: "Сон",
-    action_hibernate: "Гибернация",
-    action_logoff: "Выйти из системы",
+    record: "🔴 Запись", stop_rec: "⏹ Стоп запись", play: "▶ Воспроизвести", pause: "⏸ Пауза",
+    resume: "▶ Продолжить", stop_play: "⏹ Стоп",
+    rec_time: "⏱ Запись: {}…", rec_done: "⏱ Записано: {}", play_inf: "🔄 Проигрываний: {} (∞)",
+    play_lim: "🔄 Проигрываний: {} / {}", events: "📦 Событий: {}", duration: "⏳ Длительность: {}",
+    status_ready: "Готов", status_rec: "Идёт запись…", status_play: "Воспроизведение…",
+    status_paused: "Пауза", status_held: "Удержание — другой рабочий стол",
+    status_pixel: "Остановлено по условию пикселя",
+    sec_playback: "▶ Воспроизведение", sec_recording: "🎬 Запись", sec_limit: "⏱ Лимит времени",
+    sec_pixel: "🎯 Условие по пикселю", sec_appearance: "🎨 Оформление",
+    sec_hotkeys: "⌨ Горячие клавиши", sec_files: "📁 Файлы", sec_editor: "✂ Редактор",
+    sec_profiles: "📋 Профили",
+    loop_cb: "Циклическое воспроизведение", play_count: "Проигрываний:", speed: "Скорость",
+    repeat_delay: "Пауза между циклами (мс)", jitter: "Джиттер таймингов (%)",
+    abs_mouse: "Абсолютная мышь (фикс DPI)", anchor_use: "Следовать за окном привязки",
+    capture_moves: "Записывать движения мыши", sample_rate: "Шаг выборки движений (мс)",
+    anchor_rec: "Запоминать целевое окно", anchor_of: "⚓ Привязка: {}", anchor_none: "нет",
+    time_limit_cb: "Остановиться по таймеру", time_limit_h: "Ч", time_limit_m: "М",
+    time_limit_s: "С", action_on_limit: "Затем:",
+    action_stop: "Остановить", action_shutdown: "Выключить", action_reboot: "Перезагрузить",
+    action_sleep: "Сон", action_hibernate: "Гибернация", action_logoff: "Выйти из системы",
     shutdown_delay: "Отсчёт до выключения (с)",
-    theme: "Тема:",
-    language: "Язык:",
-    lang_auto: "Авто (система)",
-    transparent_ui: "🪟 Прозрачный интерфейс",
-    on_top: "📌 Поверх всех окон",
-    hk_record: "Запись:",
-    hk_play: "Плей / стоп:",
-    hk_stop: "Аварийный стоп:",
-    hk_failed: "⚠ Часть клавиш занята другой программой",
-    save: "💾 Сохранить",
-    save_as: "💾 Сохранить как…",
-    load: "📂 Загрузить",
-    open_file: "📂 Открыть…",
-    clear: "🗑 Очистить",
-    recent: "Недавние:",
-    compress: "Сжимать макросы (.mrz)",
-    data_dir: "📁 Папка данных:",
+    pixel_cb: "Останавливаться по пикселю экрана", pixel_pick: "🎯 Взять через 3 с",
+    pixel_picking: "Наведите курсор… {} с", pixel_tol: "Допуск",
+    pixel_match: "когда совпадает", pixel_differ: "когда отличается",
+    theme: "Тема:", language: "Язык:", lang_auto: "Авто (система)",
+    transparent_ui: "🌓 Прозрачный интерфейс", on_top: "📌 Поверх всех окон",
+    tray_cb: "Значок в трее", close_tray_cb: "Крестик сворачивает в трей",
+    lang_template: "🌍 Выгрузить шаблон перевода",
+    hk_record: "Запись:", hk_play: "Плей / стоп:", hk_pause: "Пауза:",
+    hk_stop: "Аварийный стоп:", hk_failed: "⚠ Часть клавиш занята другой программой",
+    hk_bind: "Задать", hk_press: "нажмите клавишу… (Esc — отмена)", hk_clear: "Сбросить",
+    save: "💾 Сохранить", save_as: "💾 Сохранить как…", load: "📂 Загрузить",
+    open_file: "📂 Открыть…", clear: "🗑 Очистить", recent: "Недавние:",
+    compress: "Сжимать макросы (.mrz)", data_dir: "📁 Папка данных:",
     save_settings: "💾 Сохранить настройки",
-    saved: "Сохранено: {}",
-    loaded: "Загружено: {}",
-    cleared: "Макрос очищен",
-    settings_saved: "Настройки сохранены",
-    save_err: "Ошибка сохранения: {}",
-    load_err: "Ошибка загрузки: {}",
-    no_macro: "Макрос не загружен",
+    export_exe: "⚙ Экспорт в .exe", export_ahk: "📜 Экспорт в .ahk",
+    ed_from: "с", ed_to: "по", ed_delete: "Удалить", ed_crop: "Оставить только",
+    ed_insert: "Вставить паузу (мс)", ed_scale: "Масштаб времени ×",
+    ed_drop_moves: "Убрать движения", ed_zero: "Обрезать начало", ed_undo: "⏪ Отменить",
+    prof_name: "Имя:", prof_save: "Сохранить", prof_load: "Загрузить", prof_delete: "Удалить",
+    saved: "Сохранено: {}", loaded: "Загружено: {}", cleared: "Макрос очищен",
+    settings_saved: "Настройки сохранены", save_err: "Ошибка сохранения: {}",
+    load_err: "Ошибка загрузки: {}", no_macro: "Макрос не загружен",
+    exported: "Экспортировано: {}", done: "Готово",
 };
 
 const UK: Strings = Strings {
-    record: "🔴 Запис",
-    stop_rec: "⏹ Стоп запис",
-    play: "▶ Відтворити",
-    pause: "⏸ Пауза",
-    resume: "⏵ Продовжити",
-    stop_play: "⏹ Стоп",
-    rec_time: "⏱ Запис: {}…",
-    rec_done: "⏱ Записано: {} (готово)",
-    play_inf: "🔄 Відтворень: {} (∞)",
-    play_lim: "🔄 Відтворень: {} / {}",
-    events: "📦 Подій: {}",
-    duration: "⏳ Тривалість: {}",
-    status_ready: "Готово",
-    status_rec: "Триває запис…",
-    status_play: "Відтворення…",
-    status_paused: "Пауза",
-    status_held: "Утримання — вікно на іншому робочому столі",
-    sec_playback: "▶ Відтворення",
-    sec_recording: "🎬 Запис",
-    sec_limit: "⏱ Ліміт часу",
-    sec_appearance: "🎨 Оформлення",
-    sec_hotkeys: "⌨ Гарячі клавіші",
-    sec_files: "📁 Файли",
-    loop_cb: "Циклічне відтворення",
-    play_count: "Відтворень:",
-    speed: "Швидкість",
-    repeat_delay: "Пауза між циклами (мс)",
-    jitter: "Джитер таймінгів (%)",
-    abs_mouse: "Абсолютна миша (фікс DPI)",
-    capture_moves: "Записувати рухи миші",
-    sample_rate: "Крок вибірки рухів (мс)",
-    time_limit_cb: "Зупинитися за таймером",
-    time_limit_h: "Г",
-    time_limit_m: "Х",
-    time_limit_s: "С",
-    action_on_limit: "Дія за таймером:",
-    action_stop: "Зупинити",
-    action_shutdown: "Вимкнути",
-    action_reboot: "Перезавантажити",
-    action_sleep: "Сон",
-    action_hibernate: "Гібернація",
-    action_logoff: "Вийти з системи",
+    record: "🔴 Запис", stop_rec: "⏹ Стоп запис", play: "▶ Відтворити", pause: "⏸ Пауза",
+    resume: "▶ Продовжити", stop_play: "⏹ Стоп",
+    rec_time: "⏱ Запис: {}…", rec_done: "⏱ Записано: {}", play_inf: "🔄 Відтворень: {} (∞)",
+    play_lim: "🔄 Відтворень: {} / {}", events: "📦 Подій: {}", duration: "⏳ Тривалість: {}",
+    status_ready: "Готово", status_rec: "Триває запис…", status_play: "Відтворення…",
+    status_paused: "Пауза", status_held: "Утримання — інший робочий стіл",
+    status_pixel: "Зупинено за умовою пікселя",
+    sec_playback: "▶ Відтворення", sec_recording: "🎬 Запис", sec_limit: "⏱ Ліміт часу",
+    sec_pixel: "🎯 Умова за пікселем", sec_appearance: "🎨 Оформлення",
+    sec_hotkeys: "⌨ Гарячі клавіші", sec_files: "📁 Файли", sec_editor: "✂ Редактор",
+    sec_profiles: "📋 Профілі",
+    loop_cb: "Циклічне відтворення", play_count: "Відтворень:", speed: "Швидкість",
+    repeat_delay: "Пауза між циклами (мс)", jitter: "Джитер таймінгів (%)",
+    abs_mouse: "Абсолютна миша (фікс DPI)", anchor_use: "Слідувати за вікном прив'язки",
+    capture_moves: "Записувати рухи миші", sample_rate: "Крок вибірки рухів (мс)",
+    anchor_rec: "Запам'ятовувати цільове вікно", anchor_of: "⚓ Прив'язка: {}",
+    anchor_none: "немає",
+    time_limit_cb: "Зупинитися за таймером", time_limit_h: "Г", time_limit_m: "Х",
+    time_limit_s: "С", action_on_limit: "Потім:",
+    action_stop: "Зупинити", action_shutdown: "Вимкнути", action_reboot: "Перезавантажити",
+    action_sleep: "Сон", action_hibernate: "Гібернація", action_logoff: "Вийти з системи",
     shutdown_delay: "Відлік до вимкнення (с)",
-    theme: "Тема:",
-    language: "Мова:",
-    lang_auto: "Авто (система)",
-    transparent_ui: "🪟 Прозорий інтерфейс",
-    on_top: "📌 Завжди поверх вікон",
-    hk_record: "Запис:",
-    hk_play: "Плей / стоп:",
-    hk_stop: "Аварійний стоп:",
-    hk_failed: "⚠ Частину клавіш зайнято іншою програмою",
-    save: "💾 Зберегти",
-    save_as: "💾 Зберегти як…",
-    load: "📂 Завантажити",
-    open_file: "📂 Відкрити…",
-    clear: "🗑 Очистити",
-    recent: "Нещодавні:",
-    compress: "Стискати макроси (.mrz)",
-    data_dir: "📁 Тека даних:",
+    pixel_cb: "Зупинятися за пікселем екрана", pixel_pick: "🎯 Взяти через 3 с",
+    pixel_picking: "Наведіть курсор… {} с", pixel_tol: "Допуск",
+    pixel_match: "коли збігається", pixel_differ: "коли відрізняється",
+    theme: "Тема:", language: "Мова:", lang_auto: "Авто (система)",
+    transparent_ui: "🌓 Прозорий інтерфейс", on_top: "📌 Завжди поверх вікон",
+    tray_cb: "Значок у треї", close_tray_cb: "Хрестик згортає у трей",
+    lang_template: "🌍 Вивантажити шаблон перекладу",
+    hk_record: "Запис:", hk_play: "Плей / стоп:", hk_pause: "Пауза:",
+    hk_stop: "Аварійний стоп:", hk_failed: "⚠ Частину клавіш зайнято іншою програмою",
+    hk_bind: "Задати", hk_press: "натисніть клавішу… (Esc — скасувати)", hk_clear: "Скинути",
+    save: "💾 Зберегти", save_as: "💾 Зберегти як…", load: "📂 Завантажити",
+    open_file: "📂 Відкрити…", clear: "🗑 Очистити", recent: "Нещодавні:",
+    compress: "Стискати макроси (.mrz)", data_dir: "📁 Тека даних:",
     save_settings: "💾 Зберегти налаштування",
-    saved: "Збережено: {}",
-    loaded: "Завантажено: {}",
-    cleared: "Макрос очищено",
-    settings_saved: "Налаштування збережено",
-    save_err: "Помилка збереження: {}",
-    load_err: "Помилка завантаження: {}",
-    no_macro: "Макрос не завантажено",
+    export_exe: "⚙ Експорт у .exe", export_ahk: "📜 Експорт у .ahk",
+    ed_from: "з", ed_to: "по", ed_delete: "Видалити", ed_crop: "Залишити лише",
+    ed_insert: "Вставити паузу (мс)", ed_scale: "Масштаб часу ×",
+    ed_drop_moves: "Прибрати рухи", ed_zero: "Обрізати початок", ed_undo: "⏪ Скасувати",
+    prof_name: "Ім'я:", prof_save: "Зберегти", prof_load: "Завантажити", prof_delete: "Видалити",
+    saved: "Збережено: {}", loaded: "Завантажено: {}", cleared: "Макрос очищено",
+    settings_saved: "Налаштування збережено", save_err: "Помилка збереження: {}",
+    load_err: "Помилка завантаження: {}", no_macro: "Макрос не завантажено",
+    exported: "Експортовано: {}", done: "Готово",
 };
 
 const PT: Strings = Strings {
-    record: "🔴 Gravar",
-    stop_rec: "⏹ Parar Grav",
-    play: "▶ Tocar",
-    pause: "⏸ Pausar",
-    resume: "⏵ Retomar",
-    stop_play: "⏹ Parar",
-    rec_time: "⏱ Gravando: {}…",
-    rec_done: "⏱ Gravado: {} (pronto)",
-    play_inf: "🔄 Reproduções: {} (∞)",
-    play_lim: "🔄 Reproduções: {} / {}",
-    events: "📦 Eventos: {}",
-    duration: "⏳ Duração: {}",
-    status_ready: "Pronto",
-    status_rec: "Gravando…",
-    status_play: "Reproduzindo…",
-    status_paused: "Pausado",
-    status_held: "Em espera — janela em outra área de trabalho",
-    sec_playback: "▶ Reprodução",
-    sec_recording: "🎬 Gravação",
-    sec_limit: "⏱ Limite de tempo",
-    sec_appearance: "🎨 Aparência",
-    sec_hotkeys: "⌨ Atalhos",
-    sec_files: "📁 Arquivos",
-    loop_cb: "Reprodução em loop",
-    play_count: "Contagem:",
-    speed: "Velocidade",
-    repeat_delay: "Pausa entre loops (ms)",
-    jitter: "Variação de tempo (%)",
-    abs_mouse: "Mouse absoluto (fix DPI)",
-    capture_moves: "Gravar movimento do mouse",
-    sample_rate: "Amostragem de movimento (ms)",
-    time_limit_cb: "Parar após o limite",
-    time_limit_h: "H",
-    time_limit_m: "M",
-    time_limit_s: "S",
-    action_on_limit: "Ação no limite:",
-    action_stop: "Parar",
-    action_shutdown: "Desligar",
-    action_reboot: "Reiniciar",
-    action_sleep: "Suspender",
-    action_hibernate: "Hibernar",
-    action_logoff: "Sair da sessão",
+    record: "🔴 Gravar", stop_rec: "⏹ Parar grav", play: "▶ Tocar", pause: "⏸ Pausar",
+    resume: "▶ Retomar", stop_play: "⏹ Parar",
+    rec_time: "⏱ Gravando: {}…", rec_done: "⏱ Gravado: {}", play_inf: "🔄 Reproduções: {} (∞)",
+    play_lim: "🔄 Reproduções: {} / {}", events: "📦 Eventos: {}", duration: "⏳ Duração: {}",
+    status_ready: "Pronto", status_rec: "Gravando…", status_play: "Reproduzindo…",
+    status_paused: "Pausado", status_held: "Em espera — outra área de trabalho",
+    status_pixel: "Parado pela condição de pixel",
+    sec_playback: "▶ Reprodução", sec_recording: "🎬 Gravação", sec_limit: "⏱ Limite de tempo",
+    sec_pixel: "🎯 Condição de pixel", sec_appearance: "🎨 Aparência", sec_hotkeys: "⌨ Atalhos",
+    sec_files: "📁 Arquivos", sec_editor: "✂ Editor", sec_profiles: "📋 Perfis",
+    loop_cb: "Reprodução em loop", play_count: "Contagem:", speed: "Velocidade",
+    repeat_delay: "Pausa entre loops (ms)", jitter: "Variação de tempo (%)",
+    abs_mouse: "Mouse absoluto (fix DPI)", anchor_use: "Seguir a janela ancorada",
+    capture_moves: "Gravar movimento do mouse", sample_rate: "Amostragem (ms)",
+    anchor_rec: "Lembrar a janela alvo", anchor_of: "⚓ Âncora: {}", anchor_none: "nenhuma",
+    time_limit_cb: "Parar após o limite", time_limit_h: "H", time_limit_m: "M",
+    time_limit_s: "S", action_on_limit: "Depois:",
+    action_stop: "Parar", action_shutdown: "Desligar", action_reboot: "Reiniciar",
+    action_sleep: "Suspender", action_hibernate: "Hibernar", action_logoff: "Sair da sessão",
     shutdown_delay: "Contagem para desligar (s)",
-    theme: "Tema:",
-    language: "Idioma:",
-    lang_auto: "Auto (sistema)",
-    transparent_ui: "🪟 Interface transparente",
-    on_top: "📌 Sempre no topo",
-    hk_record: "Gravar:",
-    hk_play: "Tocar / parar:",
-    hk_stop: "Parada de emergência:",
-    hk_failed: "⚠ Alguns atalhos estão ocupados",
-    save: "💾 Salvar",
-    save_as: "💾 Salvar como…",
-    load: "📂 Carregar",
-    open_file: "📂 Abrir…",
-    clear: "🗑 Limpar",
-    recent: "Recentes:",
-    compress: "Comprimir macros (.mrz)",
-    data_dir: "📁 Pasta de dados:",
-    save_settings: "💾 Salvar configurações",
-    saved: "Salvo: {}",
-    loaded: "Carregado: {}",
-    cleared: "Macro limpo",
-    settings_saved: "Configurações salvas",
-    save_err: "Erro ao salvar: {}",
-    load_err: "Erro ao carregar: {}",
-    no_macro: "Nenhum macro carregado",
+    pixel_cb: "Parar por um pixel da tela", pixel_pick: "🎯 Capturar em 3 s",
+    pixel_picking: "Aponte o cursor… {} s", pixel_tol: "Tolerância",
+    pixel_match: "quando coincidir", pixel_differ: "quando diferir",
+    theme: "Tema:", language: "Idioma:", lang_auto: "Auto (sistema)",
+    transparent_ui: "🌓 Interface transparente", on_top: "📌 Sempre no topo",
+    tray_cb: "Ícone na bandeja", close_tray_cb: "Fechar minimiza para a bandeja",
+    lang_template: "🌍 Exportar modelo de idioma",
+    hk_record: "Gravar:", hk_play: "Tocar / parar:", hk_pause: "Pausar:",
+    hk_stop: "Parada de emergência:", hk_failed: "⚠ Alguns atalhos estão ocupados",
+    hk_bind: "Definir", hk_press: "pressione uma tecla… (Esc cancela)", hk_clear: "Limpar",
+    save: "💾 Salvar", save_as: "💾 Salvar como…", load: "📂 Carregar", open_file: "📂 Abrir…",
+    clear: "🗑 Limpar", recent: "Recentes:", compress: "Comprimir macros (.mrz)",
+    data_dir: "📁 Pasta de dados:", save_settings: "💾 Salvar configurações",
+    export_exe: "⚙ Exportar .exe", export_ahk: "📜 Exportar .ahk",
+    ed_from: "de", ed_to: "até", ed_delete: "Excluir", ed_crop: "Manter só",
+    ed_insert: "Inserir pausa (ms)", ed_scale: "Escalar tempo ×",
+    ed_drop_moves: "Remover movimentos", ed_zero: "Cortar início", ed_undo: "⏪ Desfazer",
+    prof_name: "Nome:", prof_save: "Salvar", prof_load: "Carregar", prof_delete: "Excluir",
+    saved: "Salvo: {}", loaded: "Carregado: {}", cleared: "Macro limpo",
+    settings_saved: "Configurações salvas", save_err: "Erro ao salvar: {}",
+    load_err: "Erro ao carregar: {}", no_macro: "Nenhum macro carregado",
+    exported: "Exportado: {}", done: "Pronto",
 };
 
 const ES: Strings = Strings {
-    record: "🔴 Grabar",
-    stop_rec: "⏹ Detener grab",
-    play: "▶ Reproducir",
-    pause: "⏸ Pausar",
-    resume: "⏵ Reanudar",
-    stop_play: "⏹ Detener",
-    rec_time: "⏱ Grabando: {}…",
-    rec_done: "⏱ Grabado: {} (listo)",
-    play_inf: "🔄 Reproducciones: {} (∞)",
-    play_lim: "🔄 Reproducciones: {} / {}",
-    events: "📦 Eventos: {}",
-    duration: "⏳ Duración: {}",
-    status_ready: "Listo",
-    status_rec: "Grabando…",
-    status_play: "Reproduciendo…",
-    status_paused: "En pausa",
-    status_held: "En espera — ventana en otro escritorio",
-    sec_playback: "▶ Reproducción",
-    sec_recording: "🎬 Grabación",
-    sec_limit: "⏱ Límite de tiempo",
-    sec_appearance: "🎨 Apariencia",
-    sec_hotkeys: "⌨ Atajos",
-    sec_files: "📁 Archivos",
-    loop_cb: "Reproducción en bucle",
-    play_count: "Repeticiones:",
-    speed: "Velocidad",
-    repeat_delay: "Pausa entre bucles (ms)",
-    jitter: "Variación de tiempo (%)",
-    abs_mouse: "Ratón absoluto (fijo DPI)",
-    capture_moves: "Grabar movimiento del ratón",
-    sample_rate: "Muestreo de movimiento (ms)",
-    time_limit_cb: "Detener tras el límite",
-    time_limit_h: "H",
-    time_limit_m: "M",
-    time_limit_s: "S",
-    action_on_limit: "Acción al límite:",
-    action_stop: "Detener",
-    action_shutdown: "Apagar",
-    action_reboot: "Reiniciar",
-    action_sleep: "Suspender",
-    action_hibernate: "Hibernar",
-    action_logoff: "Cerrar sesión",
+    record: "🔴 Grabar", stop_rec: "⏹ Detener grab", play: "▶ Reproducir", pause: "⏸ Pausar",
+    resume: "▶ Reanudar", stop_play: "⏹ Detener",
+    rec_time: "⏱ Grabando: {}…", rec_done: "⏱ Grabado: {}",
+    play_inf: "🔄 Reproducciones: {} (∞)", play_lim: "🔄 Reproducciones: {} / {}",
+    events: "📦 Eventos: {}", duration: "⏳ Duración: {}",
+    status_ready: "Listo", status_rec: "Grabando…", status_play: "Reproduciendo…",
+    status_paused: "En pausa", status_held: "En espera — otro escritorio",
+    status_pixel: "Detenido por la condición de píxel",
+    sec_playback: "▶ Reproducción", sec_recording: "🎬 Grabación",
+    sec_limit: "⏱ Límite de tiempo", sec_pixel: "🎯 Condición de píxel",
+    sec_appearance: "🎨 Apariencia", sec_hotkeys: "⌨ Atajos", sec_files: "📁 Archivos",
+    sec_editor: "✂ Editor", sec_profiles: "📋 Perfiles",
+    loop_cb: "Reproducción en bucle", play_count: "Repeticiones:", speed: "Velocidad",
+    repeat_delay: "Pausa entre bucles (ms)", jitter: "Variación de tiempo (%)",
+    abs_mouse: "Ratón absoluto (fijo DPI)", anchor_use: "Seguir la ventana anclada",
+    capture_moves: "Grabar movimiento del ratón", sample_rate: "Muestreo (ms)",
+    anchor_rec: "Recordar la ventana objetivo", anchor_of: "⚓ Ancla: {}", anchor_none: "ninguna",
+    time_limit_cb: "Detener tras el límite", time_limit_h: "H", time_limit_m: "M",
+    time_limit_s: "S", action_on_limit: "Luego:",
+    action_stop: "Detener", action_shutdown: "Apagar", action_reboot: "Reiniciar",
+    action_sleep: "Suspender", action_hibernate: "Hibernar", action_logoff: "Cerrar sesión",
     shutdown_delay: "Cuenta atrás de apagado (s)",
-    theme: "Tema:",
-    language: "Idioma:",
-    lang_auto: "Auto (sistema)",
-    transparent_ui: "🪟 Interfaz transparente",
-    on_top: "📌 Siempre encima",
-    hk_record: "Grabar:",
-    hk_play: "Reproducir / detener:",
-    hk_stop: "Parada de emergencia:",
-    hk_failed: "⚠ Algunos atajos están ocupados",
-    save: "💾 Guardar",
-    save_as: "💾 Guardar como…",
-    load: "📂 Cargar",
-    open_file: "📂 Abrir…",
-    clear: "🗑 Limpiar",
-    recent: "Recientes:",
-    compress: "Comprimir macros (.mrz)",
-    data_dir: "📁 Carpeta de datos:",
-    save_settings: "💾 Guardar ajustes",
-    saved: "Guardado: {}",
-    loaded: "Cargado: {}",
-    cleared: "Macro borrado",
-    settings_saved: "Ajustes guardados",
-    save_err: "Error al guardar: {}",
-    load_err: "Error al cargar: {}",
-    no_macro: "Ningún macro cargado",
+    pixel_cb: "Detener por un píxel de pantalla", pixel_pick: "🎯 Capturar en 3 s",
+    pixel_picking: "Apunta el cursor… {} s", pixel_tol: "Tolerancia",
+    pixel_match: "cuando coincida", pixel_differ: "cuando difiera",
+    theme: "Tema:", language: "Idioma:", lang_auto: "Auto (sistema)",
+    transparent_ui: "🌓 Interfaz transparente", on_top: "📌 Siempre encima",
+    tray_cb: "Icono en la bandeja", close_tray_cb: "Cerrar minimiza a la bandeja",
+    lang_template: "🌍 Exportar plantilla de idioma",
+    hk_record: "Grabar:", hk_play: "Reproducir / detener:", hk_pause: "Pausar:",
+    hk_stop: "Parada de emergencia:", hk_failed: "⚠ Algunos atajos están ocupados",
+    hk_bind: "Asignar", hk_press: "pulsa una tecla… (Esc cancela)", hk_clear: "Borrar",
+    save: "💾 Guardar", save_as: "💾 Guardar como…", load: "📂 Cargar", open_file: "📂 Abrir…",
+    clear: "🗑 Limpiar", recent: "Recientes:", compress: "Comprimir macros (.mrz)",
+    data_dir: "📁 Carpeta de datos:", save_settings: "💾 Guardar ajustes",
+    export_exe: "⚙ Exportar .exe", export_ahk: "📜 Exportar .ahk",
+    ed_from: "de", ed_to: "a", ed_delete: "Eliminar", ed_crop: "Conservar sólo",
+    ed_insert: "Insertar pausa (ms)", ed_scale: "Escalar tiempo ×",
+    ed_drop_moves: "Quitar movimientos", ed_zero: "Recortar inicio", ed_undo: "⏪ Deshacer",
+    prof_name: "Nombre:", prof_save: "Guardar", prof_load: "Cargar", prof_delete: "Eliminar",
+    saved: "Guardado: {}", loaded: "Cargado: {}", cleared: "Macro borrado",
+    settings_saved: "Ajustes guardados", save_err: "Error al guardar: {}",
+    load_err: "Error al cargar: {}", no_macro: "Ningún macro cargado",
+    exported: "Exportado: {}", done: "Listo",
 };
 
 const ZH: Strings = Strings {
-    record: "🔴 录制",
-    stop_rec: "⏹ 停止录制",
-    play: "▶ 播放",
-    pause: "⏸ 暂停",
-    resume: "⏵ 继续",
-    stop_play: "⏹ 停止",
-    rec_time: "⏱ 录制中: {}…",
-    rec_done: "⏱ 已录制: {} (完成)",
-    play_inf: "🔄 播放次数: {} (∞)",
-    play_lim: "🔄 播放次数: {} / {}",
-    events: "📦 事件: {}",
-    duration: "⏳ 时长: {}",
-    status_ready: "就绪",
-    status_rec: "录制中…",
-    status_play: "播放中…",
-    status_paused: "已暂停",
-    status_held: "已挂起 — 窗口在其他虚拟桌面",
-    sec_playback: "▶ 播放",
-    sec_recording: "🎬 录制",
-    sec_limit: "⏱ 时间限制",
-    sec_appearance: "🎨 外观",
-    sec_hotkeys: "⌨ 快捷键",
-    sec_files: "📁 文件",
-    loop_cb: "循环播放",
-    play_count: "播放次数:",
-    speed: "速度",
-    repeat_delay: "循环间隔 (毫秒)",
-    jitter: "时间抖动 (%)",
-    abs_mouse: "绝对鼠标 (修复DPI)",
-    capture_moves: "记录鼠标移动",
-    sample_rate: "移动采样 (毫秒)",
-    time_limit_cb: "到达时限后停止",
-    time_limit_h: "时",
-    time_limit_m: "分",
-    time_limit_s: "秒",
-    action_on_limit: "到达时限操作:",
-    action_stop: "停止",
-    action_shutdown: "关机",
-    action_reboot: "重启",
-    action_sleep: "睡眠",
-    action_hibernate: "休眠",
-    action_logoff: "注销",
+    record: "🔴 录制", stop_rec: "⏹ 停止录制", play: "▶ 播放", pause: "⏸ 暂停",
+    resume: "▶ 继续", stop_play: "⏹ 停止",
+    rec_time: "⏱ 录制中: {}…", rec_done: "⏱ 已录制: {}", play_inf: "🔄 播放次数: {} (∞)",
+    play_lim: "🔄 播放次数: {} / {}", events: "📦 事件: {}", duration: "⏳ 时长: {}",
+    status_ready: "就绪", status_rec: "录制中…", status_play: "播放中…",
+    status_paused: "已暂停", status_held: "已挂起 — 其他虚拟桌面",
+    status_pixel: "已按像素条件停止",
+    sec_playback: "▶ 播放", sec_recording: "🎬 录制", sec_limit: "⏱ 时间限制",
+    sec_pixel: "🎯 像素条件", sec_appearance: "🎨 外观", sec_hotkeys: "⌨ 快捷键",
+    sec_files: "📁 文件", sec_editor: "✂ 编辑器", sec_profiles: "📋 配置",
+    loop_cb: "循环播放", play_count: "播放次数:", speed: "速度",
+    repeat_delay: "循环间隔 (毫秒)", jitter: "时间抖动 (%)",
+    abs_mouse: "绝对鼠标 (修复DPI)", anchor_use: "跟随锚定窗口",
+    capture_moves: "记录鼠标移动", sample_rate: "移动采样 (毫秒)",
+    anchor_rec: "记住目标窗口", anchor_of: "⚓ 锚点: {}", anchor_none: "无",
+    time_limit_cb: "到达时限后停止", time_limit_h: "时", time_limit_m: "分",
+    time_limit_s: "秒", action_on_limit: "然后:",
+    action_stop: "停止", action_shutdown: "关机", action_reboot: "重启",
+    action_sleep: "睡眠", action_hibernate: "休眠", action_logoff: "注销",
     shutdown_delay: "关机倒计时 (秒)",
-    theme: "主题:",
-    language: "语言:",
-    lang_auto: "自动 (系统)",
-    transparent_ui: "🪟 透明界面",
-    on_top: "📌 始终置顶",
-    hk_record: "录制:",
-    hk_play: "播放 / 停止:",
-    hk_stop: "紧急停止:",
-    hk_failed: "⚠ 部分快捷键被其他程序占用",
-    save: "💾 保存",
-    save_as: "💾 另存为…",
-    load: "📂 加载",
-    open_file: "📂 打开…",
-    clear: "🗑 清空",
-    recent: "最近:",
-    compress: "压缩保存 (.mrz)",
-    data_dir: "📁 数据目录:",
-    save_settings: "💾 保存设置",
-    saved: "已保存: {}",
-    loaded: "已加载: {}",
-    cleared: "宏已清空",
-    settings_saved: "设置已保存",
-    save_err: "保存错误: {}",
-    load_err: "加载错误: {}",
-    no_macro: "未加载宏",
+    pixel_cb: "按屏幕像素停止", pixel_pick: "🎯 3 秒后取色",
+    pixel_picking: "请将光标移到目标… {} 秒", pixel_tol: "容差",
+    pixel_match: "当匹配时", pixel_differ: "当不匹配时",
+    theme: "主题:", language: "语言:", lang_auto: "自动 (系统)",
+    transparent_ui: "🌓 透明界面", on_top: "📌 始终置顶",
+    tray_cb: "托盘图标", close_tray_cb: "关闭按钮最小化到托盘",
+    lang_template: "🌍 导出语言模板",
+    hk_record: "录制:", hk_play: "播放 / 停止:", hk_pause: "暂停:",
+    hk_stop: "紧急停止:", hk_failed: "⚠ 部分快捷键被其他程序占用",
+    hk_bind: "设置", hk_press: "请按一个键…（Esc 取消）", hk_clear: "清除",
+    save: "💾 保存", save_as: "💾 另存为…", load: "📂 加载", open_file: "📂 打开…",
+    clear: "🗑 清空", recent: "最近:", compress: "压缩保存 (.mrz)",
+    data_dir: "📁 数据目录:", save_settings: "💾 保存设置",
+    export_exe: "⚙ 导出 .exe", export_ahk: "📜 导出 .ahk",
+    ed_from: "从", ed_to: "到", ed_delete: "删除", ed_crop: "仅保留",
+    ed_insert: "插入暂停 (毫秒)", ed_scale: "时间缩放 ×", ed_drop_moves: "移除移动",
+    ed_zero: "裁剪开头", ed_undo: "⏪ 撤销",
+    prof_name: "名称:", prof_save: "保存", prof_load: "加载", prof_delete: "删除",
+    saved: "已保存: {}", loaded: "已加载: {}", cleared: "宏已清空",
+    settings_saved: "设置已保存", save_err: "保存错误: {}", load_err: "加载错误: {}",
+    no_macro: "未加载宏", exported: "已导出: {}", done: "完成",
 };
+
+const LANG_CODES: [&str; 6] = ["en", "ru", "uk", "pt", "es", "zh"];
+
+/// Built-in tables, with `<data>/lang/<code>.json` applied on top when present.
+fn tables() -> &'static [&'static Strings; 6] {
+    static ACTIVE: OnceLock<[&'static Strings; 6]> = OnceLock::new();
+    ACTIVE.get_or_init(|| {
+        let base: [&'static Strings; 6] = [&EN, &RU, &UK, &PT, &ES, &ZH];
+        let mut out = base;
+        for i in 0..6 {
+            let path = paths::lang_dir().join(format!("{}.json", LANG_CODES[i]));
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            match serde_json::from_str::<BTreeMap<String, String>>(&text) {
+                Ok(map) => {
+                    out[i] = Box::leak(Box::new(base[i].with_overrides(&map)));
+                    info!("loaded translation overrides from {}", path.display());
+                }
+                Err(e) => warn!("bad translation file {}: {e}", path.display()),
+            }
+        }
+        out
+    })
+}
+
+/// Writes a filled-in template users can translate and drop back into `lang/`.
+fn export_lang_template(lang_index: usize) -> Result<PathBuf> {
+    let idx = lang_index.min(5);
+    let map = tables()[idx].to_map();
+    let path = paths::lang_dir().join(format!("{}.template.json", LANG_CODES[idx]));
+    std::fs::write(&path, serde_json::to_string_pretty(&map)?)?;
+    Ok(path)
+}
 
 fn detect_system_lang() -> Lang {
     #[cfg(windows)]
@@ -2348,18 +3001,19 @@ fn get_strings(lang_mode: usize, system_lang: Lang) -> &'static Strings {
         6 => Lang::Zh,
         _ => system_lang,
     };
-    match lang {
-        Lang::Ru => &RU,
-        Lang::Uk => &UK,
-        Lang::Pt => &PT,
-        Lang::Es => &ES,
-        Lang::Zh => &ZH,
-        Lang::En => &EN,
-    }
+    let idx = match lang {
+        Lang::En => 0,
+        Lang::Ru => 1,
+        Lang::Uk => 2,
+        Lang::Pt => 3,
+        Lang::Es => 4,
+        Lang::Zh => 5,
+    };
+    tables()[idx]
 }
 
 // ============================================================================
-// Theme system
+// Themes
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2431,7 +3085,6 @@ struct Palette {
 fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
-
 fn rgba(r: u8, g: u8, b: u8, a: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(r, g, b, a)
 }
@@ -2457,7 +3110,7 @@ fn get_system_accent_color() -> Option<egui::Color32> {
         );
         let _ = RegCloseKey(key);
         if res.is_ok() {
-            // AccentColor is stored as ABGR.
+            // Stored as ABGR.
             return Some(egui::Color32::from_rgb(
                 (data & 0xFF) as u8,
                 ((data >> 8) & 0xFF) as u8,
@@ -2477,82 +3130,90 @@ fn get_palette(theme: Theme) -> Palette {
     match theme {
         Theme::Dark => Palette {
             dark: true, bg: rgb(16, 16, 16), panel: rgb(24, 24, 24), widget: rgb(42, 42, 42),
-            widget_hover: rgb(58, 58, 58), widget_active: rgb(75, 75, 75), active_fg: rgb(255, 255, 255),
-            border: rgb(70, 70, 70), hover_border: rgb(95, 95, 95), text: rgb(230, 230, 230),
-            faint: rgb(130, 130, 130), accent: rgb(70, 130, 255), focus_border: rgb(0, 200, 255),
-            widget_round: 4.0, shadow_blur: 4, shadow_offset: 1, shadow_alpha: 60,
-            item_spacing_y: 5.0, button_padding: 3.0, animation_time: 0.15, backdrop: 1,
+            widget_hover: rgb(58, 58, 58), widget_active: rgb(75, 75, 75),
+            active_fg: rgb(255, 255, 255), border: rgb(70, 70, 70), hover_border: rgb(95, 95, 95),
+            text: rgb(230, 230, 230), faint: rgb(130, 130, 130), accent: rgb(70, 130, 255),
+            focus_border: rgb(0, 200, 255), widget_round: 4.0, shadow_blur: 4, shadow_offset: 1,
+            shadow_alpha: 60, item_spacing_y: 5.0, button_padding: 3.0, animation_time: 0.15,
+            backdrop: 1,
         },
         Theme::Oled => Palette {
             dark: true, bg: rgb(0, 0, 0), panel: rgb(0, 0, 0), widget: rgb(20, 20, 20),
-            widget_hover: rgb(35, 35, 35), widget_active: rgb(50, 50, 50), active_fg: rgb(255, 255, 255),
-            border: rgb(40, 40, 40), hover_border: rgb(80, 80, 80), text: rgb(240, 240, 240),
-            faint: rgb(120, 120, 120), accent: rgb(0, 122, 204), focus_border: rgb(0, 255, 255),
-            widget_round: 2.0, shadow_blur: 0, shadow_offset: 0, shadow_alpha: 0,
-            item_spacing_y: 5.0, button_padding: 3.0, animation_time: 0.1, backdrop: 1,
+            widget_hover: rgb(35, 35, 35), widget_active: rgb(50, 50, 50),
+            active_fg: rgb(255, 255, 255), border: rgb(40, 40, 40), hover_border: rgb(80, 80, 80),
+            text: rgb(240, 240, 240), faint: rgb(120, 120, 120), accent: rgb(0, 122, 204),
+            focus_border: rgb(0, 255, 255), widget_round: 2.0, shadow_blur: 0, shadow_offset: 0,
+            shadow_alpha: 0, item_spacing_y: 5.0, button_padding: 3.0, animation_time: 0.1,
+            backdrop: 1,
         },
         Theme::Material3 => {
             let accent = get_system_accent_color().unwrap_or_else(|| rgb(208, 188, 255));
             Palette {
                 dark: true, bg: rgb(18, 17, 24), panel: rgb(24, 23, 31), widget: rgb(32, 31, 42),
-                widget_hover: rgb(40, 39, 52), widget_active: accent, active_fg: rgb(255, 255, 255),
-                border: rgb(73, 69, 82), hover_border: accent, text: rgb(230, 224, 233),
-                faint: rgb(147, 143, 153), accent, focus_border: rgb(255, 255, 0),
-                widget_round: 20.0, shadow_blur: 0, shadow_offset: 0, shadow_alpha: 0,
-                item_spacing_y: 7.0, button_padding: 6.0, animation_time: 0.4, backdrop: 1,
+                widget_hover: rgb(40, 39, 52), widget_active: accent,
+                active_fg: rgb(255, 255, 255), border: rgb(73, 69, 82), hover_border: accent,
+                text: rgb(230, 224, 233), faint: rgb(147, 143, 153), accent,
+                focus_border: rgb(255, 255, 0), widget_round: 20.0, shadow_blur: 0,
+                shadow_offset: 0, shadow_alpha: 0, item_spacing_y: 7.0, button_padding: 6.0,
+                animation_time: 0.4, backdrop: 1,
             }
         }
         Theme::Catppuccin => Palette {
             dark: true, bg: rgb(17, 17, 27), panel: rgb(30, 30, 46), widget: rgb(49, 50, 68),
-            widget_hover: rgb(69, 71, 90), widget_active: rgb(203, 166, 247), active_fg: rgb(17, 17, 27),
-            border: rgb(88, 91, 112), hover_border: rgb(203, 166, 247), text: rgb(205, 214, 244),
-            faint: rgb(166, 172, 200), accent: rgb(203, 166, 247), focus_border: rgb(250, 178, 102),
-            widget_round: 10.0, shadow_blur: 6, shadow_offset: 2, shadow_alpha: 90,
-            item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.25, backdrop: 1,
+            widget_hover: rgb(69, 71, 90), widget_active: rgb(203, 166, 247),
+            active_fg: rgb(17, 17, 27), border: rgb(88, 91, 112), hover_border: rgb(203, 166, 247),
+            text: rgb(205, 214, 244), faint: rgb(166, 172, 200), accent: rgb(203, 166, 247),
+            focus_border: rgb(250, 178, 102), widget_round: 10.0, shadow_blur: 6, shadow_offset: 2,
+            shadow_alpha: 90, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.25,
+            backdrop: 1,
         },
         Theme::Nord => Palette {
             dark: true, bg: rgb(46, 52, 64), panel: rgb(46, 52, 64), widget: rgb(59, 66, 82),
-            widget_hover: rgb(67, 76, 94), widget_active: rgb(136, 192, 208), active_fg: rgb(46, 52, 64),
-            border: rgb(76, 86, 106), hover_border: rgb(136, 192, 208), text: rgb(216, 222, 233),
-            faint: rgb(148, 155, 168), accent: rgb(136, 192, 208), focus_border: rgb(143, 188, 187),
-            widget_round: 6.0, shadow_blur: 5, shadow_offset: 1, shadow_alpha: 80,
-            item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.2, backdrop: 1,
+            widget_hover: rgb(67, 76, 94), widget_active: rgb(136, 192, 208),
+            active_fg: rgb(46, 52, 64), border: rgb(76, 86, 106), hover_border: rgb(136, 192, 208),
+            text: rgb(216, 222, 233), faint: rgb(148, 155, 168), accent: rgb(136, 192, 208),
+            focus_border: rgb(143, 188, 187), widget_round: 6.0, shadow_blur: 5, shadow_offset: 1,
+            shadow_alpha: 80, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.2,
+            backdrop: 1,
         },
         Theme::Dracula => Palette {
             dark: true, bg: rgb(40, 42, 54), panel: rgb(40, 42, 54), widget: rgb(68, 71, 90),
-            widget_hover: rgb(80, 83, 105), widget_active: rgb(255, 121, 198), active_fg: rgb(40, 42, 54),
-            border: rgb(98, 114, 164), hover_border: rgb(255, 121, 198), text: rgb(248, 248, 242),
-            faint: rgb(135, 140, 160), accent: rgb(255, 121, 198), focus_border: rgb(189, 147, 249),
-            widget_round: 8.0, shadow_blur: 6, shadow_offset: 2, shadow_alpha: 90,
-            item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.25, backdrop: 1,
+            widget_hover: rgb(80, 83, 105), widget_active: rgb(255, 121, 198),
+            active_fg: rgb(40, 42, 54), border: rgb(98, 114, 164), hover_border: rgb(255, 121, 198),
+            text: rgb(248, 248, 242), faint: rgb(135, 140, 160), accent: rgb(255, 121, 198),
+            focus_border: rgb(189, 147, 249), widget_round: 8.0, shadow_blur: 6, shadow_offset: 2,
+            shadow_alpha: 90, item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.25,
+            backdrop: 1,
         },
         Theme::Glass => Palette {
-            dark: true, bg: rgb(24, 28, 40), panel: rgba(40, 46, 64, 110), widget: rgba(255, 255, 255, 45),
-            widget_hover: rgba(255, 255, 255, 75), widget_active: rgba(120, 180, 255, 200),
-            active_fg: rgb(255, 255, 255), border: rgba(255, 255, 255, 110),
-            hover_border: rgba(255, 255, 255, 170), text: rgb(240, 245, 255), faint: rgb(190, 200, 220),
-            accent: rgb(120, 180, 255), focus_border: rgb(255, 255, 255),
-            widget_round: 14.0, shadow_blur: 12, shadow_offset: 3, shadow_alpha: 100,
-            item_spacing_y: 5.0, button_padding: 4.0, animation_time: 0.3, backdrop: 3,
+            dark: true, bg: rgb(24, 28, 40), panel: rgba(40, 46, 64, 110),
+            widget: rgba(255, 255, 255, 45), widget_hover: rgba(255, 255, 255, 75),
+            widget_active: rgba(120, 180, 255, 200), active_fg: rgb(255, 255, 255),
+            border: rgba(255, 255, 255, 110), hover_border: rgba(255, 255, 255, 170),
+            text: rgb(240, 245, 255), faint: rgb(190, 200, 220), accent: rgb(120, 180, 255),
+            focus_border: rgb(255, 255, 255), widget_round: 14.0, shadow_blur: 12,
+            shadow_offset: 3, shadow_alpha: 100, item_spacing_y: 5.0, button_padding: 4.0,
+            animation_time: 0.3, backdrop: 3,
         },
         Theme::Neumorphism => Palette {
-            dark: false, bg: rgb(224, 229, 236), panel: rgb(224, 229, 236), widget: rgb(224, 229, 236),
-            widget_hover: rgb(231, 236, 243), widget_active: rgb(93, 120, 255), active_fg: rgb(255, 255, 255),
+            dark: false, bg: rgb(224, 229, 236), panel: rgb(224, 229, 236),
+            widget: rgb(224, 229, 236), widget_hover: rgb(231, 236, 243),
+            widget_active: rgb(93, 120, 255), active_fg: rgb(255, 255, 255),
             border: rgb(224, 229, 236), hover_border: rgb(224, 229, 236), text: rgb(60, 70, 90),
             faint: rgb(120, 130, 150), accent: rgb(93, 120, 255), focus_border: rgb(255, 100, 100),
             widget_round: 12.0, shadow_blur: 10, shadow_offset: 5, shadow_alpha: 110,
             item_spacing_y: 6.0, button_padding: 5.0, animation_time: 0.25, backdrop: 1,
         },
-        // Mica finally wired up to a theme of its own.
         Theme::Fluent => {
             let accent = get_system_accent_color().unwrap_or_else(|| rgb(76, 156, 255));
             Palette {
-                dark: true, bg: rgb(32, 32, 32), panel: rgba(43, 43, 43, 150), widget: rgba(255, 255, 255, 22),
-                widget_hover: rgba(255, 255, 255, 38), widget_active: accent, active_fg: rgb(255, 255, 255),
+                dark: true, bg: rgb(32, 32, 32), panel: rgba(43, 43, 43, 150),
+                widget: rgba(255, 255, 255, 22), widget_hover: rgba(255, 255, 255, 38),
+                widget_active: accent, active_fg: rgb(255, 255, 255),
                 border: rgba(255, 255, 255, 40), hover_border: accent, text: rgb(240, 240, 240),
-                faint: rgb(165, 165, 165), accent, focus_border: accent,
-                widget_round: 7.0, shadow_blur: 0, shadow_offset: 0, shadow_alpha: 0,
-                item_spacing_y: 6.0, button_padding: 5.0, animation_time: 0.2, backdrop: 2,
+                faint: rgb(165, 165, 165), accent, focus_border: accent, widget_round: 7.0,
+                shadow_blur: 0, shadow_offset: 0, shadow_alpha: 0, item_spacing_y: 6.0,
+                button_padding: 5.0, animation_time: 0.2, backdrop: 2,
             }
         }
     }
@@ -2567,7 +3228,16 @@ fn make_shadow(p: &Palette) -> egui::Shadow {
     }
 }
 
-fn apply_theme(ctx: &egui::Context, theme: Theme, transparent_ui: bool) {
+/// Applies a theme and returns the fill the central panel should use.
+///
+/// The translucency of the window and the background of popups have to come from
+/// two different places. egui paints combo-box lists, menus and tooltips with
+/// `panel_fill`, and those float *above* the app's own content - a see-through list
+/// there means reading two layers of text at once. So `panel_fill` stays opaque for
+/// the popups, and the window's translucency is applied straight to the central
+/// panel's frame by the caller.
+#[must_use]
+fn apply_theme(ctx: &egui::Context, theme: Theme, transparent_ui: bool) -> egui::Color32 {
     let p = get_palette(theme);
     let mut visuals = if p.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
 
@@ -2601,12 +3271,26 @@ fn apply_theme(ctx: &egui::Context, theme: Theme, transparent_ui: bool) {
     visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0, p.focus_border);
 
     let translucent = transparent_ui || p.backdrop > 1;
+    let panel_fill = if translucent {
+        if p.backdrop > 1 { p.panel } else { rgba(30, 30, 30, 140) }
+    } else {
+        p.panel
+    };
+
     if translucent {
-        visuals.window_fill = egui::Color32::TRANSPARENT;
-        visuals.panel_fill = if p.backdrop > 1 { p.panel } else { rgba(30, 30, 30, 140) };
-        visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
-        visuals.window_shadow = egui::Shadow::NONE;
-        visuals.popup_shadow = egui::Shadow::NONE;
+        // Everything egui might use for a floating surface is forced opaque, and gets
+        // a border plus a shadow so it reads as a separate layer.
+        visuals.panel_fill = p.bg;
+        visuals.window_fill = p.bg;
+        visuals.extreme_bg_color = p.bg;
+        visuals.window_stroke = egui::Stroke::new(1.0, p.hover_border);
+        visuals.window_shadow = make_shadow(&p);
+        visuals.popup_shadow = egui::Shadow {
+            offset: [0, 4],
+            blur: 14,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(170),
+        };
     }
 
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
@@ -2618,10 +3302,99 @@ fn apply_theme(ctx: &egui::Context, theme: Theme, transparent_ui: bool) {
     ctx.set_style_of(egui::Theme::Dark, style.clone());
     ctx.set_style_of(egui::Theme::Light, style);
 
-    // Always push the backdrop (1 = none), so switching *away* from Glass/Fluent
-    // actually removes the system effect instead of leaving it behind.
+    // Pushed unconditionally (1 = none) so leaving a backdrop theme clears the effect.
     #[cfg(windows)]
     platform::apply_system_backdrop(platform::app_hwnd(), p.backdrop);
+
+    panel_fill
+}
+
+// ============================================================================
+// Macro editing helpers
+// ============================================================================
+
+fn describe_event(ev: &MacroEvent) -> String {
+    match ev.kind {
+        InputEventKind::Key { vk, down, .. } => {
+            format!("{} {}", if down { "key↓" } else { "key↑" }, vk_name(vk as u32))
+        }
+        InputEventKind::MouseMove { x, y, .. } => format!("move {x},{y}"),
+        InputEventKind::MouseButton { button, down, x, y } => {
+            format!("{:?}{} {x},{y}", button, if down { "↓" } else { "↑" })
+        }
+        InputEventKind::MouseWheel { delta, horizontal, .. } => {
+            format!("wheel{} {delta}", if horizontal { " h" } else { "" })
+        }
+    }
+}
+
+/// Removes `[from, to]` and pulls the tail back so no silent gap is left behind.
+fn editor_delete_range(data: &mut MacroData, from: usize, to: usize) {
+    if data.events.is_empty() {
+        return;
+    }
+    let from = from.min(data.events.len() - 1);
+    let to = to.min(data.events.len() - 1).max(from);
+    let start_t = data.events[from].t_us;
+    let end_t = data.events[to].t_us;
+    let removed = end_t.saturating_sub(start_t);
+    data.events.drain(from..=to);
+    for ev in data.events.iter_mut().skip(from) {
+        ev.t_us = ev.t_us.saturating_sub(removed);
+    }
+    data.duration_us = data.duration_us.saturating_sub(removed).max(data.last_t());
+}
+
+fn editor_crop(data: &mut MacroData, from: usize, to: usize) {
+    if data.events.is_empty() {
+        return;
+    }
+    let from = from.min(data.events.len() - 1);
+    let to = to.min(data.events.len() - 1).max(from);
+    let slice: Vec<MacroEvent> = data.events[from..=to].to_vec();
+    let base = slice.first().map(|e| e.t_us).unwrap_or(0);
+    data.events = slice
+        .into_iter()
+        .map(|mut e| {
+            e.t_us = e.t_us.saturating_sub(base);
+            e
+        })
+        .collect();
+    data.duration_us = data.last_t();
+}
+
+fn editor_insert_delay(data: &mut MacroData, at: usize, ms: u64) {
+    let us = ms * 1_000;
+    for ev in data.events.iter_mut().skip(at) {
+        ev.t_us = ev.t_us.saturating_add(us);
+    }
+    data.duration_us = data.duration_us.saturating_add(us).max(data.last_t());
+}
+
+fn editor_scale(data: &mut MacroData, factor: f64) {
+    let f = factor.clamp(0.05, 20.0);
+    for ev in data.events.iter_mut() {
+        ev.t_us = (ev.t_us as f64 * f) as u64;
+    }
+    data.duration_us = ((data.duration_us as f64) * f) as u64;
+}
+
+fn editor_drop_moves(data: &mut MacroData) {
+    data.events.retain(|e| !matches!(e.kind, InputEventKind::MouseMove { .. }));
+}
+
+/// Shifts everything so the first event happens at t = 0.
+fn editor_trim_lead(data: &mut MacroData) {
+    let Some(first) = data.events.first().map(|e| e.t_us) else {
+        return;
+    };
+    if first == 0 {
+        return;
+    }
+    for ev in data.events.iter_mut() {
+        ev.t_us = ev.t_us.saturating_sub(first);
+    }
+    data.duration_us = data.duration_us.saturating_sub(first).max(data.last_t());
 }
 
 // ============================================================================
@@ -2634,18 +3407,44 @@ struct MacroApp {
     system_lang: Lang,
     status_msg: String,
     theme_dirty: bool,
+    // editor
+    ed_from: usize,
+    ed_to: usize,
+    ed_delay_ms: u64,
+    ed_scale: f64,
+    ed_undo: Option<MacroData>,
+    // profiles
+    profiles: Vec<String>,
+    profile_name: String,
+    /// Fill for the central panel - this is what makes the window translucent.
+    panel_fill: egui::Color32,
+    // pixel picking
+    pick_deadline: Option<Instant>,
+    /// When the current "press a key" session started.
+    capture_started: Option<Instant>,
 }
 
 impl MacroApp {
     fn new(cc: &eframe::CreationContext<'_>, state: Arc<AppState>, config: AppConfig) -> Self {
         setup_fonts(&cc.egui_ctx);
-        apply_theme(&cc.egui_ctx, theme_at(config.default_theme), config.transparent_ui);
+        let panel_fill =
+            apply_theme(&cc.egui_ctx, theme_at(config.default_theme), config.transparent_ui);
         Self {
+            panel_fill,
             state,
             config,
             system_lang: detect_system_lang(),
             status_msg: String::new(),
             theme_dirty: true,
+            ed_from: 0,
+            ed_to: 0,
+            ed_delay_ms: 500,
+            ed_scale: 1.0,
+            ed_undo: None,
+            profiles: list_profiles(),
+            profile_name: String::new(),
+            pick_deadline: None,
+            capture_started: None,
         }
     }
 
@@ -2653,13 +3452,29 @@ impl MacroApp {
         get_strings(self.config.default_lang, self.system_lang)
     }
 
-    fn sync(&self) {
-        apply_config_to_state(&self.config, &self.state);
+    fn busy(&self) -> bool {
+        self.state.recording.load(Ordering::Relaxed) || self.state.playing.load(Ordering::Relaxed)
+    }
+
+    fn snapshot_for_undo(&mut self) {
+        self.ed_undo = Some(self.state.macro_data.lock().clone());
+    }
+
+    fn edit<F: FnOnce(&mut MacroData)>(&mut self, f: F) {
+        if self.busy() {
+            return;
+        }
+        self.snapshot_for_undo();
+        let mut data = self.state.macro_data.lock();
+        f(&mut data);
+        let dur = data.duration_us;
+        drop(data);
+        self.state.recorded_time_us.store(dur, Ordering::Relaxed);
     }
 
     fn do_save(&mut self, path: PathBuf) {
-        let data = self.state.macro_data.lock().clone();
         let s = self.strs();
+        let data = self.state.macro_data.lock().clone();
         if data.is_empty() {
             self.status_msg = s.no_macro.to_string();
             return;
@@ -2668,8 +3483,7 @@ impl MacroApp {
             Ok(()) => {
                 self.config.push_recent(&path);
                 *self.state.current_path.lock() = Some(path.clone());
-                self.status_msg =
-                    s.saved.replace("{}", &path.file_name().unwrap_or_default().to_string_lossy());
+                self.status_msg = s.saved.replace("{}", &file_label(&path));
             }
             Err(e) => self.status_msg = s.save_err.replace("{}", &e.to_string()),
         }
@@ -2683,8 +3497,8 @@ impl MacroApp {
                 *self.state.macro_data.lock() = data;
                 *self.state.current_path.lock() = Some(path.clone());
                 self.config.push_recent(&path);
-                self.status_msg =
-                    s.loaded.replace("{}", &path.file_name().unwrap_or_default().to_string_lossy());
+                self.ed_undo = None;
+                self.status_msg = s.loaded.replace("{}", &file_label(&path));
             }
             Err(e) => self.status_msg = s.load_err.replace("{}", &e.to_string()),
         }
@@ -2699,28 +3513,10 @@ impl MacroApp {
             }
         })
     }
+}
 
-    fn pick_open(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Macro", &["json", "mrz", "gz"])
-            .set_directory(paths::data_dir())
-            .pick_file()
-        {
-            self.do_load(path);
-        }
-    }
-
-    fn pick_save(&mut self) {
-        let ext = if self.config.compress_on_save { "mrz" } else { "json" };
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Macro", &["json", "mrz"])
-            .set_directory(paths::data_dir())
-            .set_file_name(format!("macro.{ext}"))
-            .save_file()
-        {
-            self.do_save(path);
-        }
-    }
+fn file_label(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
 }
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -2745,20 +3541,152 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// One row of the hotkey editor. Returns true when the binding changed.
+///
+/// Two ways to set a key, because one of them always works: click the button and
+/// press anything, or pick from the list (which also covers keys the window never
+/// receives, such as Pause and the NumPad).
+fn hotkey_row(
+    ui: &mut egui::Ui,
+    s: &Strings,
+    label: &str,
+    salt: &str,
+    slot: u32,
+    hk: &mut Hotkey,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label);
+
+        let capturing = CAPTURE_SLOT.load(Ordering::Relaxed) == slot;
+        let text = if capturing { s.hk_press.to_string() } else { hk.label() };
+        let button = egui::Button::new(text).min_size(egui::vec2(140.0, 0.0));
+        if ui.add(button).on_hover_text(s.hk_bind).clicked() {
+            if capturing {
+                end_capture();
+            } else {
+                begin_capture(slot);
+            }
+        }
+
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text("▾")
+            .width(46.0)
+            .show_ui(ui, |ui| {
+                for (name, vk) in HOTKEY_CHOICES {
+                    if ui.selectable_label(hk.vk == vk, name).clicked() && hk.vk != vk {
+                        hk.vk = vk;
+                        changed = true;
+                    }
+                }
+            });
+
+        changed |= ui.checkbox(&mut hk.ctrl, "Ctrl").changed();
+        changed |= ui.checkbox(&mut hk.alt, "Alt").changed();
+        changed |= ui.checkbox(&mut hk.shift, "Shift").changed();
+        if ui.small_button(s.hk_clear).clicked() && hk.vk != 0 {
+            *hk = Hotkey::plain(0);
+            changed = true;
+        }
+    });
+    changed
+}
+
 impl eframe::App for MacroApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let s = self.strs();
         let recording = self.state.recording.load(Ordering::Relaxed);
         let playing = self.state.playing.load(Ordering::Relaxed);
         let paused = self.state.paused.load(Ordering::Relaxed);
+        let busy = recording || playing;
 
-        // The window only exists after the first frame, so the backdrop is applied once here.
+        // The window only exists after the first frame, so the backdrop lands here.
         if self.theme_dirty {
-            apply_theme(ui.ctx(), theme_at(self.config.default_theme), self.config.transparent_ui);
+            self.panel_fill = apply_theme(
+                ui.ctx(),
+                theme_at(self.config.default_theme),
+                self.config.transparent_ui,
+            );
             self.theme_dirty = false;
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        // ---- close button -----------------------------------------------------
+        // Minimize to tray instead of quitting - unless the tray itself asked us to
+        // quit, and never when the icon failed to appear, which would leave the app
+        // running with no way to reach it.
+        if ui.ctx().input(|i| i.viewport().close_requested()) {
+            let to_tray = self.config.tray_enabled
+                && self.config.close_to_tray
+                && tray::is_active()
+                && !ALLOW_CLOSE.load(Ordering::Relaxed);
+            if to_tray {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                set_window_visible(false);
+            }
+        }
+
+        // ---- hotkey binding ---------------------------------------------------
+        let slot = CAPTURE_SLOT.load(Ordering::Relaxed);
+        if slot != 0 {
+            // Keep the window awake and give up after a while so a forgotten binding
+            // session can never leave the global hotkeys switched off.
+            ui.ctx().request_repaint();
+            match self.capture_started {
+                Some(t) if t.elapsed() > Duration::from_secs(15) => {
+                    self.capture_started = None;
+                    end_capture();
+                }
+                None => self.capture_started = Some(Instant::now()),
+                _ => {}
+            }
+            // Path 1: normal window input (works whenever this window has focus).
+            if let Some(hk) = capture_from_window(ui.ctx()) {
+                *CAPTURED_KEY.lock() = Some(hk);
+            }
+        } else {
+            self.capture_started = None;
+        }
+
+        // Path 2: the low-level hook, which also sees keys while another app is focused.
+        let captured = CAPTURED_KEY.lock().take();
+        if let Some(hk) = captured {
+            if slot != 0 && hk.vk != 0 {
+                match slot {
+                    1 => self.config.hotkey_record = hk,
+                    2 => self.config.hotkey_play = hk,
+                    3 => self.config.hotkey_stop = hk,
+                    4 => self.config.hotkey_pause = hk,
+                    _ => {}
+                }
+                self.status_msg = format!("{} {}", s.hk_bind, hk.label());
+            }
+            self.capture_started = None;
+            end_capture();
+            publish_hotkeys(&self.config);
+        }
+
+        // ---- deferred pixel pick ---------------------------------------------
+        if let Some(deadline) = self.pick_deadline {
+            if Instant::now() >= deadline {
+                self.pick_deadline = None;
+                let (x, y) = platform::cursor_pos();
+                self.config.pixel_x = x;
+                self.config.pixel_y = y;
+                if let Some((r, g, b)) = platform::screen_pixel(x, y) {
+                    self.config.pixel_r = r;
+                    self.config.pixel_g = g;
+                    self.config.pixel_b = b;
+                }
+                self.status_msg = s.done.to_string();
+            }
+        }
+
+        if self.state.pixel_triggered.swap(false, Ordering::Relaxed) {
+            self.status_msg = s.status_pixel.to_string();
+        }
+
+        let panel = egui::Frame::central_panel(ui.style()).fill(self.panel_fill);
+        egui::CentralPanel::default().frame(panel).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading(APP_TITLE);
@@ -2768,26 +3696,19 @@ impl eframe::App for MacroApp {
 
                 // ---- transport ------------------------------------------------
                 ui.horizontal(|ui| {
-                    let rec_label =
-                        if recording { s.stop_rec } else { s.record };
-                    if ui
-                        .add_enabled(!playing, egui::Button::new(rec_label))
-                        .clicked()
-                    {
+                    let label = if recording { s.stop_rec } else { s.record };
+                    if ui.add_enabled(!playing, egui::Button::new(label)).clicked() {
                         toggle_recording(&self.state);
                     }
-                    ui.label(
-                        egui::RichText::new(self.config.hotkey_record.label()).weak(),
-                    );
+                    ui.label(egui::RichText::new(self.config.hotkey_record.label()).weak());
                 });
-
                 ui.horizontal(|ui| {
-                    let play_label = if playing { s.stop_play } else { s.play };
-                    if ui.add_enabled(!recording, egui::Button::new(play_label)).clicked() {
+                    let label = if playing { s.stop_play } else { s.play };
+                    if ui.add_enabled(!recording, egui::Button::new(label)).clicked() {
                         toggle_playback(&self.state);
                     }
-                    let pause_label = if paused { s.resume } else { s.pause };
-                    if ui.add_enabled(playing, egui::Button::new(pause_label)).clicked() {
+                    let label = if paused { s.resume } else { s.pause };
+                    if ui.add_enabled(playing, egui::Button::new(label)).clicked() {
                         toggle_pause(&self.state);
                     }
                     ui.label(egui::RichText::new(self.config.hotkey_play.label()).weak());
@@ -2804,7 +3725,6 @@ impl eframe::App for MacroApp {
                         ui.label(s.rec_done.replace("{}", &format_us(rt)));
                     }
                 }
-
                 if playing || self.state.play_count.load(Ordering::Relaxed) > 0 {
                     let c = self.state.play_count.load(Ordering::Relaxed);
                     if self.state.loop_play.load(Ordering::Relaxed) {
@@ -2818,10 +3738,9 @@ impl eframe::App for MacroApp {
                         );
                     }
                 }
-
                 ui.separator();
 
-                // ---- playback settings ----------------------------------------
+                // ---- playback --------------------------------------------------
                 egui::CollapsingHeader::new(s.sec_playback).default_open(true).show(ui, |ui| {
                     ui.checkbox(&mut self.config.loop_play, s.loop_cb);
                     if !self.config.loop_play {
@@ -2847,9 +3766,19 @@ impl eframe::App for MacroApp {
                         ui.add(egui::DragValue::new(&mut self.config.jitter_pct).range(0..=50));
                     });
                     ui.checkbox(&mut self.config.absolute_mouse, s.abs_mouse);
+                    ui.checkbox(&mut self.config.use_window_anchor, s.anchor_use);
+                    let anchor = self
+                        .state
+                        .macro_data
+                        .lock()
+                        .anchor
+                        .as_ref()
+                        .map(|a| a.title.clone());
+                    let text = anchor.unwrap_or_else(|| s.anchor_none.to_string());
+                    ui.label(egui::RichText::new(s.anchor_of.replace("{}", &text)).weak().small());
                 });
 
-                // ---- recording settings ---------------------------------------
+                // ---- recording -------------------------------------------------
                 egui::CollapsingHeader::new(s.sec_recording).show(ui, |ui| {
                     ui.checkbox(&mut self.config.capture_mouse_moves, s.capture_moves);
                     ui.horizontal(|ui| {
@@ -2858,9 +3787,10 @@ impl eframe::App for MacroApp {
                             egui::DragValue::new(&mut self.config.mouse_sample_ms).range(1..=100),
                         );
                     });
+                    ui.checkbox(&mut self.config.record_window_anchor, s.anchor_rec);
                 });
 
-                // ---- time limit -----------------------------------------------
+                // ---- time limit -------------------------------------------------
                 egui::CollapsingHeader::new(s.sec_limit).show(ui, |ui| {
                     ui.checkbox(&mut self.config.time_limit_enabled, s.time_limit_cb);
                     if self.config.time_limit_enabled {
@@ -2878,43 +3808,194 @@ impl eframe::App for MacroApp {
                                 egui::DragValue::new(&mut self.config.time_limit_s).range(0..=59),
                             );
                         });
-
-                        let actions = [
-                            s.action_stop,
-                            s.action_shutdown,
-                            s.action_reboot,
-                            s.action_sleep,
-                            s.action_hibernate,
-                            s.action_logoff,
-                        ];
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(s.action_on_limit);
-                            for (i, name) in actions.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut self.config.action_on_completion,
-                                    i,
-                                    *name,
-                                );
-                            }
+                    }
+                    let actions = [
+                        s.action_stop,
+                        s.action_shutdown,
+                        s.action_reboot,
+                        s.action_sleep,
+                        s.action_hibernate,
+                        s.action_logoff,
+                    ];
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(s.action_on_limit);
+                        for (i, name) in actions.iter().enumerate() {
+                            ui.selectable_value(&mut self.config.action_on_completion, i, *name);
+                        }
+                    });
+                    if matches!(self.config.action_on_completion, 1 | 2) {
+                        ui.horizontal(|ui| {
+                            ui.label(s.shutdown_delay);
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.shutdown_delay_s)
+                                    .range(0..=600),
+                            );
                         });
-                        if matches!(self.config.action_on_completion, 1 | 2) {
-                            ui.horizontal(|ui| {
-                                ui.label(s.shutdown_delay);
-                                ui.add(
-                                    egui::DragValue::new(&mut self.config.shutdown_delay_s)
-                                        .range(0..=600),
-                                );
-                            });
+                    }
+                });
+
+                // ---- pixel condition ---------------------------------------------
+                egui::CollapsingHeader::new(s.sec_pixel).show(ui, |ui| {
+                    ui.checkbox(&mut self.config.pixel_enabled, s.pixel_cb);
+                    ui.horizontal(|ui| {
+                        ui.label("X");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.pixel_x).range(-32000..=32000),
+                        );
+                        ui.label("Y");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.pixel_y).range(-32000..=32000),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        let mut col = [
+                            self.config.pixel_r,
+                            self.config.pixel_g,
+                            self.config.pixel_b,
+                        ];
+                        if ui.color_edit_button_srgb(&mut col).changed() {
+                            self.config.pixel_r = col[0];
+                            self.config.pixel_g = col[1];
+                            self.config.pixel_b = col[2];
+                        }
+                        ui.label(s.pixel_tol);
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.pixel_tolerance).range(0..=255),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.config.pixel_mode, 0, s.pixel_match);
+                        ui.selectable_value(&mut self.config.pixel_mode, 1, s.pixel_differ);
+                    });
+                    match self.pick_deadline {
+                        Some(d) => {
+                            let left = d.saturating_duration_since(Instant::now()).as_secs() + 1;
+                            ui.label(s.pixel_picking.replace("{}", &left.to_string()));
+                        }
+                        None => {
+                            if ui.button(s.pixel_pick).clicked() {
+                                self.pick_deadline =
+                                    Some(Instant::now() + Duration::from_secs(3));
+                            }
                         }
                     }
                 });
 
-                // ---- hotkeys ---------------------------------------------------
+                // ---- editor --------------------------------------------------------
+                egui::CollapsingHeader::new(s.sec_editor).show(ui, |ui| {
+                    let (count, rows) = {
+                        let data = self.state.macro_data.lock();
+                        let n = data.events.len();
+                        let from = self.ed_from.min(n.saturating_sub(1));
+                        let to = self.ed_to.min(n.saturating_sub(1)).max(from);
+                        let end = (from + 40).min(n);
+                        let rows: Vec<(usize, u64, String)> = data
+                            .events
+                            .get(from..end)
+                            .unwrap_or(&[])
+                            .iter()
+                            .enumerate()
+                            .map(|(i, ev)| (from + i, ev.t_us, describe_event(ev)))
+                            .collect();
+                        let _ = to;
+                        (n, rows)
+                    };
+
+                    if count == 0 {
+                        ui.label(s.no_macro);
+                    } else {
+                        let last = count - 1;
+                        ui.horizontal(|ui| {
+                            ui.label(s.ed_from);
+                            ui.add(egui::DragValue::new(&mut self.ed_from).range(0..=last));
+                            ui.label(s.ed_to);
+                            ui.add(egui::DragValue::new(&mut self.ed_to).range(0..=last));
+                        });
+                        if self.ed_to < self.ed_from {
+                            self.ed_to = self.ed_from;
+                        }
+
+                        egui::ScrollArea::vertical().max_height(160.0).id_salt("ed_list").show(
+                            ui,
+                            |ui| {
+                                for (i, t, text) in &rows {
+                                    let selected = *i >= self.ed_from && *i <= self.ed_to;
+                                    let line = format!("{i:>5}  {}  {text}", format_us(*t));
+                                    if ui
+                                        .selectable_label(
+                                            selected,
+                                            egui::RichText::new(line).monospace().small(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.ed_from = *i;
+                                        self.ed_to = *i;
+                                    }
+                                }
+                            },
+                        );
+
+                        ui.horizontal_wrapped(|ui| {
+                            let (from, to) = (self.ed_from, self.ed_to);
+                            if ui.add_enabled(!busy, egui::Button::new(s.ed_delete)).clicked() {
+                                self.edit(|d| editor_delete_range(d, from, to));
+                            }
+                            if ui.add_enabled(!busy, egui::Button::new(s.ed_crop)).clicked() {
+                                self.edit(|d| editor_crop(d, from, to));
+                            }
+                            if ui.add_enabled(!busy, egui::Button::new(s.ed_drop_moves)).clicked() {
+                                self.edit(editor_drop_moves);
+                            }
+                            if ui.add_enabled(!busy, egui::Button::new(s.ed_zero)).clicked() {
+                                self.edit(editor_trim_lead);
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(s.ed_insert);
+                            ui.add(
+                                egui::DragValue::new(&mut self.ed_delay_ms)
+                                    .range(0..=600_000)
+                                    .speed(10.0),
+                            );
+                            if ui.add_enabled(!busy, egui::Button::new("＋")).clicked() {
+                                let (at, ms) = (self.ed_from, self.ed_delay_ms);
+                                self.edit(|d| editor_insert_delay(d, at, ms));
+                            }
+                            ui.label(s.ed_scale);
+                            ui.add(
+                                egui::DragValue::new(&mut self.ed_scale)
+                                    .range(0.05..=20.0)
+                                    .speed(0.05),
+                            );
+                            if ui.add_enabled(!busy, egui::Button::new("✔")).clicked() {
+                                let f = self.ed_scale;
+                                self.edit(|d| editor_scale(d, f));
+                            }
+                        });
+                        if ui
+                            .add_enabled(self.ed_undo.is_some() && !busy, egui::Button::new(s.ed_undo))
+                            .clicked()
+                        {
+                            if let Some(prev) = self.ed_undo.take() {
+                                let dur = prev.duration_us;
+                                *self.state.macro_data.lock() = prev;
+                                self.state.recorded_time_us.store(dur, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+
+                // ---- hotkeys --------------------------------------------------------
                 egui::CollapsingHeader::new(s.sec_hotkeys).show(ui, |ui| {
                     let mut changed = false;
-                    changed |= hotkey_row(ui, s.hk_record, "hk_rec", &mut self.config.hotkey_record);
-                    changed |= hotkey_row(ui, s.hk_play, "hk_play", &mut self.config.hotkey_play);
-                    changed |= hotkey_row(ui, s.hk_stop, "hk_stop", &mut self.config.hotkey_stop);
+                    changed |=
+                        hotkey_row(ui, s, s.hk_record, "hk1", 1, &mut self.config.hotkey_record);
+                    changed |=
+                        hotkey_row(ui, s, s.hk_play, "hk2", 2, &mut self.config.hotkey_play);
+                    changed |=
+                        hotkey_row(ui, s, s.hk_pause, "hk4", 4, &mut self.config.hotkey_pause);
+                    changed |=
+                        hotkey_row(ui, s, s.hk_stop, "hk3", 3, &mut self.config.hotkey_stop);
                     if changed {
                         publish_hotkeys(&self.config);
                         request_hotkey_refresh();
@@ -2924,7 +4005,7 @@ impl eframe::App for MacroApp {
                     }
                 });
 
-                // ---- appearance ------------------------------------------------
+                // ---- appearance ------------------------------------------------------
                 egui::CollapsingHeader::new(s.sec_appearance).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(s.theme);
@@ -2942,11 +4023,9 @@ impl eframe::App for MacroApp {
                                 }
                             });
                     });
-
                     if ui.checkbox(&mut self.config.transparent_ui, s.transparent_ui).changed() {
                         self.theme_dirty = true;
                     }
-
                     if ui.checkbox(&mut self.config.always_on_top, s.on_top).changed() {
                         let level = if self.config.always_on_top {
                             egui::viewport::WindowLevel::AlwaysOnTop
@@ -2956,7 +4035,10 @@ impl eframe::App for MacroApp {
                         ui.ctx()
                             .send_viewport_cmd(egui::viewport::ViewportCommand::WindowLevel(level));
                     }
-
+                    ui.checkbox(&mut self.config.tray_enabled, s.tray_cb);
+                    if self.config.tray_enabled {
+                        ui.checkbox(&mut self.config.close_to_tray, s.close_tray_cb);
+                    }
                     ui.horizontal(|ui| {
                         ui.label(s.language);
                         egui::ComboBox::from_id_salt("lang")
@@ -2989,9 +4071,64 @@ impl eframe::App for MacroApp {
                                 }
                             });
                     });
+                    if ui.button(s.lang_template).clicked() {
+                        let idx = self.config.default_lang.saturating_sub(1);
+                        match export_lang_template(idx) {
+                            Ok(p) => self.status_msg = s.exported.replace("{}", &file_label(&p)),
+                            Err(e) => {
+                                self.status_msg = s.save_err.replace("{}", &e.to_string());
+                            }
+                        }
+                    }
                 });
 
-                // ---- files ------------------------------------------------------
+                // ---- profiles ---------------------------------------------------------
+                egui::CollapsingHeader::new(s.sec_profiles).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(s.prof_name);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.profile_name)
+                                .desired_width(120.0),
+                        );
+                        if ui.button(s.prof_save).clicked() && !self.profile_name.trim().is_empty()
+                        {
+                            let path = profile_path(&self.profile_name);
+                            match save_config_to(&path, &self.config) {
+                                Ok(()) => {
+                                    self.profiles = list_profiles();
+                                    self.status_msg =
+                                        s.saved.replace("{}", &file_label(&path));
+                                }
+                                Err(e) => {
+                                    self.status_msg = s.save_err.replace("{}", &e.to_string())
+                                }
+                            }
+                        }
+                    });
+                    let names = self.profiles.clone();
+                    ui.horizontal_wrapped(|ui| {
+                        for name in names {
+                            if ui.small_button(&name).clicked() {
+                                let path = profile_path(&name);
+                                let mut cfg = load_config_from(&path);
+                                cfg.recent_files = self.config.recent_files.clone();
+                                self.config = cfg;
+                                self.profile_name = name.clone();
+                                self.theme_dirty = true;
+                                publish_hotkeys(&self.config);
+                                request_hotkey_refresh();
+                                self.status_msg = s.loaded.replace("{}", &name);
+                            }
+                        }
+                    });
+                    if ui.button(s.prof_delete).clicked() && !self.profile_name.trim().is_empty() {
+                        let _ = std::fs::remove_file(profile_path(&self.profile_name));
+                        self.profiles = list_profiles();
+                        self.status_msg = s.done.to_string();
+                    }
+                });
+
+                // ---- files ------------------------------------------------------------
                 egui::CollapsingHeader::new(s.sec_files).default_open(true).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         if ui.button(s.save).clicked() {
@@ -2999,7 +4136,15 @@ impl eframe::App for MacroApp {
                             self.do_save(path);
                         }
                         if ui.button(s.save_as).clicked() {
-                            self.pick_save();
+                            let ext = if self.config.compress_on_save { "mrz" } else { "json" };
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Macro", &["json", "mrz"])
+                                .set_directory(paths::data_dir())
+                                .set_file_name(format!("macro.{ext}"))
+                                .save_file()
+                            {
+                                self.do_save(path);
+                            }
                         }
                         if ui.button(s.load).clicked() {
                             let path = self
@@ -3011,14 +4156,83 @@ impl eframe::App for MacroApp {
                             self.do_load(path);
                         }
                         if ui.button(s.open_file).clicked() {
-                            self.pick_open();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Macro", &["json", "mrz", "gz"])
+                                .set_directory(paths::data_dir())
+                                .pick_file()
+                            {
+                                self.do_load(path);
+                            }
                         }
-                        if ui.add_enabled(!recording && !playing, egui::Button::new(s.clear)).clicked()
-                        {
+                        if ui.add_enabled(!busy, egui::Button::new(s.clear)).clicked() {
                             *self.state.macro_data.lock() = MacroData::default();
                             self.state.recorded_time_us.store(0, Ordering::Relaxed);
                             *self.state.current_path.lock() = None;
+                            self.ed_undo = None;
                             self.status_msg = s.cleared.to_string();
+                        }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button(s.export_exe).clicked() {
+                            let data = self.state.macro_data.lock().clone();
+                            if data.is_empty() {
+                                self.status_msg = s.no_macro.to_string();
+                            } else if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Executable", &["exe"])
+                                .set_directory(paths::data_dir())
+                                .set_file_name("macro-player.exe")
+                                .save_file()
+                            {
+                                let payload = Payload {
+                                    loops: if self.config.loop_play {
+                                        0
+                                    } else {
+                                        self.config.play_count_limit
+                                    },
+                                    speed: self.config.speed,
+                                    absolute_mouse: self.config.absolute_mouse,
+                                    repeat_delay_ms: self.config.repeat_delay_ms,
+                                    macro_data: data,
+                                };
+                                match export_self_running_exe(&path, &payload) {
+                                    Ok(()) => {
+                                        self.status_msg =
+                                            s.exported.replace("{}", &file_label(&path))
+                                    }
+                                    Err(e) => {
+                                        self.status_msg =
+                                            s.save_err.replace("{}", &e.to_string())
+                                    }
+                                }
+                            }
+                        }
+                        if ui.button(s.export_ahk).clicked() {
+                            let data = self.state.macro_data.lock().clone();
+                            if data.is_empty() {
+                                self.status_msg = s.no_macro.to_string();
+                            } else if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("AutoHotkey", &["ahk"])
+                                .set_directory(paths::data_dir())
+                                .set_file_name("macro.ahk")
+                                .save_file()
+                            {
+                                let loops = if self.config.loop_play {
+                                    0
+                                } else {
+                                    self.config.play_count_limit
+                                };
+                                match export_ahk(&path, &data, loops) {
+                                    Ok(()) => {
+                                        self.status_msg =
+                                            s.exported.replace("{}", &file_label(&path))
+                                    }
+                                    Err(e) => {
+                                        self.status_msg =
+                                            s.save_err.replace("{}", &e.to_string())
+                                    }
+                                }
+                            }
                         }
                     });
 
@@ -3029,11 +4243,9 @@ impl eframe::App for MacroApp {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(s.recent);
                             for path in recent {
-                                let name = Path::new(&path)
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| path.clone());
-                                if ui.small_button(name).on_hover_text(&path).clicked() {
+                                let name = file_label(Path::new(&path));
+                                let label = if name.is_empty() { path.clone() } else { name };
+                                if ui.small_button(label).on_hover_text(&path).clicked() {
                                     self.do_load(PathBuf::from(path.clone()));
                                 }
                             }
@@ -3061,7 +4273,7 @@ impl eframe::App for MacroApp {
 
                 ui.separator();
 
-                // ---- footer -----------------------------------------------------
+                // ---- footer -------------------------------------------------------------
                 let (count, dur) = {
                     let d = self.state.macro_data.lock();
                     (d.events.len(), d.duration_us)
@@ -3085,7 +4297,7 @@ impl eframe::App for MacroApp {
                     s.status_play.to_string()
                 } else {
                     format!(
-                        "{} [{}: rec | {}: play | {}: stop]",
+                        "{} [{} · {} · {}]",
                         s.status_ready,
                         self.config.hotkey_record.label(),
                         self.config.hotkey_play.label(),
@@ -3096,24 +4308,26 @@ impl eframe::App for MacroApp {
             });
         });
 
-        // Idempotent every frame (B1): the live state can never drift from the UI.
+        // Idempotent every frame: the engine can never drift from the UI.
         self.config.sanitize();
-        self.sync();
+        apply_config_to_state(&self.config, &self.state);
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if CAPTURE_SLOT.load(Ordering::Relaxed) != 0 {
+            end_capture();
+        }
         self.state.stop_play.store(true, Ordering::Relaxed);
         self.state.paused.store(false, Ordering::Relaxed);
         stop_recording(&self.state);
 
-        // Give the playback thread a moment to release any held keys (B3).
+        // Let the playback thread release anything it was holding.
         let deadline = Instant::now() + Duration::from_millis(400);
         while self.state.playing.load(Ordering::Relaxed) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        // Autosave (R4).
         self.config.sanitize();
         if let Err(e) = save_config(&self.config) {
             warn!("could not autosave config: {e}");
@@ -3137,31 +4351,8 @@ impl eframe::App for MacroApp {
     }
 }
 
-/// One row of the hotkey editor. Returns true when the binding changed.
-fn hotkey_row(ui: &mut egui::Ui, label: &str, salt: &str, hk: &mut Hotkey) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(label);
-        egui::ComboBox::from_id_salt(salt)
-            .selected_text(vk_name(hk.vk))
-            .width(110.0)
-            .show_ui(ui, |ui| {
-                for (name, vk) in HOTKEY_CHOICES {
-                    if ui.selectable_label(hk.vk == vk, name).clicked() && hk.vk != vk {
-                        hk.vk = vk;
-                        changed = true;
-                    }
-                }
-            });
-        changed |= ui.checkbox(&mut hk.ctrl, "Ctrl").changed();
-        changed |= ui.checkbox(&mut hk.alt, "Alt").changed();
-        changed |= ui.checkbox(&mut hk.shift, "Shift").changed();
-    });
-    changed
-}
-
 // ============================================================================
-// Command line
+// Command line & headless playback
 // ============================================================================
 
 struct CliArgs {
@@ -3214,24 +4405,16 @@ OPTIONS:
 Without --no-gui the options simply pre-load the GUI.
 ";
 
-/// Headless playback (F7).
-fn run_headless(args: &CliArgs, cfg: &AppConfig) -> Result<()> {
-    let path = args.play.clone().context("--no-gui requires --play <FILE>")?;
-    let data = load_macro(&path)?;
-
+/// Plays a macro without any window. Shared by `--no-gui` and exported executables.
+fn run_headless(data: MacroData, loops: u64, speed: f64, absolute: bool, delay_ms: u64) -> Result<()> {
     let (tx, rx) = unbounded();
     let state = AppState::new(tx);
-    apply_config_to_state(cfg, &state);
+    state.loop_play.store(loops == 0, Ordering::Relaxed);
+    state.play_count_limit.store(loops.max(1), Ordering::Relaxed);
+    state.absolute_mouse.store(absolute, Ordering::Relaxed);
+    state.repeat_delay_ms.store(delay_ms, Ordering::Relaxed);
+    *state.speed.lock() = speed.clamp(0.05, 10.0);
 
-    if let Some(n) = args.loops {
-        state.loop_play.store(n == 0, Ordering::Relaxed);
-        state.play_count_limit.store(n.max(1), Ordering::Relaxed);
-    }
-    if let Some(sp) = args.speed {
-        *state.speed.lock() = sp.clamp(0.05, 10.0);
-    }
-
-    // Drain the (unused) channel so senders never block.
     std::thread::spawn(move || while rx.recv().is_ok() {});
 
     #[cfg(windows)]
@@ -3239,10 +4422,10 @@ fn run_headless(args: &CliArgs, cfg: &AppConfig) -> Result<()> {
         let st = state.clone();
         std::thread::Builder::new()
             .name("hooks".into())
-            .spawn(move || input_hook_thread(st, HookMode::HotkeysOnly))?;
+            .spawn(move || input_hook_thread(st, HookMode::HotkeysOnly, false))?;
     }
 
-    println!("Playing {} ({} events)…", path.display(), data.events.len());
+    println!("Playing {} events…", data.events.len());
     let generation = state.play_generation.fetch_add(1, Ordering::SeqCst) + 1;
     state.playing.store(true, Ordering::Relaxed);
     playback_loop(state, data, generation);
@@ -3267,11 +4450,39 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     Some(guard)
 }
 
+/// Taskbar / title-bar icon, with a fallback if the embedded blob is the wrong size.
+fn load_window_icon() -> egui::IconData {
+    if ICON_RGBA.len() == (ICON_SIZE * ICON_SIZE * 4) as usize {
+        egui::IconData { rgba: ICON_RGBA.to_vec(), width: ICON_SIZE, height: ICON_SIZE }
+    } else {
+        warn!("embedded icon has an unexpected size - using the OS default");
+        egui::IconData::default()
+    }
+}
+
 fn main() -> Result<()> {
     init_epoch();
     let _log_guard = init_logging();
-    let args = parse_cli();
+    platform::set_dpi_awareness();
 
+    // An exported self-running executable carries its macro appended to the image.
+    if let Some(payload) = read_self_payload() {
+        platform::attach_parent_console();
+        info!("running as an exported macro player");
+        let mut data = payload.macro_data;
+        if data.normalize().is_err() {
+            return Ok(());
+        }
+        return run_headless(
+            data,
+            payload.loops,
+            payload.speed,
+            payload.absolute_mouse,
+            payload.repeat_delay_ms,
+        );
+    }
+
+    let args = parse_cli();
     if args.help || args.version {
         platform::attach_parent_console();
         if args.version {
@@ -3282,18 +4493,23 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    platform::set_dpi_awareness();
-
     let mut config = load_config();
     publish_hotkeys(&config);
     info!("data directory: {}", paths::data_dir().display());
 
     if args.no_gui {
         platform::attach_parent_console();
-        return run_headless(&args, &config);
+        let path = args.play.clone().context("--no-gui requires --play <FILE>")?;
+        let data = load_macro(&path)?;
+        return run_headless(
+            data,
+            args.loops.unwrap_or(if config.loop_play { 0 } else { config.play_count_limit }),
+            args.speed.unwrap_or(config.speed),
+            config.absolute_mouse,
+            config.repeat_delay_ms,
+        );
     }
 
-    // Single instance (R1).
     if !platform::acquire_single_instance() {
         platform::focus_existing_instance();
         info!("another instance is already running - exiting");
@@ -3314,12 +4530,12 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     {
         let st = state.clone();
+        let tray_on = config.tray_enabled;
         std::thread::Builder::new()
             .name("hooks".into())
-            .spawn(move || input_hook_thread(st, HookMode::Full))?;
+            .spawn(move || input_hook_thread(st, HookMode::Full, tray_on))?;
     }
 
-    // Optional macro preloaded from the command line.
     if let Some(path) = args.play.clone() {
         match load_macro(&path) {
             Ok(data) => {
@@ -3342,8 +4558,9 @@ fn main() -> Result<()> {
     apply_config_to_state(&config, &state);
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([440.0, 680.0])
-        .with_min_inner_size([360.0, 400.0])
+        .with_inner_size([460.0, 720.0])
+        .with_min_inner_size([380.0, 420.0])
+        .with_icon(load_window_icon())
         .with_transparent(true);
     if config.always_on_top {
         viewport = viewport.with_always_on_top();
@@ -3361,7 +4578,7 @@ fn main() -> Result<()> {
 }
 
 // ============================================================================
-// Tests (I2)
+// Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -3372,11 +4589,22 @@ mod tests {
         MacroEvent { t_us, kind: InputEventKind::MouseMove { x: 1, y: 2, dx: 0, dy: 0 } }
     }
 
+    fn click(t_us: u64) -> MacroEvent {
+        MacroEvent {
+            t_us,
+            kind: InputEventKind::MouseButton {
+                button: MouseButton::Left,
+                down: true,
+                x: 5,
+                y: 5,
+            },
+        }
+    }
+
     #[test]
     fn roundtrip_v2() {
         let data = MacroData::new(vec![ev(0), ev(1000)], 5000);
-        let json = serde_json::to_string(&data).unwrap();
-        let back: MacroData = serde_json::from_str(&json).unwrap();
+        let back: MacroData = serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
         assert_eq!(back.events.len(), 2);
         assert_eq!(back.duration_us, 5000);
         assert_eq!(back.version, 2);
@@ -3385,9 +4613,9 @@ mod tests {
     #[test]
     fn accepts_legacy_v1_array() {
         let json = serde_json::to_string(&vec![ev(0), ev(42)]).unwrap();
-        assert!(serde_json::from_str::<MacroData>(&json).is_err());
-        let events: Vec<MacroEvent> = serde_json::from_str(&json).unwrap();
-        assert_eq!(events.len(), 2);
+        let data = parse_macro(&json).unwrap();
+        assert_eq!(data.events.len(), 2);
+        assert_eq!(data.duration_us, 42);
     }
 
     #[test]
@@ -3399,16 +4627,94 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rejects_empty() {
-        let mut data = MacroData::default();
-        assert!(data.normalize().is_err());
+    fn cycle_length_keeps_trailing_pause() {
+        let data = MacroData::new(vec![ev(0), ev(3_000_000)], 5_000_000);
+        assert_eq!(data.cycle_len_us(), 5_000_000);
     }
 
     #[test]
-    fn cycle_length_keeps_trailing_pause() {
-        // 3 s of events followed by 2 s of idle time must replay as a 5 s cycle (B8).
-        let data = MacroData::new(vec![ev(0), ev(3_000_000)], 5_000_000);
-        assert_eq!(data.cycle_len_us(), 5_000_000);
+    fn editor_delete_pulls_the_tail_back() {
+        let mut d = MacroData::new(vec![ev(0), ev(1000), ev(2000), ev(3000)], 3000);
+        editor_delete_range(&mut d, 1, 2);
+        assert_eq!(d.events.len(), 2);
+        assert_eq!(d.events[1].t_us, 2000); // 3000 - (2000 - 1000)
+    }
+
+    #[test]
+    fn editor_crop_rebases_to_zero() {
+        let mut d = MacroData::new(vec![ev(0), ev(1000), ev(2500)], 2500);
+        editor_crop(&mut d, 1, 2);
+        assert_eq!(d.events.len(), 2);
+        assert_eq!(d.events[0].t_us, 0);
+        assert_eq!(d.events[1].t_us, 1500);
+        assert_eq!(d.duration_us, 1500);
+    }
+
+    #[test]
+    fn editor_insert_delay_shifts_the_tail() {
+        let mut d = MacroData::new(vec![ev(0), ev(1000)], 1000);
+        editor_insert_delay(&mut d, 1, 500);
+        assert_eq!(d.events[0].t_us, 0);
+        assert_eq!(d.events[1].t_us, 501_000);
+    }
+
+    #[test]
+    fn editor_scale_and_trim() {
+        let mut d = MacroData::new(vec![ev(1000), ev(2000)], 2000);
+        editor_scale(&mut d, 2.0);
+        assert_eq!(d.events[1].t_us, 4000);
+        editor_trim_lead(&mut d);
+        assert_eq!(d.events[0].t_us, 0);
+        assert_eq!(d.events[1].t_us, 2000);
+    }
+
+    #[test]
+    fn editor_drop_moves_keeps_clicks() {
+        let mut d = MacroData::new(vec![ev(0), click(10), ev(20)], 20);
+        editor_drop_moves(&mut d);
+        assert_eq!(d.events.len(), 1);
+    }
+
+    #[test]
+    fn payload_roundtrip_through_a_fake_image() {
+        let payload = Payload {
+            loops: 3,
+            speed: 1.5,
+            absolute_mouse: true,
+            repeat_delay_ms: 250,
+            macro_data: MacroData::new(vec![ev(0), ev(1000)], 1000),
+        };
+        let mut image = b"MZ fake executable body".to_vec();
+        let blob = gzip(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        image.extend_from_slice(&blob);
+        image.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        image.extend_from_slice(PAYLOAD_MAGIC);
+
+        let start = payload_offset(&image).expect("payload should be found");
+        let json = gunzip(&image[start..image.len() - 16]).unwrap();
+        let back: Payload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.loops, 3);
+        assert_eq!(back.macro_data.events.len(), 2);
+    }
+
+    #[test]
+    fn plain_image_has_no_payload() {
+        assert!(payload_offset(b"MZ just an executable").is_none());
+        assert!(payload_offset(b"tiny").is_none());
+    }
+
+    #[test]
+    fn ahk_export_emits_a_loop_and_sleeps() {
+        let dir = std::env::temp_dir().join("mr_ahk_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.ahk");
+        let d = MacroData::new(vec![click(0), click(1_500_000)], 2_000_000);
+        export_ahk(&path, &d, 4).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Loop 4 {"));
+        assert!(text.contains("Sleep 1500"));
+        assert!(text.contains("Click"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -3419,6 +4725,7 @@ mod tests {
             jitter_pct: 900,
             mouse_sample_ms: 0,
             default_theme: 99,
+            pixel_tolerance: 900,
             ..Default::default()
         };
         cfg.sanitize();
@@ -3427,11 +4734,13 @@ mod tests {
         assert_eq!(cfg.jitter_pct, 50);
         assert_eq!(cfg.mouse_sample_ms, 1);
         assert_eq!(cfg.default_theme, THEME_NAMES.len() - 1);
+        assert_eq!(cfg.pixel_tolerance, 255);
     }
 
     #[test]
     fn time_limit_math() {
-        let cfg = AppConfig { time_limit_h: 1, time_limit_m: 2, time_limit_s: 3, ..Default::default() };
+        let cfg =
+            AppConfig { time_limit_h: 1, time_limit_m: 2, time_limit_s: 3, ..Default::default() };
         assert_eq!(cfg.time_limit_us(), 3_723_000_000);
     }
 
@@ -3448,10 +4757,28 @@ mod tests {
 
     #[test]
     fn absolute_normalization_hits_both_edges() {
-        let (nx, ny) = platform::normalize_abs(0, 0, 0, 0, 1920, 1080);
-        assert_eq!((nx, ny), (0, 0));
-        let (nx, ny) = platform::normalize_abs(1919, 1079, 0, 0, 1920, 1080);
-        assert_eq!((nx, ny), (65535, 65535));
+        assert_eq!(platform::normalize_abs(0, 0, 0, 0, 1920, 1080), (0, 0));
+        assert_eq!(platform::normalize_abs(1919, 1079, 0, 0, 1920, 1080), (65535, 65535));
+    }
+
+    #[test]
+    fn language_overrides_apply() {
+        let mut map = BTreeMap::new();
+        map.insert("record".to_string(), "REC!".to_string());
+        map.insert("play".to_string(), String::new()); // empty values are ignored
+        let s = EN.with_overrides(&map);
+        assert_eq!(s.record, "REC!");
+        assert_eq!(s.play, EN.play);
+        assert!(s.to_map().contains_key("stop_play"));
+    }
+
+    #[test]
+    fn vk_names_cover_the_common_keys() {
+        assert_eq!(vk_name(0x77), "F8");
+        assert_eq!(vk_name(0x13), "Pause");
+        assert_eq!(vk_name(0x41), "A");
+        assert_eq!(vk_name(0x30), "0");
+        assert!(vk_name(0xFE).starts_with("VK "));
     }
 
     #[test]
@@ -3479,6 +4806,12 @@ mod tests {
         cfg.push_recent(Path::new("m11.json"));
         assert_eq!(cfg.recent_files.len(), 8);
         assert!(cfg.recent_files[0].ends_with("m11.json"));
+    }
+
+    #[test]
+    fn profile_names_are_sanitized() {
+        let p = profile_path("farm/../evil");
+        assert!(p.file_name().unwrap().to_string_lossy().starts_with("farm_"));
     }
 }
 
