@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/icon_256.png" width="128" alt="Macro Recorder">
+<img src="icon_256.png" width="128" alt="Macro Recorder">
 
 # 🦀 Macro Recorder
 
