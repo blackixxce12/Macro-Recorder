@@ -573,8 +573,8 @@ Grab the latest `.exe` from the **[Releases](../../releases)** page. No installa
 ```bash
 # 1. Install Rust (1.97.1+, edition 2024): https://rustup.rs
 # 2. Clone & build
-git clone https://github.com/blackixxce12/Micro-Recorder.git
-cd Micro-Recorder
+git clone https://github.com/blackixxce12/Macro-Recorder.git
+cd Macro-Recorder
 
 # Universal build
 cargo build --release
