@@ -673,6 +673,63 @@ Issues и PR приветствуются — особенно по пункта
 
 ---
 
+# 🛡️ Безопасность и проверка VirusTotal
+
+<p align="center">
+  <a href="https://www.virustotal.com/gui/file/21cab5702a58699c1b2f14ac4dec322ea591cfed52cde2bb9e361e22496413a7/">
+    <img src="https://img.shields.io/badge/VirusTotal-2%2F71%20Safe-brightgreen?style=for-the-badge&logo=virustotal&logoColor=white&color=2e7d32" alt="VirusTotal Build 1">
+  </a>
+  <a href="https://www.virustotal.com/gui/file/f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4/">
+    <img src="https://img.shields.io/badge/VirusTotal-2%2F71%20Safe-brightgreen?style=for-the-badge&logo=virustotal&logoColor=white&color=2e7d32" alt="VirusTotal Build 2">
+  </a>
+  <a href="#-почему-возникают-ложные-срабатывания-false-positives">
+    <img src="https://img.shields.io/badge/Status-False%20Positives%20Verified-blue?style=for-the-badge&logo=shield&logoColor=white" alt="False Positives Verified">
+  </a>
+</p>
+
+---
+
+> [!NOTE]
+> **Уведомление о безопасности:** Все исполняемые файлы перед каждым релизом проходят автоматическую проверку на **VirusTotal**. Из **71 антивирусного провайдера** 69 подтверждают абсолютную чистоту файлов. Детекты 2/71 являются **100% ложными срабатываниями (False Positives)**, вызванными эвристическим анализом работы с Win32 API ввода и отсутствием платной цифровой подписи.
+
+---
+
+## 📊 Результаты сканирования VirusTotal
+
+| Файл / Сборка | SHA-256 Хеш | Детект VT | Отчет VirusTotal |
+| :--- | :--- | :---: | :---: |
+| **Release Build 1** | `21cab5702a58699c1b2f14ac4dec322ea591cfed52cde2bb9e361e22496413a7` | <mark>**2 / 71**</mark> | [🔍 Открыть отчет](https://www.virustotal.com/gui/file/21cab5702a58699c1b2f14ac4dec322ea591cfed52cde2bb9e361e22496413a7/) |
+| **Release Build 2** | `f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4` | <mark>**2 / 71**</mark> | [🔍 Открыть отчет](https://www.virustotal.com/gui/file/f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4/) |
+
+---
+
+## ❓ Почему возникают ложные срабатывания (False Positives)?
+
+Программы для автоматизации и симуляции ввода на системном уровне часто получают эвристические предупреждения от малоизвестных антивирусных движков по следующим причинам:
+
+1. **Низкоуровневые Win32 API (`SendInput`, `SetWindowsHookEx`)**
+   * Для перехвата горячих клавиш и выполнения макросов/эмуляции мыши и клавиатуры используются стандартные функции Windows API. Некоторые эвристические сканеры по ошибке классифицируют глобальные хуки ввода как потенциальные кейлоггеры или автокликеры.
+2. **Отсутствие коммерческого цифрового сертификата (Code Signing)**
+   * Подпись исполняемых файлов `.exe` сертификатами EV стоит дорого. Неподписанные бинарные файлы открытых проектов получают более низкий показатель репутации от SmartScreen и ИИ-моделей антивирусов.
+3. **Оптимизации компилятора Rust**
+   * Компиляция с флагами оптимизации результирующего машинного кода (LTO, инструкции `x86-64-v3`) создает бинарные паттерны, которые авто-сканеры иногда отмечают как неизвестные обобщенные детекты (`Heur.BKG`, `Trojan.Generic`).
+
+---
+
+## 🔒 Прозрачность и самостоятельная проверка
+
+Проект полностью **Open Source**, поэтому вы имеете абсолютный контроль над тем, что запускается в вашей системе:
+
+<details>
+<summary><b>🛠️ Проверка контрольной суммы SHA-256</b></summary>
+
+<br>
+
+Чтобы убедиться, что скачанный `.exe` файл совпадает с проверенным на VirusTotal, выполните команду в PowerShell:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\имя_файла.exe (обычный или v3)
+
 ## 📜 Лицензия и благодарности
 
 MIT — см. [LICENSE](LICENSE). Делайте что хотите; ссылка обратно приветствуется.
