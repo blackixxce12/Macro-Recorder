@@ -594,9 +594,6 @@ $env:RUSTFLAGS="-C target-cpu=x86-64-v3"; cargo build --release
 cargo test
 ```
 
-Бинарник появится в `target/release/`. Release-профиль: `opt-level = "z"`, полный LTO, один codegen unit, символы вырезаны, `panic = "abort"` — именно поэтому колбэки хуков написаны без паник, а не полагаются на `catch_unwind`.
-
-**Иконка:** `build.rs` встраивает `assets/icon.ico` в исполняемый файл через [`winresource`](https://github.com/BenjaminRi/winresource), которому нужен компилятор ресурсов — `rc.exe` (Windows SDK, идёт с MSVC-тулчейном) или `windres.exe` (MinGW). Если его нет, сборка всё равно проходит: вы получите `cargo:warning` и останетесь без иконки в проводнике. Иконка окна берётся из `assets/icon.rgba` и работает всегда. Как их пересоздать — см. [`assets/README.md`](assets/README.md).
 
 Чтобы посмотреть, что делает приложение, читайте `logs/macro-recorder.log.*` или соберите в debug-режиме (там остаётся консоль) с `RUST_LOG=debug`.
 
