@@ -13,10 +13,6 @@
 [![egui](https://img.shields.io/badge/UI-egui%20%2F%20eframe%200.36-blue)]()
 [![Latest Release](https://img.shields.io/github/v/release/blackixxce12/Micro-Recorder?label=release&color=green)](https://github.com/blackixxce12/Micro-Recorder/releases)
 
-
-
-
-
 *Record mouse & keyboard → replay it forever, exactly N times, or until a timer runs out → go drink some tea.* ☕
 
 [📥 Download](../../releases) • [✨ Features](#-features) • [🆚 vs TinyTask](#-macro-recorder-vs-tinytask) • [🧠 How it works](#-how-it-works) • [🇷🇺 Русская версия](README_RU.md)
@@ -27,7 +23,7 @@
 
 ---
 
-## 🆕 What's new in 1.3
+## 🆕 Highlights
 
 | | |
 |---|---|
@@ -42,7 +38,7 @@
 | 🌍 **External translations** | Drop `lang/xx.json` next to the exe to override any string without rebuilding |
 
 <details>
-<summary>1.3 brought</summary>
+<summary>Under the hood</summary>
 
 Pause/resume with a proper schedule clock · rebindable hotkeys + emergency stop · X1/X2 capture ·
 Open/Save dialogs and recent files · gzip `.mrz` macros · shutdown/restart/sleep/hibernate/log-off ·
@@ -135,7 +131,7 @@ That weekend project got slightly out of hand. 🦀
 
 ### Full comparison
 
-| | **TinyTask 1.77** | **Macro Recorder 1.3** |
+| | **TinyTask 1.77** | **Macro Recorder** |
 |---|---|---|
 | **License** | Freeware, **closed source** (proprietary) | **MIT, fully open source** |
 | **Implementation** | Pure C + raw Win32, self-contained **32-bit** exe | Rust 2024 + `windows-rs`, **64-bit** exe |
@@ -150,7 +146,7 @@ That weekend project got slightly out of hand. 🦀
 | **Mouse wheel** | ⚠️ documented as unavailable with some mice | ✅ **vertical + horizontal** |
 | **X1 / X2 side buttons** | ❌ | ✅ recorded and replayed |
 | **Ignores its own injected input** | not documented | ✅ `LLKHF_INJECTED` / `LLMHF_INJECTED` filtered |
-| **Hotkeys excluded from recordings** | ✅ by design | ✅ (fixed in 1.3) |
+| **Hotkeys excluded from recordings** | ✅ by design | ✅ |
 | **Repeat playback** | ✅ continuous **or** N times | ✅ continuous **or** N times (1–9999) |
 | **Delay between loops** | ❌ (bake it into the recording) | ✅ 0–600 000 ms |
 | **Pause / resume** | ❌ | ✅ without losing the position |
@@ -234,7 +230,7 @@ Facts above were taken from the official TinyTask site rather than SEO mirrors (
 
 **Interface & files**
 
-- ⌨ Rebindable global hotkeys: record, play, and a dedicated **emergency stop** (default `F8` / `F9` / `Pause`)
+- ⌨ Rebindable global hotkeys: record, play, and a dedicated **emergency stop** (default `F6` / `F7` / `F8` / `F9`)
 - 📌 Always on Top toggle
 - 🎨 **9 themes** + a transparent UI switch, with Windows 11 **Mica** and **Acrylic** backdrops (and a blur fallback on Windows 10)
 - 🌍 **6 languages**, auto-detected and switchable at runtime
@@ -326,15 +322,17 @@ Entering **Paused** or **Held** releases anything the macro was holding down and
 
 | Action | Default | Notes |
 |---|---|---|
-| Start / stop **recording** | `F8` | Rebindable |
-| Start / stop **playback** | `F9` | Rebindable |
-| **Emergency stop** | `Pause` / `Break` | Stops recording *and* playback |
-| Pause / resume playback | unbound | Rebindable, or use the UI button |
+| Start / stop **recording** | `F6` | Rebindable |
+| Start / stop **playback** | `F7` | Rebindable |
+| **Emergency stop** | `F9` | Stops recording *and* playback |
+| Pause / resume playback | `F8` | Rebindable, or use the UI button |
 
 All three are registered globally with `MOD_NOREPEAT`, so they work while any application has focus, and they are filtered out of the recording. Each can be combined with **Ctrl**, **Alt** and **Shift**, and changes apply immediately — no restart.
 
-Press **Bind** and then any key — letters, digits, function keys, NumPad, anything. Esc cancels,
-**Clear** unbinds. The key you press while binding is swallowed, so it never leaks into the app below.
+Click the key button and press anything — letters, digits, function keys. While binding, the global
+hotkeys are released so you can even swap `F6` and `F7` around; Esc or 15 seconds of silence cancels.
+The ▾ list next to it covers keys the window never receives, such as `Pause`, `ScrollLock` and the
+NumPad. **Clear** unbinds a slot entirely.
 
 > If another application already owns one of your combinations, the app says so under **⌨ Hotkeys** instead of failing silently — pick a different key or add a modifier.
 
@@ -406,10 +404,20 @@ hides the window instead of quitting — useful for multi-hour unattended runs.
 
 ### ⚓ Window anchoring
 
-When **Remember the target window** is on, starting a recording stores the title and position
-of whatever window was in the foreground. If you later enable **Follow the anchored window**,
-playback looks that window up, computes how far it has moved, and shifts every absolute
-coordinate by the same amount. Move the game window, and the macro still lands on the buttons.
+A macro stores absolute screen coordinates, so moving the target window normally breaks it.
+Anchoring fixes that.
+
+Turn on **Remember the target window** (off by default) and the moment you start recording, the
+app notes the title and position of whatever window was in the foreground — the game, the browser,
+whatever you were about to click on. That pair is saved inside the macro file.
+
+Later, with **Follow the anchored window** enabled, playback finds that window by title, measures
+how far it has moved since the recording, and shifts every coordinate by the same offset. Drag the
+window to the other half of the screen and the macro still lands on the same buttons. If the window
+isn't open, playback runs unshifted and says so in the log.
+
+It's off by default because it stores a window title inside your macro file, and because a macro
+recorded across several windows (or on the desktop itself) is better left unanchored.
 
 ### 🎯 Pixel stop condition
 
@@ -513,14 +521,14 @@ Written by **💾 Save Settings** and automatically on exit.
 | `action_on_completion` | 0–5 | `0` | `0` stop · `1` shut down · `2` restart · `3` sleep · `4` hibernate · `5` log off |
 | `shutdown_delay_s` | 0–600 | `60` | Countdown before shutdown/restart |
 | `use_window_anchor` | bool | `false` | Shift coordinates if the anchored window moved |
-| `record_window_anchor` | bool | `true` | Remember the foreground window when recording starts |
-| `tray_enabled` / `close_to_tray` | bool | `true` / `false` | Tray icon; ✕ minimizes instead of quitting |
+| `record_window_anchor` | bool | `false` | Remember the foreground window when recording starts |
+| `tray_enabled` / `close_to_tray` | bool | `true` / `true` | Tray icon; ✕ minimizes instead of quitting |
 | `pixel_enabled` | bool | `false` | Stop playback on a screen pixel |
 | `pixel_x` / `pixel_y` | i32 | `0` | Watched screen coordinate |
 | `pixel_r` / `_g` / `_b` | u8 | `255,0,0` | Target colour |
 | `pixel_tolerance` | 0–255 | `20` | Per-channel tolerance |
 | `pixel_mode` | 0/1 | `0` | `0` stop when it matches · `1` stop when it differs |
-| `hotkey_record` / `hotkey_play` / `hotkey_stop` / `hotkey_pause` | object | F8 / F9 / Pause / — | `{ "vk": 119, "ctrl": false, "alt": false, "shift": false }`; `vk: 0` means unbound |
+| `hotkey_record` / `hotkey_play` / `hotkey_stop` / `hotkey_pause` | object | F6 / F7 / F9 / F8 | `{ "vk": 117, "ctrl": false, "alt": false, "shift": false }`; `vk: 0` means unbound |
 | `recent_files` | array | `[]` | Up to 8 recent macro paths |
 | `compress_on_save` | bool | `false` | Default to `.mrz` when saving |
 
@@ -574,7 +582,7 @@ Grab the latest `.exe` from the **[Releases](../../releases)** page. No installa
 # 1. Install Rust (1.97.1+, edition 2024): https://rustup.rs
 # 2. Clone & build
 git clone https://github.com/blackixxce12/Macro-Recorder.git
-cd Macro-Recorder
+cd Micro-Recorder
 
 # Universal build
 cargo build --release
@@ -589,6 +597,9 @@ $env:RUSTFLAGS="-C target-cpu=x86-64-v3"; cargo build --release
 cargo test
 ```
 
+The binary lands in `target/release/`. Release profile: `opt-level = "z"`, fat LTO, one codegen unit, symbols stripped, `panic = "abort"` — which is why the hook callbacks are written to be panic-free rather than relying on `catch_unwind`.
+
+**Icon:** `build.rs` embeds `assets/icon.ico` into the executable using [`winresource`](https://github.com/BenjaminRi/winresource), which needs a resource compiler — `rc.exe` (Windows SDK, comes with the MSVC toolchain) or `windres.exe` (MinGW). If it isn't found the build still succeeds; you just get a `cargo:warning` and no Explorer icon. The window icon comes from `assets/icon.rgba` and always works. See [`assets/README.md`](assets/README.md) to regenerate them.
 
 To watch what the app is doing, either read `logs/macro-recorder.log.*` or build in debug mode (which keeps a console attached) and set `RUST_LOG=debug`.
 
