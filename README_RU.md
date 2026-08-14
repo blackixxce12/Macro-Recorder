@@ -11,7 +11,7 @@
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?logo=windows&logoColor=white)]()
 [![Rust](https://img.shields.io/badge/Made%20with-Rust%201.97-orange?logo=rust&logoColor=white)]()
 [![egui](https://img.shields.io/badge/UI-egui%20%2F%20eframe%200.36-blue)]()
-[![Latest Release](https://img.shields.io/github/v/release/blackixxce12/Micro-Recorder?label=release&color=green)](https://github.com/blackixxce12/Micro-Recorder/releases)
+[![Latest Release](https://img.shields.io/github/v/release/blackixxce12/Macro-Recorder?label=release&color=green)](https://github.com/blackixxce12/macro-recorder/releases)
 
 *Записал мышь и клавиатуру → повторяй бесконечно, ровно N раз или до истечения таймера → иди пить чай.* ☕
 
