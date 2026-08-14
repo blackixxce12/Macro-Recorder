@@ -642,6 +642,18 @@ pub enum MouseButton {
     X2,
 }
 
+impl MouseButton {
+    fn from_index(i: usize) -> Self {
+        match i {
+            1 => Self::Right,
+            2 => Self::Middle,
+            3 => Self::X1,
+            4 => Self::X2,
+            _ => Self::Left,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum InputEventKind {
     Key { vk: u16, scan: u16, down: bool, extended: bool },
@@ -2667,6 +2679,12 @@ define_strings!(
     ed_from, ed_to, ed_delete, ed_crop, ed_insert, ed_scale, ed_drop_moves, ed_zero, ed_undo,
     prof_name, prof_save, prof_load, prof_delete,
     saved, loaded, cleared, settings_saved, save_err, load_err, no_macro, exported, done,
+    ed_open, ed_title, ed_human, ed_raw, ed_selected, ed_steps,
+    step_wait, step_move, step_click, step_dbl, step_drag, step_scroll, step_type,
+    step_key, step_hold,
+    dir_up, dir_down, dir_left, dir_right, btn_l, btn_r, btn_m,
+    insp_title, insp_none, insp_time, insp_key, insp_delta, insp_horiz, insp_extended,
+    insp_dup, insp_del_one, st_down, st_up, bulk_replace, bulk_shift,
 );
 
 const EN: Strings = Strings {
@@ -2711,6 +2729,20 @@ const EN: Strings = Strings {
     saved: "Saved: {}", loaded: "Loaded: {}", cleared: "Macro cleared",
     settings_saved: "Settings saved", save_err: "Save error: {}", load_err: "Load error: {}",
     no_macro: "No macro loaded", exported: "Exported: {}", done: "Done",
+    ed_open: "✂ Open editor", ed_title: "Macro editor",
+    ed_human: "Story", ed_raw: "Raw events",
+    ed_selected: "Selected: {} … {}", ed_steps: "{} steps",
+    step_wait: "Waited {}", step_move: "Moved the cursor to {}",
+    step_click: "{} click at {}", step_dbl: "{} double click at {}",
+    step_drag: "Dragged with {} from {} to {}", step_scroll: "Scrolled {} — {} notches",
+    step_type: "Typed \u{201c}{}\u{201d}", step_key: "Pressed {}", step_hold: "Held {} for {}",
+    dir_up: "up", dir_down: "down", dir_left: "left", dir_right: "right",
+    btn_l: "Left", btn_r: "Right", btn_m: "Middle",
+    insp_title: "Selected action", insp_none: "Click a line to edit it",
+    insp_time: "At (ms)", insp_key: "Key", insp_delta: "Delta", insp_horiz: "Horizontal",
+    insp_extended: "Extended", insp_dup: "Duplicate", insp_del_one: "Delete action",
+    st_down: "press", st_up: "release",
+    bulk_replace: "Replace in selection", bulk_shift: "Shift coordinates",
 };
 
 const RU: Strings = Strings {
@@ -2758,6 +2790,20 @@ const RU: Strings = Strings {
     settings_saved: "Настройки сохранены", save_err: "Ошибка сохранения: {}",
     load_err: "Ошибка загрузки: {}", no_macro: "Макрос не загружен",
     exported: "Экспортировано: {}", done: "Готово",
+    ed_open: "✂ Открыть редактор", ed_title: "Редактор макроса",
+    ed_human: "Рассказ", ed_raw: "Сырые события",
+    ed_selected: "Выбрано: {} … {}", ed_steps: "шагов: {}",
+    step_wait: "Пауза {}", step_move: "Курсор переехал в {}",
+    step_click: "{} клик в {}", step_dbl: "Двойной {} клик в {}",
+    step_drag: "Протащил {} из {} в {}", step_scroll: "Прокрутка {} — {} щелчков",
+    step_type: "Набрано \u{201c}{}\u{201d}", step_key: "Нажата {}", step_hold: "{} удерживалась {}",
+    dir_up: "вверх", dir_down: "вниз", dir_left: "влево", dir_right: "вправо",
+    btn_l: "ЛКМ", btn_r: "ПКМ", btn_m: "СКМ",
+    insp_title: "Выбранное действие", insp_none: "Кликните по строке, чтобы её изменить",
+    insp_time: "Момент (мс)", insp_key: "Клавиша", insp_delta: "Дельта", insp_horiz: "Горизонтально",
+    insp_extended: "Расширенная", insp_dup: "Дублировать", insp_del_one: "Удалить действие",
+    st_down: "нажатие", st_up: "отпускание",
+    bulk_replace: "Заменить в выделении", bulk_shift: "Сдвинуть координаты",
 };
 
 const UK: Strings = Strings {
@@ -2806,6 +2852,20 @@ const UK: Strings = Strings {
     settings_saved: "Налаштування збережено", save_err: "Помилка збереження: {}",
     load_err: "Помилка завантаження: {}", no_macro: "Макрос не завантажено",
     exported: "Експортовано: {}", done: "Готово",
+    ed_open: "✂ Відкрити редактор", ed_title: "Редактор макроса",
+    ed_human: "Розповідь", ed_raw: "Сирі події",
+    ed_selected: "Вибрано: {} … {}", ed_steps: "кроків: {}",
+    step_wait: "Пауза {}", step_move: "Курсор переїхав у {}",
+    step_click: "{} клік у {}", step_dbl: "Подвійний {} клік у {}",
+    step_drag: "Протягнув {} з {} у {}", step_scroll: "Прокрутка {} — {} клацань",
+    step_type: "Набрано \u{201c}{}\u{201d}", step_key: "Натиснуто {}", step_hold: "{} утримувалась {}",
+    dir_up: "вгору", dir_down: "вниз", dir_left: "вліво", dir_right: "вправо",
+    btn_l: "ЛКМ", btn_r: "ПКМ", btn_m: "СКМ",
+    insp_title: "Вибрана дія", insp_none: "Клацніть рядок, щоб змінити його",
+    insp_time: "Момент (мс)", insp_key: "Клавіша", insp_delta: "Дельта", insp_horiz: "Горизонтально",
+    insp_extended: "Розширена", insp_dup: "Дублювати", insp_del_one: "Видалити дію",
+    st_down: "натискання", st_up: "відпускання",
+    bulk_replace: "Замінити у виділенні", bulk_shift: "Зсунути координати",
 };
 
 const PT: Strings = Strings {
@@ -2851,6 +2911,20 @@ const PT: Strings = Strings {
     settings_saved: "Configurações salvas", save_err: "Erro ao salvar: {}",
     load_err: "Erro ao carregar: {}", no_macro: "Nenhum macro carregado",
     exported: "Exportado: {}", done: "Pronto",
+    ed_open: "✂ Abrir editor", ed_title: "Editor de macro",
+    ed_human: "Narrativa", ed_raw: "Eventos brutos",
+    ed_selected: "Selecionado: {} … {}", ed_steps: "{} passos",
+    step_wait: "Esperou {}", step_move: "Moveu o cursor para {}",
+    step_click: "Clique {} em {}", step_dbl: "Clique duplo {} em {}",
+    step_drag: "Arrastou com {} de {} para {}", step_scroll: "Rolou {} — {} entalhes",
+    step_type: "Digitou \u{201c}{}\u{201d}", step_key: "Pressionou {}", step_hold: "Segurou {} por {}",
+    dir_up: "para cima", dir_down: "para baixo", dir_left: "à esquerda", dir_right: "à direita",
+    btn_l: "Esquerdo", btn_r: "Direito", btn_m: "Meio",
+    insp_title: "Ação selecionada", insp_none: "Clique numa linha para editá-la",
+    insp_time: "Momento (ms)", insp_key: "Tecla", insp_delta: "Delta", insp_horiz: "Horizontal",
+    insp_extended: "Estendida", insp_dup: "Duplicar", insp_del_one: "Excluir ação",
+    st_down: "pressionar", st_up: "soltar",
+    bulk_replace: "Substituir na seleção", bulk_shift: "Deslocar coordenadas",
 };
 
 const ES: Strings = Strings {
@@ -2898,6 +2972,20 @@ const ES: Strings = Strings {
     settings_saved: "Ajustes guardados", save_err: "Error al guardar: {}",
     load_err: "Error al cargar: {}", no_macro: "Ningún macro cargado",
     exported: "Exportado: {}", done: "Listo",
+    ed_open: "✂ Abrir editor", ed_title: "Editor de macro",
+    ed_human: "Relato", ed_raw: "Eventos en bruto",
+    ed_selected: "Seleccionado: {} … {}", ed_steps: "{} pasos",
+    step_wait: "Esperó {}", step_move: "Movió el cursor a {}",
+    step_click: "Clic {} en {}", step_dbl: "Doble clic {} en {}",
+    step_drag: "Arrastró con {} de {} a {}", step_scroll: "Desplazó {} — {} muescas",
+    step_type: "Escribió \u{201c}{}\u{201d}", step_key: "Pulsó {}", step_hold: "Mantuvo {} durante {}",
+    dir_up: "arriba", dir_down: "abajo", dir_left: "izquierda", dir_right: "derecha",
+    btn_l: "Izquierdo", btn_r: "Derecho", btn_m: "Central",
+    insp_title: "Acción seleccionada", insp_none: "Haz clic en una línea para editarla",
+    insp_time: "Momento (ms)", insp_key: "Tecla", insp_delta: "Delta", insp_horiz: "Horizontal",
+    insp_extended: "Extendida", insp_dup: "Duplicar", insp_del_one: "Eliminar acción",
+    st_down: "pulsar", st_up: "soltar",
+    bulk_replace: "Reemplazar en la selección", bulk_shift: "Desplazar coordenadas",
 };
 
 const ZH: Strings = Strings {
@@ -2942,6 +3030,20 @@ const ZH: Strings = Strings {
     saved: "已保存: {}", loaded: "已加载: {}", cleared: "宏已清空",
     settings_saved: "设置已保存", save_err: "保存错误: {}", load_err: "加载错误: {}",
     no_macro: "未加载宏", exported: "已导出: {}", done: "完成",
+    ed_open: "✂ 打开编辑器", ed_title: "宏编辑器",
+    ed_human: "叙述", ed_raw: "原始事件",
+    ed_selected: "已选: {} … {}", ed_steps: "{} 步",
+    step_wait: "等待 {}", step_move: "光标移动到 {}",
+    step_click: "{} 点击于 {}", step_dbl: "{} 双击于 {}",
+    step_drag: "用 {} 从 {} 拖到 {}", step_scroll: "滚动 {} — {} 格",
+    step_type: "输入 \u{201c}{}\u{201d}", step_key: "按下 {}", step_hold: "{} 按住了 {}",
+    dir_up: "向上", dir_down: "向下", dir_left: "向左", dir_right: "向右",
+    btn_l: "左键", btn_r: "右键", btn_m: "中键",
+    insp_title: "所选动作", insp_none: "点击一行即可编辑",
+    insp_time: "时刻 (毫秒)", insp_key: "按键", insp_delta: "增量", insp_horiz: "水平",
+    insp_extended: "扩展键", insp_dup: "复制", insp_del_one: "删除动作",
+    st_down: "按下", st_up: "松开",
+    bulk_replace: "在选区中替换", bulk_shift: "偏移坐标",
 };
 
 const LANG_CODES: [&str; 6] = ["en", "ru", "uk", "pt", "es", "zh"];
@@ -3332,6 +3434,279 @@ fn describe_event(ev: &MacroEvent) -> String {
     }
 }
 
+/// One line of the human-readable summary, mapped back onto its raw events.
+#[derive(Clone, Debug)]
+pub struct Step {
+    /// Index of the first raw event this line covers.
+    pub first: usize,
+    /// Index of the last one, inclusive.
+    pub last: usize,
+    pub t_us: u64,
+    pub text: String,
+}
+
+fn format_dur(us: u64) -> String {
+    if us < 1_000 {
+        format!("{us} \u{b5}s")
+    } else if us < 1_000_000 {
+        format!("{} ms", us / 1_000)
+    } else if us < 60_000_000 {
+        format!("{:.1} s", us as f64 / 1_000_000.0)
+    } else {
+        format_us(us)
+    }
+}
+
+fn point(x: i32, y: i32) -> String {
+    format!("({x}, {y})")
+}
+
+fn button_name(b: MouseButton, s: &Strings) -> String {
+    match b {
+        MouseButton::Left => s.btn_l.to_string(),
+        MouseButton::Right => s.btn_r.to_string(),
+        MouseButton::Middle => s.btn_m.to_string(),
+        MouseButton::X1 => "X1".into(),
+        MouseButton::X2 => "X2".into(),
+    }
+}
+
+/// The character a key produces, for the "Typed ..." lines.
+///
+/// Only letters, digits and space: anything else is reported as a key press, which
+/// keeps the summary honest instead of guessing at layouts and modifiers.
+fn typed_char(vk: u16) -> Option<char> {
+    match vk {
+        0x41..=0x5A => Some((b'A' + (vk - 0x41) as u8) as char),
+        0x30..=0x39 => Some((b'0' + (vk - 0x30) as u8) as char),
+        0x20 => Some(' '),
+        _ => None,
+    }
+}
+
+fn find_key_up(events: &[MacroEvent], from: usize, vk: u16) -> Option<usize> {
+    events.iter().enumerate().skip(from).find_map(|(j, e)| match e.kind {
+        InputEventKind::Key { vk: v, down: false, .. } if v == vk => Some(j),
+        _ => None,
+    })
+}
+
+/// Turns raw events into a readable story: moves, clicks, drags, typing and pauses.
+///
+/// Every line remembers the event range it came from, so selecting a line in the
+/// editor selects exactly those events for deleting, cropping or re-timing.
+fn summarize(events: &[MacroEvent], s: &Strings) -> Vec<Step> {
+    /// Movement below this is treated as hand tremor rather than a drag.
+    const DRAG_PX: i32 = 8;
+    /// Two presses closer than this at the same spot read as one double click.
+    const DOUBLE_US: u64 = 400_000;
+    /// Idle time worth mentioning.
+    const IDLE_US: u64 = 300_000;
+
+    let mut out: Vec<Step> = Vec::new();
+    let mut i = 0usize;
+    let mut prev_end_t = 0u64;
+
+    while i < events.len() {
+        let ev = events[i];
+        let gap = ev.t_us.saturating_sub(prev_end_t);
+        if gap >= IDLE_US && !out.is_empty() {
+            out.push(Step {
+                first: i,
+                last: i,
+                t_us: prev_end_t,
+                text: s.step_wait.replace("{}", &format_dur(gap)),
+            });
+        }
+
+        match ev.kind {
+            InputEventKind::MouseMove { .. } => {
+                let mut last = i;
+                while last + 1 < events.len()
+                    && matches!(events[last + 1].kind, InputEventKind::MouseMove { .. })
+                {
+                    last += 1;
+                }
+                if let InputEventKind::MouseMove { x, y, .. } = events[last].kind {
+                    out.push(Step {
+                        first: i,
+                        last,
+                        t_us: ev.t_us,
+                        text: s.step_move.replace("{}", &point(x, y)),
+                    });
+                }
+                prev_end_t = events[last].t_us;
+                i = last + 1;
+            }
+
+            InputEventKind::MouseButton { button, down: true, x, y } => {
+                // Walk to the matching release, noting whether the cursor travelled.
+                let mut end = i;
+                let (mut ex, mut ey) = (x, y);
+                let mut moved = false;
+                let mut j = i + 1;
+                while j < events.len() {
+                    match events[j].kind {
+                        InputEventKind::MouseButton { button: b2, down: false, x: ux, y: uy }
+                            if b2 == button =>
+                        {
+                            ex = ux;
+                            ey = uy;
+                            end = j;
+                            break;
+                        }
+                        InputEventKind::MouseMove { x: mx, y: my, .. } => {
+                            if (mx - x).abs() > DRAG_PX || (my - y).abs() > DRAG_PX {
+                                moved = true;
+                            }
+                            ex = mx;
+                            ey = my;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+
+                let name = button_name(button, s);
+                let text = if moved {
+                    s.step_drag
+                        .replacen("{}", &name, 1)
+                        .replacen("{}", &point(x, y), 1)
+                        .replacen("{}", &point(ex, ey), 1)
+                } else {
+                    // A second press of the same button, near the same spot, soon after.
+                    let mut second_end = None;
+                    if let Some(next) = events.get(end + 1) {
+                        if let InputEventKind::MouseButton {
+                            button: b2,
+                            down: true,
+                            x: nx,
+                            y: ny,
+                        } = next.kind
+                        {
+                            if b2 == button
+                                && next.t_us.saturating_sub(events[end].t_us) < DOUBLE_US
+                                && (nx - x).abs() <= DRAG_PX
+                                && (ny - y).abs() <= DRAG_PX
+                            {
+                                let mut k = end + 2;
+                                while k < events.len() {
+                                    if let InputEventKind::MouseButton {
+                                        button: b3,
+                                        down: false,
+                                        ..
+                                    } = events[k].kind
+                                    {
+                                        if b3 == button {
+                                            second_end = Some(k);
+                                            break;
+                                        }
+                                    }
+                                    k += 1;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(k) = second_end {
+                        end = k;
+                        s.step_dbl.replacen("{}", &name, 1).replacen("{}", &point(x, y), 1)
+                    } else {
+                        s.step_click.replacen("{}", &name, 1).replacen("{}", &point(x, y), 1)
+                    }
+                };
+
+                out.push(Step { first: i, last: end, t_us: ev.t_us, text });
+                prev_end_t = events[end].t_us;
+                i = end + 1;
+            }
+
+            InputEventKind::MouseWheel { delta, horizontal, .. } => {
+                let sign = delta >= 0;
+                let mut last = i;
+                let mut notches = (delta.abs() / 120).max(1);
+                while let Some(next) = events.get(last + 1) {
+                    match next.kind {
+                        InputEventKind::MouseWheel { delta: d2, horizontal: h2, .. }
+                            if h2 == horizontal && (d2 >= 0) == sign =>
+                        {
+                            notches += (d2.abs() / 120).max(1);
+                            last += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                let dir = match (horizontal, sign) {
+                    (false, true) => s.dir_up,
+                    (false, false) => s.dir_down,
+                    (true, true) => s.dir_right,
+                    (true, false) => s.dir_left,
+                };
+                out.push(Step {
+                    first: i,
+                    last,
+                    t_us: ev.t_us,
+                    text: s
+                        .step_scroll
+                        .replacen("{}", dir, 1)
+                        .replacen("{}", &notches.to_string(), 1),
+                });
+                prev_end_t = events[last].t_us;
+                i = last + 1;
+            }
+
+            InputEventKind::Key { vk, down: true, .. } => {
+                // Greedily collect a run of printable keys into one "Typed ..." line.
+                let mut chars = String::new();
+                let mut last = i;
+                let mut j = i;
+                while j < events.len() {
+                    let InputEventKind::Key { vk: v, down: true, .. } = events[j].kind else {
+                        break;
+                    };
+                    let (Some(c), Some(up)) = (typed_char(v), find_key_up(events, j, v)) else {
+                        break;
+                    };
+                    chars.push(c);
+                    last = up;
+                    j = up + 1;
+                }
+
+                let text = if chars.chars().count() >= 2 {
+                    s.step_type.replace("{}", &chars)
+                } else {
+                    let up = find_key_up(events, i, vk).unwrap_or(i);
+                    last = up;
+                    let held = events[up].t_us.saturating_sub(ev.t_us);
+                    if held > 500_000 {
+                        s.step_hold
+                            .replacen("{}", &vk_name(vk as u32), 1)
+                            .replacen("{}", &format_dur(held), 1)
+                    } else {
+                        s.step_key.replace("{}", &vk_name(vk as u32))
+                    }
+                };
+
+                out.push(Step { first: i, last, t_us: ev.t_us, text });
+                prev_end_t = events[last].t_us;
+                i = last + 1;
+            }
+
+            // Stray releases with no matching press: show them as-is rather than hide them.
+            _ => {
+                out.push(Step {
+                    first: i,
+                    last: i,
+                    t_us: ev.t_us,
+                    text: describe_event(&ev),
+                });
+                prev_end_t = ev.t_us;
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Removes `[from, to]` and pulls the tail back so no silent gap is left behind.
 fn editor_delete_range(data: &mut MacroData, from: usize, to: usize) {
     if data.events.is_empty() {
@@ -3387,6 +3762,101 @@ fn editor_drop_moves(data: &mut MacroData) {
     data.events.retain(|e| !matches!(e.kind, InputEventKind::MouseMove { .. }));
 }
 
+/// Replaces one event outright.
+///
+/// Changing a key zeroes its scancode: playback prefers the scancode when it is
+/// non-zero, so keeping the old one would silently replay the old key.
+fn editor_set_event(data: &mut MacroData, index: usize, kind: InputEventKind) {
+    if let Some(ev) = data.events.get_mut(index) {
+        ev.kind = kind;
+    }
+}
+
+/// Moves one event in time, without letting it jump past its neighbours.
+fn editor_set_time(data: &mut MacroData, index: usize, t_us: u64) {
+    let lo = if index == 0 { 0 } else { data.events[index - 1].t_us };
+    let hi = data.events.get(index + 1).map(|e| e.t_us).unwrap_or(u64::MAX);
+    if let Some(ev) = data.events.get_mut(index) {
+        ev.t_us = t_us.clamp(lo, hi);
+    }
+    data.duration_us = data.duration_us.max(data.last_t());
+}
+
+fn editor_delete_one(data: &mut MacroData, index: usize) {
+    if index < data.events.len() {
+        editor_delete_range(data, index, index);
+    }
+}
+
+/// Copies an event and drops the copy 10 ms later.
+fn editor_duplicate(data: &mut MacroData, index: usize) {
+    let Some(ev) = data.events.get(index).copied() else {
+        return;
+    };
+    let mut copy = ev;
+    copy.t_us = ev.t_us.saturating_add(10_000);
+    for e in data.events.iter_mut().skip(index + 1) {
+        e.t_us = e.t_us.saturating_add(10_000);
+    }
+    data.events.insert(index + 1, copy);
+    data.duration_us = data.duration_us.saturating_add(10_000).max(data.last_t());
+}
+
+/// Swaps one mouse button for another across a range. Returns how many changed.
+fn editor_replace_button(
+    data: &mut MacroData,
+    from: usize,
+    to: usize,
+    old: MouseButton,
+    new: MouseButton,
+) -> usize {
+    if data.events.is_empty() || old == new {
+        return 0;
+    }
+    let from = from.min(data.events.len() - 1);
+    let to = to.min(data.events.len() - 1).max(from);
+    let mut n = 0;
+    for ev in &mut data.events[from..=to] {
+        if let InputEventKind::MouseButton { button, .. } = &mut ev.kind {
+            if *button == old {
+                *button = new;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Offsets every screen coordinate in a range - for when the target window moved.
+fn editor_shift_coords(data: &mut MacroData, from: usize, to: usize, dx: i32, dy: i32) {
+    if data.events.is_empty() || (dx == 0 && dy == 0) {
+        return;
+    }
+    let from = from.min(data.events.len() - 1);
+    let to = to.min(data.events.len() - 1).max(from);
+    for ev in &mut data.events[from..=to] {
+        match &mut ev.kind {
+            InputEventKind::MouseMove { x, y, .. }
+            | InputEventKind::MouseButton { x, y, .. }
+            | InputEventKind::MouseWheel { x, y, .. } => {
+                *x += dx;
+                *y += dy;
+            }
+            InputEventKind::Key { .. } => {}
+        }
+    }
+}
+
+/// Keys offered when retyping a keyboard event. Anything else goes in by code.
+const EDIT_KEYS: [(&str, u16); 30] = [
+    ("Space", 0x20), ("Enter", 0x0D), ("Tab", 0x09), ("Esc", 0x1B),
+    ("Backspace", 0x08), ("Delete", 0x2E), ("Shift", 0x10), ("Ctrl", 0x11),
+    ("Alt", 0x12), ("Left", 0x25), ("Up", 0x26), ("Right", 0x27), ("Down", 0x28),
+    ("A", 0x41), ("B", 0x42), ("C", 0x43), ("D", 0x44), ("E", 0x45), ("Q", 0x51),
+    ("R", 0x52), ("S", 0x53), ("W", 0x57), ("1", 0x31), ("2", 0x32), ("3", 0x33),
+    ("F1", 0x70), ("F2", 0x71), ("F5", 0x74), ("F8", 0x77), ("F9", 0x78),
+];
+
 /// Shifts everything so the first event happens at t = 0.
 fn editor_trim_lead(data: &mut MacroData) {
     let Some(first) = data.events.first().map(|e| e.t_us) else {
@@ -3417,6 +3887,24 @@ struct MacroApp {
     ed_delay_ms: u64,
     ed_scale: f64,
     ed_undo: Option<MacroData>,
+    /// The editor lives in its own OS window.
+    editor_open: bool,
+    /// Story view vs the raw event list.
+    ed_human: bool,
+    /// Cached summary plus the inputs it was built from, so a long macro is not
+    /// re-narrated on every frame.
+    ed_steps: Vec<Step>,
+    ed_steps_key: (usize, u64, usize),
+    /// The single event shown in the inspector.
+    ed_cursor: usize,
+    /// Which event the current undo snapshot belongs to, so dragging a value does
+    /// not overwrite the snapshot on every frame.
+    ed_undo_key: Option<usize>,
+    ed_pick_deadline: Option<Instant>,
+    bulk_from_btn: usize,
+    bulk_to_btn: usize,
+    bulk_dx: i32,
+    bulk_dy: i32,
     // profiles
     profiles: Vec<String>,
     profile_name: String,
@@ -3445,6 +3933,17 @@ impl MacroApp {
             ed_delay_ms: 500,
             ed_scale: 1.0,
             ed_undo: None,
+            editor_open: false,
+            ed_human: true,
+            ed_steps: Vec::new(),
+            ed_steps_key: (usize::MAX, 0, 0),
+            ed_cursor: 0,
+            ed_undo_key: None,
+            ed_pick_deadline: None,
+            bulk_from_btn: 0,
+            bulk_to_btn: 1,
+            bulk_dx: 0,
+            bulk_dy: 0,
             profiles: list_profiles(),
             profile_name: String::new(),
             pick_deadline: None,
@@ -3464,11 +3963,30 @@ impl MacroApp {
         self.ed_undo = Some(self.state.macro_data.lock().clone());
     }
 
+    /// Edit path for the inspector: snapshots once per event, so undo returns to
+    /// the state before you started fiddling with *this* action rather than to the
+    /// previous animation frame.
+    fn edit_event<F: FnOnce(&mut MacroData)>(&mut self, index: usize, f: F) {
+        if self.busy() {
+            return;
+        }
+        if self.ed_undo_key != Some(index) {
+            self.ed_undo = Some(self.state.macro_data.lock().clone());
+            self.ed_undo_key = Some(index);
+        }
+        let mut data = self.state.macro_data.lock();
+        f(&mut data);
+        let dur = data.duration_us;
+        drop(data);
+        self.state.recorded_time_us.store(dur, Ordering::Relaxed);
+    }
+
     fn edit<F: FnOnce(&mut MacroData)>(&mut self, f: F) {
         if self.busy() {
             return;
         }
         self.snapshot_for_undo();
+        self.ed_undo_key = None;
         let mut data = self.state.macro_data.lock();
         f(&mut data);
         let dur = data.duration_us;
@@ -3505,6 +4023,20 @@ impl MacroApp {
                 self.status_msg = s.loaded.replace("{}", &file_label(&path));
             }
             Err(e) => self.status_msg = s.load_err.replace("{}", &e.to_string()),
+        }
+    }
+
+    /// Rebuilds the story only when the macro or the language actually changed.
+    fn refresh_steps(&mut self) {
+        let s = self.strs();
+        let (count, dur, events) = {
+            let d = self.state.macro_data.lock();
+            (d.events.len(), d.duration_us, d.events.clone())
+        };
+        let key = (count, dur, self.config.default_lang);
+        if key != self.ed_steps_key {
+            self.ed_steps = summarize(&events, s);
+            self.ed_steps_key = key;
         }
     }
 
@@ -3598,6 +4130,406 @@ fn hotkey_row(
     changed
 }
 
+impl MacroApp {
+    /// The editor, drawn into whatever `Ui` it is given.
+    ///
+    /// Kept separate from the window plumbing on purpose: if the child viewport is
+    /// ever unavailable, this same function can be dropped straight back into the
+    /// main window without touching any of the logic.
+    fn editor_ui(&mut self, ui: &mut egui::Ui) {
+        let s = self.strs();
+        let busy = self.busy();
+        self.refresh_steps();
+
+        let (count, dur) = {
+            let d = self.state.macro_data.lock();
+            (d.events.len(), d.duration_us)
+        };
+        if count == 0 {
+            ui.label(s.no_macro);
+            return;
+        }
+        let last_index = count - 1;
+        self.ed_cursor = self.ed_cursor.min(last_index);
+        self.ed_from = self.ed_from.min(last_index);
+        self.ed_to = self.ed_to.min(last_index).max(self.ed_from);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(s.events.replace("{}", &count.to_string()));
+            ui.label(s.duration.replace("{}", &format_us(dur)));
+            ui.separator();
+            ui.selectable_value(&mut self.ed_human, true, s.ed_human);
+            ui.selectable_value(&mut self.ed_human, false, s.ed_raw);
+        });
+        ui.separator();
+
+        // The list gets whatever is left after the inspector, which is pinned to the
+        // bottom - letting the scroll area take the whole window used to push every
+        // control off-screen.
+        let list_h = (ui.available_height() - 330.0).max(120.0);
+
+        if self.ed_human {
+            let steps = self.ed_steps.clone();
+            let mut pick = None;
+            egui::ScrollArea::vertical().id_salt("story").max_height(list_h).auto_shrink(
+                [false, false],
+            ).show(ui, |ui| {
+                for st in &steps {
+                    let selected = st.first >= self.ed_from && st.last <= self.ed_to;
+                    let line = format!("{}   {}", format_us(st.t_us), st.text);
+                    if ui.selectable_label(selected, line).clicked() {
+                        pick = Some((st.first, st.last));
+                    }
+                }
+            });
+            if let Some((a, b)) = pick {
+                self.ed_from = a;
+                self.ed_to = b;
+                self.ed_cursor = a;
+            }
+        } else {
+            let from = self.ed_from;
+            let rows: Vec<(usize, u64, String)> = {
+                let d = self.state.macro_data.lock();
+                let end = (from + 400).min(count);
+                d.events
+                    .get(from..end)
+                    .unwrap_or(&[])
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ev)| (from + i, ev.t_us, describe_event(ev)))
+                    .collect()
+            };
+            let mut pick = None;
+            egui::ScrollArea::vertical().id_salt("raw").max_height(list_h).auto_shrink(
+                [false, false],
+            ).show(ui, |ui| {
+                for (i, t, text) in &rows {
+                    let selected = *i == self.ed_cursor;
+                    let line = format!("{i:>6}  {}  {text}", format_us(*t));
+                    if ui
+                        .selectable_label(selected, egui::RichText::new(line).monospace().small())
+                        .clicked()
+                    {
+                        pick = Some(*i);
+                    }
+                }
+            });
+            if let Some(i) = pick {
+                self.ed_cursor = i;
+                self.ed_from = i;
+                self.ed_to = i;
+            }
+        }
+
+        // ---- inspector: one action at a time ---------------------------------
+        ui.separator();
+        let idx = self.ed_cursor;
+        let current = self.state.macro_data.lock().events.get(idx).copied();
+        if let Some(ev) = current {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(s.insp_title).strong());
+                ui.label(egui::RichText::new(format!("#{idx}")).weak());
+                if ui.small_button("\u{25c0}").clicked() && idx > 0 {
+                    self.ed_cursor = idx - 1;
+                }
+                if ui.small_button("\u{25b6}").clicked() && idx < last_index {
+                    self.ed_cursor = idx + 1;
+                }
+                ui.label(egui::RichText::new(describe_event(&ev)).weak());
+            });
+
+            let mut kind = ev.kind;
+            let mut kind_changed = false;
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(s.insp_time);
+                let mut t_ms = ev.t_us as f64 / 1000.0;
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::DragValue::new(&mut t_ms).speed(1.0).range(0.0..=1.0e9),
+                    )
+                    .changed()
+                {
+                    let t_us = (t_ms * 1000.0).max(0.0) as u64;
+                    self.edit_event(idx, |d| editor_set_time(d, idx, t_us));
+                }
+            });
+
+            match &mut kind {
+                InputEventKind::Key { vk, scan, down, extended } => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(s.insp_key);
+                        egui::ComboBox::from_id_salt("insp_key")
+                            .selected_text(vk_name(*vk as u32))
+                            .width(120.0)
+                            .show_ui(ui, |ui| {
+                                for (name, code) in EDIT_KEYS {
+                                    if ui.selectable_label(*vk == code, name).clicked()
+                                        && *vk != code
+                                    {
+                                        *vk = code;
+                                        // A stale scancode would replay the old key.
+                                        *scan = 0;
+                                        kind_changed = true;
+                                    }
+                                }
+                            });
+                        let mut raw = *vk as u32;
+                        if ui.add(egui::DragValue::new(&mut raw).range(1..=254)).changed() {
+                            *vk = raw as u16;
+                            *scan = 0;
+                            kind_changed = true;
+                        }
+                        kind_changed |= ui.selectable_value(down, true, s.st_down).clicked();
+                        kind_changed |= ui.selectable_value(down, false, s.st_up).clicked();
+                        kind_changed |= ui.checkbox(extended, s.insp_extended).changed();
+                    });
+                }
+                InputEventKind::MouseButton { button, down, x, y } => {
+                    ui.horizontal_wrapped(|ui| {
+                        let names = [s.btn_l, s.btn_r, s.btn_m, "X1", "X2"];
+                        let all = [
+                            MouseButton::Left,
+                            MouseButton::Right,
+                            MouseButton::Middle,
+                            MouseButton::X1,
+                            MouseButton::X2,
+                        ];
+                        egui::ComboBox::from_id_salt("insp_btn")
+                            .selected_text(
+                                names[all.iter().position(|b| b == button).unwrap_or(0)],
+                            )
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                for (b, n) in all.iter().zip(names) {
+                                    if ui.selectable_label(button == b, n).clicked()
+                                        && button != b
+                                    {
+                                        *button = *b;
+                                        kind_changed = true;
+                                    }
+                                }
+                            });
+                        kind_changed |= ui.selectable_value(down, true, s.st_down).clicked();
+                        kind_changed |= ui.selectable_value(down, false, s.st_up).clicked();
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("X");
+                        kind_changed |= ui
+                            .add(egui::DragValue::new(x).range(-32000..=32000))
+                            .changed();
+                        ui.label("Y");
+                        kind_changed |= ui
+                            .add(egui::DragValue::new(y).range(-32000..=32000))
+                            .changed();
+                        match self.ed_pick_deadline {
+                            Some(d) => {
+                                let left = d
+                                    .saturating_duration_since(Instant::now())
+                                    .as_secs()
+                                    + 1;
+                                ui.label(s.pixel_picking.replace("{}", &left.to_string()));
+                            }
+                            None => {
+                                if ui.button(s.pixel_pick).clicked() {
+                                    self.ed_pick_deadline =
+                                        Some(Instant::now() + Duration::from_secs(3));
+                                }
+                            }
+                        }
+                    });
+                }
+                InputEventKind::MouseMove { x, y, dx, dy } => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("X");
+                        kind_changed |= ui
+                            .add(egui::DragValue::new(x).range(-32000..=32000))
+                            .changed();
+                        ui.label("Y");
+                        kind_changed |= ui
+                            .add(egui::DragValue::new(y).range(-32000..=32000))
+                            .changed();
+                        ui.label("dX");
+                        kind_changed |= ui.add(egui::DragValue::new(dx)).changed();
+                        ui.label("dY");
+                        kind_changed |= ui.add(egui::DragValue::new(dy)).changed();
+                    });
+                    ui.horizontal_wrapped(|ui| match self.ed_pick_deadline {
+                        Some(d) => {
+                            let left =
+                                d.saturating_duration_since(Instant::now()).as_secs() + 1;
+                            ui.label(s.pixel_picking.replace("{}", &left.to_string()));
+                        }
+                        None => {
+                            if ui.button(s.pixel_pick).clicked() {
+                                self.ed_pick_deadline =
+                                    Some(Instant::now() + Duration::from_secs(3));
+                            }
+                        }
+                    });
+                }
+                InputEventKind::MouseWheel { delta, horizontal, x, y } => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(s.insp_delta);
+                        kind_changed |= ui
+                            .add(egui::DragValue::new(delta).range(-2400..=2400).speed(10.0))
+                            .changed();
+                        kind_changed |= ui.checkbox(horizontal, s.insp_horiz).changed();
+                        ui.label("X");
+                        kind_changed |= ui
+                            .add(egui::DragValue::new(x).range(-32000..=32000))
+                            .changed();
+                        ui.label("Y");
+                        kind_changed |= ui
+                            .add(egui::DragValue::new(y).range(-32000..=32000))
+                            .changed();
+                    });
+                }
+            }
+
+            if kind_changed && !busy {
+                self.edit_event(idx, |d| editor_set_event(d, idx, kind));
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new(s.insp_dup)).clicked() {
+                    self.edit(|d| editor_duplicate(d, idx));
+                }
+                if ui.add_enabled(!busy, egui::Button::new(s.insp_del_one)).clicked() {
+                    self.edit(|d| editor_delete_one(d, idx));
+                    self.ed_cursor = idx.saturating_sub(1);
+                }
+                if ui
+                    .add_enabled(self.ed_undo.is_some() && !busy, egui::Button::new(s.ed_undo))
+                    .clicked()
+                {
+                    if let Some(prev) = self.ed_undo.take() {
+                        let d = prev.duration_us;
+                        *self.state.macro_data.lock() = prev;
+                        self.state.recorded_time_us.store(d, Ordering::Relaxed);
+                        self.ed_undo_key = None;
+                    }
+                }
+            });
+        } else {
+            ui.label(s.insp_none);
+        }
+
+        // ---- range operations -------------------------------------------------
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(s.ed_from);
+            ui.add(egui::DragValue::new(&mut self.ed_from).range(0..=last_index));
+            ui.label(s.ed_to);
+            ui.add(egui::DragValue::new(&mut self.ed_to).range(0..=last_index));
+            if self.ed_to < self.ed_from {
+                self.ed_to = self.ed_from;
+            }
+            let (from, to) = (self.ed_from, self.ed_to);
+            if ui.add_enabled(!busy, egui::Button::new(s.ed_delete)).clicked() {
+                self.edit(|d| editor_delete_range(d, from, to));
+            }
+            if ui.add_enabled(!busy, egui::Button::new(s.ed_crop)).clicked() {
+                self.edit(|d| editor_crop(d, from, to));
+            }
+            if ui.add_enabled(!busy, egui::Button::new(s.ed_drop_moves)).clicked() {
+                self.edit(editor_drop_moves);
+            }
+            if ui.add_enabled(!busy, egui::Button::new(s.ed_zero)).clicked() {
+                self.edit(editor_trim_lead);
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(s.ed_insert);
+            ui.add(egui::DragValue::new(&mut self.ed_delay_ms).range(0..=600_000).speed(10.0));
+            if ui.add_enabled(!busy, egui::Button::new("\u{ff0b}")).clicked() {
+                let (at, ms) = (self.ed_from, self.ed_delay_ms);
+                self.edit(|d| editor_insert_delay(d, at, ms));
+            }
+            ui.label(s.ed_scale);
+            ui.add(egui::DragValue::new(&mut self.ed_scale).range(0.05..=20.0).speed(0.05));
+            if ui.add_enabled(!busy, egui::Button::new("\u{2714}")).clicked() {
+                let f = self.ed_scale;
+                self.edit(|d| editor_scale(d, f));
+            }
+        });
+
+        // Bulk edits: the two things people actually want across a whole recording.
+        ui.horizontal_wrapped(|ui| {
+            let names = [s.btn_l, s.btn_r, s.btn_m, "X1", "X2"];
+            ui.label(s.bulk_replace);
+            egui::ComboBox::from_id_salt("bulk_a")
+                .selected_text(names[self.bulk_from_btn.min(4)])
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for (i, n) in names.iter().enumerate() {
+                        ui.selectable_value(&mut self.bulk_from_btn, i, *n);
+                    }
+                });
+            ui.label("\u{2192}");
+            egui::ComboBox::from_id_salt("bulk_b")
+                .selected_text(names[self.bulk_to_btn.min(4)])
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for (i, n) in names.iter().enumerate() {
+                        ui.selectable_value(&mut self.bulk_to_btn, i, *n);
+                    }
+                });
+            if ui.add_enabled(!busy, egui::Button::new("\u{2714}")).clicked() {
+                let (from, to) = (self.ed_from, self.ed_to);
+                let a = MouseButton::from_index(self.bulk_from_btn);
+                let b = MouseButton::from_index(self.bulk_to_btn);
+                self.edit(|d| {
+                    editor_replace_button(d, from, to, a, b);
+                });
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(s.bulk_shift);
+            ui.label("dX");
+            ui.add(egui::DragValue::new(&mut self.bulk_dx).range(-32000..=32000));
+            ui.label("dY");
+            ui.add(egui::DragValue::new(&mut self.bulk_dy).range(-32000..=32000));
+            if ui.add_enabled(!busy, egui::Button::new("\u{2714}")).clicked() {
+                let (from, to, dx, dy) =
+                    (self.ed_from, self.ed_to, self.bulk_dx, self.bulk_dy);
+                self.edit(|d| editor_shift_coords(d, from, to, dx, dy));
+            }
+        });
+    }
+
+    /// Hosts the editor in its own OS window while `editor_open` is set.
+    fn editor_viewport(&mut self, ctx: &egui::Context) {
+        if !self.editor_open {
+            return;
+        }
+        let title = self.strs().ed_title;
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("macro_editor"),
+            egui::ViewportBuilder::default()
+                .with_title(title)
+                .with_inner_size([640.0, 560.0])
+                .with_min_inner_size([420.0, 320.0]),
+            |ctx, _class| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.editor_ui(ui);
+                });
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+            },
+        );
+        if close {
+            self.editor_open = false;
+        }
+    }
+}
+
 impl eframe::App for MacroApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let s = self.strs();
@@ -3671,6 +4603,31 @@ impl eframe::App for MacroApp {
             publish_hotkeys(&self.config);
         }
 
+        // ---- deferred pick of a coordinate for the selected action ------------
+        if let Some(deadline) = self.ed_pick_deadline {
+            ui.ctx().request_repaint();
+            if Instant::now() >= deadline {
+                self.ed_pick_deadline = None;
+                let (px, py) = platform::cursor_pos();
+                let idx = self.ed_cursor;
+                let current = self.state.macro_data.lock().events.get(idx).copied();
+                if let Some(ev) = current {
+                    let mut kind = ev.kind;
+                    match &mut kind {
+                        InputEventKind::MouseMove { x, y, .. }
+                        | InputEventKind::MouseButton { x, y, .. }
+                        | InputEventKind::MouseWheel { x, y, .. } => {
+                            *x = px;
+                            *y = py;
+                        }
+                        InputEventKind::Key { .. } => {}
+                    }
+                    self.edit_event(idx, |d| editor_set_event(d, idx, kind));
+                }
+                self.status_msg = format!("{px}, {py}");
+            }
+        }
+
         // ---- deferred pixel pick ---------------------------------------------
         if let Some(deadline) = self.pick_deadline {
             if Instant::now() >= deadline {
@@ -3690,6 +4647,10 @@ impl eframe::App for MacroApp {
         if self.state.pixel_triggered.swap(false, Ordering::Relaxed) {
             self.status_msg = s.status_pixel.to_string();
         }
+
+        // Drawn before the main panel so it is a sibling window, not a nested one.
+        let ctx = ui.ctx().clone();
+        self.editor_viewport(&ctx);
 
         let panel = egui::Frame::central_panel(ui.style()).fill(self.panel_fill);
         egui::CentralPanel::default().frame(panel).show(ui, |ui| {
@@ -3889,105 +4850,22 @@ impl eframe::App for MacroApp {
 
                 // ---- editor --------------------------------------------------------
                 egui::CollapsingHeader::new(s.sec_editor).show(ui, |ui| {
-                    let (count, rows) = {
-                        let data = self.state.macro_data.lock();
-                        let n = data.events.len();
-                        let from = self.ed_from.min(n.saturating_sub(1));
-                        let to = self.ed_to.min(n.saturating_sub(1)).max(from);
-                        let end = (from + 40).min(n);
-                        let rows: Vec<(usize, u64, String)> = data
-                            .events
-                            .get(from..end)
-                            .unwrap_or(&[])
-                            .iter()
-                            .enumerate()
-                            .map(|(i, ev)| (from + i, ev.t_us, describe_event(ev)))
-                            .collect();
-                        let _ = to;
-                        (n, rows)
-                    };
-
+                    let count = self.state.macro_data.lock().events.len();
                     if count == 0 {
                         ui.label(s.no_macro);
                     } else {
-                        let last = count - 1;
-                        ui.horizontal(|ui| {
-                            ui.label(s.ed_from);
-                            ui.add(egui::DragValue::new(&mut self.ed_from).range(0..=last));
-                            ui.label(s.ed_to);
-                            ui.add(egui::DragValue::new(&mut self.ed_to).range(0..=last));
-                        });
-                        if self.ed_to < self.ed_from {
-                            self.ed_to = self.ed_from;
-                        }
-
-                        egui::ScrollArea::vertical().max_height(160.0).id_salt("ed_list").show(
-                            ui,
-                            |ui| {
-                                for (i, t, text) in &rows {
-                                    let selected = *i >= self.ed_from && *i <= self.ed_to;
-                                    let line = format!("{i:>5}  {}  {text}", format_us(*t));
-                                    if ui
-                                        .selectable_label(
-                                            selected,
-                                            egui::RichText::new(line).monospace().small(),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.ed_from = *i;
-                                        self.ed_to = *i;
-                                    }
-                                }
-                            },
-                        );
-
+                        self.refresh_steps();
                         ui.horizontal_wrapped(|ui| {
-                            let (from, to) = (self.ed_from, self.ed_to);
-                            if ui.add_enabled(!busy, egui::Button::new(s.ed_delete)).clicked() {
-                                self.edit(|d| editor_delete_range(d, from, to));
+                            if ui.button(s.ed_open).clicked() {
+                                self.editor_open = true;
                             }
-                            if ui.add_enabled(!busy, egui::Button::new(s.ed_crop)).clicked() {
-                                self.edit(|d| editor_crop(d, from, to));
-                            }
-                            if ui.add_enabled(!busy, egui::Button::new(s.ed_drop_moves)).clicked() {
-                                self.edit(editor_drop_moves);
-                            }
-                            if ui.add_enabled(!busy, egui::Button::new(s.ed_zero)).clicked() {
-                                self.edit(editor_trim_lead);
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(s.ed_insert);
-                            ui.add(
-                                egui::DragValue::new(&mut self.ed_delay_ms)
-                                    .range(0..=600_000)
-                                    .speed(10.0),
+                            ui.label(
+                                egui::RichText::new(
+                                    s.ed_steps.replace("{}", &self.ed_steps.len().to_string()),
+                                )
+                                .weak(),
                             );
-                            if ui.add_enabled(!busy, egui::Button::new("＋")).clicked() {
-                                let (at, ms) = (self.ed_from, self.ed_delay_ms);
-                                self.edit(|d| editor_insert_delay(d, at, ms));
-                            }
-                            ui.label(s.ed_scale);
-                            ui.add(
-                                egui::DragValue::new(&mut self.ed_scale)
-                                    .range(0.05..=20.0)
-                                    .speed(0.05),
-                            );
-                            if ui.add_enabled(!busy, egui::Button::new("✔")).clicked() {
-                                let f = self.ed_scale;
-                                self.edit(|d| editor_scale(d, f));
-                            }
                         });
-                        if ui
-                            .add_enabled(self.ed_undo.is_some() && !busy, egui::Button::new(s.ed_undo))
-                            .clicked()
-                        {
-                            if let Some(prev) = self.ed_undo.take() {
-                                let dur = prev.duration_us;
-                                *self.state.macro_data.lock() = prev;
-                                self.state.recorded_time_us.store(dur, Ordering::Relaxed);
-                            }
-                        }
                     }
                 });
 
@@ -4638,6 +5516,152 @@ mod tests {
         assert_eq!(data.cycle_len_us(), 5_000_000);
     }
 
+    fn key(t_us: u64, vk: u16, down: bool) -> MacroEvent {
+        MacroEvent { t_us, kind: InputEventKind::Key { vk, scan: 0, down, extended: false } }
+    }
+
+    fn btn(t_us: u64, down: bool, x: i32, y: i32) -> MacroEvent {
+        MacroEvent {
+            t_us,
+            kind: InputEventKind::MouseButton { button: MouseButton::Left, down, x, y },
+        }
+    }
+
+    #[test]
+    fn set_event_swaps_the_button() {
+        let mut d = MacroData::new(vec![btn(0, true, 1, 2), btn(1000, false, 1, 2)], 1000);
+        editor_set_event(
+            &mut d,
+            0,
+            InputEventKind::MouseButton { button: MouseButton::Right, down: true, x: 1, y: 2 },
+        );
+        match d.events[0].kind {
+            InputEventKind::MouseButton { button, .. } => {
+                assert_eq!(button, MouseButton::Right)
+            }
+            _ => panic!("wrong kind"),
+        }
+    }
+
+    #[test]
+    fn replace_button_covers_only_the_selection() {
+        let mut d = MacroData::new(
+            vec![btn(0, true, 0, 0), btn(10, false, 0, 0), btn(20, true, 0, 0)],
+            20,
+        );
+        let n = editor_replace_button(&mut d, 0, 1, MouseButton::Left, MouseButton::Right);
+        assert_eq!(n, 2);
+        match d.events[2].kind {
+            InputEventKind::MouseButton { button, .. } => {
+                assert_eq!(button, MouseButton::Left, "outside the range must not change")
+            }
+            _ => panic!("wrong kind"),
+        }
+    }
+
+    #[test]
+    fn shift_coords_moves_clicks_and_moves() {
+        let mut d = MacroData::new(vec![ev(0), btn(10, true, 100, 100)], 10);
+        editor_shift_coords(&mut d, 0, 1, 5, -7);
+        match d.events[1].kind {
+            InputEventKind::MouseButton { x, y, .. } => assert_eq!((x, y), (105, 93)),
+            _ => panic!("wrong kind"),
+        }
+    }
+
+    #[test]
+    fn set_time_cannot_jump_past_neighbours() {
+        let mut d = MacroData::new(vec![ev(0), ev(1000), ev(2000)], 2000);
+        editor_set_time(&mut d, 1, 9_999);
+        assert_eq!(d.events[1].t_us, 2000);
+        editor_set_time(&mut d, 1, 0);
+        assert_eq!(d.events[1].t_us, 0);
+    }
+
+    #[test]
+    fn duplicate_inserts_a_copy_and_shifts_the_tail() {
+        let mut d = MacroData::new(vec![ev(0), ev(50_000)], 50_000);
+        editor_duplicate(&mut d, 0);
+        assert_eq!(d.events.len(), 3);
+        assert_eq!(d.events[1].t_us, 10_000);
+        assert_eq!(d.events[2].t_us, 60_000);
+    }
+
+    #[test]
+    fn story_reports_a_click_not_two_events() {
+        let events = vec![btn(0, true, 10, 20), btn(50_000, false, 10, 20)];
+        let steps = summarize(&events, &EN);
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].text.contains("(10, 20)"));
+        assert_eq!((steps[0].first, steps[0].last), (0, 1));
+    }
+
+    #[test]
+    fn story_detects_a_double_click() {
+        let events = vec![
+            btn(0, true, 5, 5),
+            btn(40_000, false, 5, 5),
+            btn(120_000, true, 5, 5),
+            btn(160_000, false, 5, 5),
+        ];
+        let steps = summarize(&events, &EN);
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].text.contains("double"));
+        assert_eq!(steps[0].last, 3);
+    }
+
+    #[test]
+    fn story_detects_a_drag() {
+        let events = vec![
+            btn(0, true, 0, 0),
+            ev(10_000),
+            MacroEvent {
+                t_us: 20_000,
+                kind: InputEventKind::MouseMove { x: 300, y: 400, dx: 0, dy: 0 },
+            },
+            btn(30_000, false, 300, 400),
+        ];
+        let steps = summarize(&events, &EN);
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].text.contains("Dragged"), "{}", steps[0].text);
+    }
+
+    #[test]
+    fn story_merges_typing_and_reports_a_pause() {
+        let events = vec![
+            key(0, 0x48, true),        // H
+            key(10_000, 0x48, false),
+            key(20_000, 0x49, true),   // I
+            key(30_000, 0x49, false),
+            key(2_000_000, 0x1B, true), // Esc, after a long gap
+            key(2_010_000, 0x1B, false),
+        ];
+        let steps = summarize(&events, &EN);
+        assert!(steps[0].text.contains("HI"), "{}", steps[0].text);
+        assert!(steps[1].text.starts_with("Waited"), "{}", steps[1].text);
+        assert!(steps[2].text.contains("Esc"), "{}", steps[2].text);
+    }
+
+    #[test]
+    fn story_collapses_a_run_of_moves() {
+        let events = vec![
+            MacroEvent { t_us: 0, kind: InputEventKind::MouseMove { x: 1, y: 1, dx: 0, dy: 0 } },
+            MacroEvent { t_us: 5_000, kind: InputEventKind::MouseMove { x: 50, y: 60, dx: 0, dy: 0 } },
+            MacroEvent { t_us: 10_000, kind: InputEventKind::MouseMove { x: 99, y: 88, dx: 0, dy: 0 } },
+        ];
+        let steps = summarize(&events, &EN);
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].text.contains("(99, 88)"));
+        assert_eq!(steps[0].last, 2);
+    }
+
+    #[test]
+    fn duration_formatting_switches_units() {
+        assert_eq!(format_dur(500), "500 \u{b5}s");
+        assert_eq!(format_dur(2_000), "2 ms");
+        assert_eq!(format_dur(1_500_000), "1.5 s");
+    }
+
     #[test]
     fn editor_delete_pulls_the_tail_back() {
         let mut d = MacroData::new(vec![ev(0), ev(1000), ev(2000), ev(3000)], 3000);
@@ -4820,4 +5844,3 @@ mod tests {
         assert!(p.file_name().unwrap().to_string_lossy().starts_with("farm_"));
     }
 }
-
