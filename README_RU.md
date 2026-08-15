@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="icon_256.png" width="128" alt="Macro Recorder">
+<img src="assets/icon_256.png" width="128" alt="Macro Recorder">
 
 # 🦀 Macro Recorder
 
@@ -17,7 +17,7 @@
 
 [📥 Скачать](../../releases) • [✨ Возможности](#-возможности) • [🆚 vs TinyTask](#-macro-recorder-vs-tinytask) • [🧠 Как это работает](#-как-это-работает) • [🇬🇧 English version](README.md)
 
-<img src="screenshot1.png" width="330" alt="Окно Macro Recorder">
+<img src="assets/screenshot1.png" width="330" alt="Окно Macro Recorder">
 
 </div>
 
