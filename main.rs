@@ -49,7 +49,9 @@ mod win32 {
     pub use windows::Win32::UI::Input::KeyboardAndMouse::*;
     pub use windows::Win32::UI::Shell::*;
     pub use windows::Win32::UI::WindowsAndMessaging::*;
-    pub use windows::core::{PCSTR, PCWSTR, w};
+    // BOOL moved out of Win32::Foundation into windows-core in the 0.62 family;
+    // the EnumWindows callback has to return exactly that type.
+    pub use windows::core::{BOOL, PCSTR, PCWSTR, w};
 }
 
 // ============================================================================
@@ -130,6 +132,14 @@ impl Rng {
     }
     fn below(&mut self, bound: u64) -> u64 {
         if bound == 0 { 0 } else { self.next_u64() % bound }
+    }
+    /// Uniform value in `-span..=span`.
+    fn signed(&mut self, span: i64) -> i64 {
+        if span <= 0 { 0 } else { (self.next_u64() % (span as u64 * 2 + 1)) as i64 - span }
+    }
+    /// Uniform value in `-1.0..=1.0`.
+    fn unit(&mut self) -> f32 {
+        self.below(2001) as f32 / 1000.0 - 1.0
     }
 }
 
@@ -465,6 +475,14 @@ pub struct AppConfig {
     pub repeat_delay_ms: u64,
     pub jitter_pct: u64,
     pub use_window_anchor: bool,
+    /// Also stretch coordinates when the anchored window changed size.
+    pub anchor_scale: bool,
+    /// Glide along a curved path instead of teleporting the cursor.
+    pub human_mouse: bool,
+    /// 0-100: how far the arc bows away from the straight line.
+    pub human_curve: u64,
+    /// Random spread applied to every target point, in pixels.
+    pub mouse_jitter_px: i32,
 
     // recording
     pub capture_mouse_moves: bool,
@@ -518,6 +536,10 @@ impl Default for AppConfig {
             repeat_delay_ms: 0,
             jitter_pct: 0,
             use_window_anchor: false,
+            anchor_scale: true,
+            human_mouse: false,
+            human_curve: 35,
+            mouse_jitter_px: 0,
 
             capture_mouse_moves: true,
             mouse_sample_ms: 5,
@@ -558,6 +580,8 @@ impl AppConfig {
         self.speed = if self.speed.is_finite() { self.speed.clamp(0.05, 10.0) } else { 1.0 };
         self.repeat_delay_ms = self.repeat_delay_ms.min(600_000);
         self.jitter_pct = self.jitter_pct.min(50);
+        self.human_curve = self.human_curve.min(100);
+        self.mouse_jitter_px = self.mouse_jitter_px.clamp(0, 60);
         self.mouse_sample_ms = self.mouse_sample_ms.clamp(1, 100);
         self.time_limit_h = self.time_limit_h.min(240);
         self.time_limit_m = self.time_limit_m.min(59);
@@ -1231,11 +1255,58 @@ mod platform {
         }
     }
 
-    /// Current position of the anchored window, if it is still around.
-    pub fn find_window_rect(title: &str) -> Option<(i32, i32)> {
+    thread_local! {
+        /// Needle and result for the EnumWindows callback below.
+        static FIND_STATE: std::cell::RefCell<(String, Option<HWND>)> =
+            const { std::cell::RefCell::new((String::new(), None)) };
+    }
+
+    unsafe extern "system" fn enum_find_proc(hwnd: HWND, _lp: LPARAM) -> BOOL {
         unsafe {
+            if !IsWindowVisible(hwnd).as_bool() {
+                return true.into();
+            }
+            let len = GetWindowTextLengthW(hwnd);
+            if len <= 0 {
+                return true.into();
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            let n = GetWindowTextW(hwnd, &mut buf);
+            if n <= 0 {
+                return true.into();
+            }
+            let title = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+            let mut stop = false;
+            FIND_STATE.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.1.is_none() && !c.0.is_empty() && title.contains(c.0.as_str()) {
+                    c.1 = Some(hwnd);
+                    stop = true;
+                }
+            });
+            (!stop).into()
+        }
+    }
+
+    /// Finds a top-level window by title and returns its rectangle.
+    ///
+    /// Exact match first, then a case-insensitive substring search: window titles
+    /// pick up suffixes all the time ("Roblox" becomes "Roblox - Level 7"), and an
+    /// exact-only lookup made anchoring fail exactly when it was needed most.
+    pub fn find_window_rect(title: &str) -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let mut hwnd = HWND::default();
             let w = wide(title);
-            let hwnd = FindWindowW(None, PCWSTR(w.as_ptr())).ok()?;
+            if let Ok(h) = FindWindowW(None, PCWSTR(w.as_ptr())) {
+                hwnd = h;
+            }
+            if hwnd.0.is_null() {
+                let needle: String =
+                    title.to_lowercase().chars().take(24).collect::<String>().trim().to_string();
+                FIND_STATE.with(|c| *c.borrow_mut() = (needle, None));
+                let _ = EnumWindows(Some(enum_find_proc), LPARAM(0));
+                hwnd = FIND_STATE.with(|c| c.borrow().1.unwrap_or_default());
+            }
             if hwnd.0.is_null() {
                 return None;
             }
@@ -1243,7 +1314,7 @@ mod platform {
             if GetWindowRect(hwnd, &mut r).is_err() {
                 return None;
             }
-            Some((r.left, r.top))
+            Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
         }
     }
 
@@ -1414,7 +1485,7 @@ mod platform {
     pub fn foreground_anchor() -> Option<WindowAnchor> {
         None
     }
-    pub fn find_window_rect(_: &str) -> Option<(i32, i32)> {
+    pub fn find_window_rect(_: &str) -> Option<(i32, i32, i32, i32)> {
         None
     }
     pub fn acquire_single_instance() -> bool {
@@ -1484,6 +1555,10 @@ pub struct AppState {
     pub repeat_delay_ms: AtomicU64,
     pub jitter_pct: AtomicU64,
     pub use_window_anchor: AtomicBool,
+    pub anchor_scale: AtomicBool,
+    pub human_mouse: AtomicBool,
+    pub human_curve: AtomicU64,
+    pub mouse_jitter_px: AtomicI32,
     pub speed: Mutex<f64>,
 
     // recording settings
@@ -1536,6 +1611,10 @@ impl AppState {
             repeat_delay_ms: AtomicU64::new(0),
             jitter_pct: AtomicU64::new(0),
             use_window_anchor: AtomicBool::new(false),
+            anchor_scale: AtomicBool::new(true),
+            human_mouse: AtomicBool::new(false),
+            human_curve: AtomicU64::new(35),
+            mouse_jitter_px: AtomicI32::new(0),
             speed: Mutex::new(1.0),
 
             capture_mouse_moves: AtomicBool::new(true),
@@ -1578,6 +1657,10 @@ fn apply_config_to_state(cfg: &AppConfig, state: &AppState) {
     state.repeat_delay_ms.store(cfg.repeat_delay_ms, Ordering::Relaxed);
     state.jitter_pct.store(cfg.jitter_pct, Ordering::Relaxed);
     state.use_window_anchor.store(cfg.use_window_anchor, Ordering::Relaxed);
+    state.anchor_scale.store(cfg.anchor_scale, Ordering::Relaxed);
+    state.human_mouse.store(cfg.human_mouse, Ordering::Relaxed);
+    state.human_curve.store(cfg.human_curve, Ordering::Relaxed);
+    state.mouse_jitter_px.store(cfg.mouse_jitter_px, Ordering::Relaxed);
     *state.speed.lock() = cfg.speed;
 
     state.capture_mouse_moves.store(cfg.capture_mouse_moves, Ordering::Relaxed);
@@ -1605,6 +1688,134 @@ fn current_rec_time_us(state: &AppState) -> u64 {
 // ============================================================================
 // Playback engine
 // ============================================================================
+
+/// Maps recorded screen coordinates onto the current position of the anchored window.
+///
+/// Translation alone was not enough: a window that was *resized* since the recording
+/// moves every control proportionally, so the mapping scales as well.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoordMap {
+    /// Where the window used to be.
+    pub rx: i32,
+    pub ry: i32,
+    /// Where it is now.
+    pub ox: i32,
+    pub oy: i32,
+    pub sx: f32,
+    pub sy: f32,
+}
+
+impl CoordMap {
+    const IDENTITY: Self = Self { rx: 0, ry: 0, ox: 0, oy: 0, sx: 1.0, sy: 1.0 };
+
+    fn map(&self, x: i32, y: i32) -> (i32, i32) {
+        let nx = self.ox as f32 + (x - self.rx) as f32 * self.sx;
+        let ny = self.oy as f32 + (y - self.ry) as f32 * self.sy;
+        (nx.round() as i32, ny.round() as i32)
+    }
+
+    /// Scales a relative movement, so drags keep their proportions too.
+    fn map_delta(&self, dx: i32, dy: i32) -> (i32, i32) {
+        ((dx as f32 * self.sx).round() as i32, (dy as f32 * self.sy).round() as i32)
+    }
+
+    fn build(anchor: &WindowAnchor, allow_scale: bool) -> Option<Self> {
+        let (x, y, w, h) = platform::find_window_rect(&anchor.title)?;
+        let (sx, sy) = if allow_scale && anchor.w > 0 && anchor.h > 0 {
+            (
+                (w as f32 / anchor.w as f32).clamp(0.2, 5.0),
+                (h as f32 / anchor.h as f32).clamp(0.2, 5.0),
+            )
+        } else {
+            (1.0, 1.0)
+        };
+        Some(Self { rx: anchor.x, ry: anchor.y, ox: x, oy: y, sx, sy })
+    }
+}
+
+/// Interior points of a cubic Bezier from `from` to `to`.
+///
+/// Both control points sit on a random side of the straight line, which is what
+/// stops every replayed movement from tracing the exact same arc.
+fn bezier_path(
+    from: (i32, i32),
+    to: (i32, i32),
+    curve: f32,
+    rng: &mut Rng,
+    steps: usize,
+) -> Vec<(i32, i32)> {
+    let (x0, y0) = (from.0 as f32, from.1 as f32);
+    let (x3, y3) = (to.0 as f32, to.1 as f32);
+    let (dx, dy) = (x3 - x0, y3 - y0);
+    let dist = (dx * dx + dy * dy).sqrt().max(1.0);
+    // Unit vector perpendicular to the path: the arc bows along this.
+    let (px, py) = (-dy / dist, dx / dist);
+    let amp = dist * curve.clamp(0.0, 1.0) * 0.35;
+    let o1 = rng.unit() * amp;
+    let o2 = rng.unit() * amp;
+    let c1 = (x0 + dx * 0.30 + px * o1, y0 + dy * 0.30 + py * o1);
+    let c2 = (x0 + dx * 0.70 + px * o2, y0 + dy * 0.70 + py * o2);
+
+    (1..steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32;
+            let u = 1.0 - t;
+            let x = u * u * u * x0 + 3.0 * u * u * t * c1.0 + 3.0 * u * t * t * c2.0 + t * t * t * x3;
+            let y = u * u * u * y0 + 3.0 * u * u * t * c1.1 + 3.0 * u * t * t * c2.1 + t * t * t * y3;
+            (x.round() as i32, y.round() as i32)
+        })
+        .collect()
+}
+
+/// Moves the cursor, optionally the way a hand would.
+struct MoveEngine {
+    last: Option<(i32, i32)>,
+    rng: Rng,
+    human: bool,
+    curve: f32,
+    jitter: i32,
+}
+
+impl MoveEngine {
+    fn new(state: &AppState) -> Self {
+        Self {
+            last: None,
+            rng: Rng::new(),
+            human: state.human_mouse.load(Ordering::Relaxed),
+            curve: state.human_curve.load(Ordering::Relaxed) as f32 / 100.0,
+            jitter: state.mouse_jitter_px.load(Ordering::Relaxed),
+        }
+    }
+
+    /// A do-nothing engine for the paths that only release stuck buttons.
+    fn inert() -> Self {
+        Self { last: None, rng: Rng::new(), human: false, curve: 0.0, jitter: 0 }
+    }
+
+    fn goto(&mut self, x: i32, y: i32) {
+        let (mut tx, mut ty) = (x, y);
+        if self.jitter > 0 {
+            tx += self.rng.signed(self.jitter as i64) as i32;
+            ty += self.rng.signed(self.jitter as i64) as i32;
+        }
+        if self.human {
+            if let Some(from) = self.last {
+                let d = (((tx - from.0).pow(2) + (ty - from.1).pow(2)) as f64).sqrt();
+                if d > 24.0 {
+                    // Roughly one step per 8 px, capped so a long haul cannot eat
+                    // more than ~60 ms of the schedule.
+                    let steps = ((d / 8.0) as usize).clamp(6, 48);
+                    for p in bezier_path(from, (tx, ty), self.curve, &mut self.rng, steps) {
+                        unsafe { platform::send_absolute_mouse_move(p.0, p.1) };
+                        spin_sleep::sleep(Duration::from_micros(1_200));
+                    }
+                }
+            }
+        }
+        unsafe { platform::send_absolute_mouse_move(tx, ty) };
+        self.last = Some((tx, ty));
+    }
+}
 
 /// Tracks what playback is holding down so nothing can stay stuck.
 #[derive(Default)]
@@ -1639,13 +1850,16 @@ impl PressedInputs {
 
     #[cfg(windows)]
     fn release_all(&mut self, state: &AppState) {
+        // Releases never move the cursor, so an inert engine and the identity map.
+        let mut mv = MoveEngine::inert();
         while let Some((vk, scan, extended)) = self.keys.pop() {
             unsafe {
                 send_input_event(
                     &InputEventKind::Key { vk, scan, down: false, extended },
                     state,
                     &mut PressedInputs::default(),
-                    (0, 0),
+                    CoordMap::IDENTITY,
+                    &mut mv,
                 );
             }
         }
@@ -1655,7 +1869,8 @@ impl PressedInputs {
                     &InputEventKind::MouseButton { button, down: false, x: 0, y: 0 },
                     state,
                     &mut PressedInputs::default(),
-                    (0, 0),
+                    CoordMap::IDENTITY,
+                    &mut mv,
                 );
             }
         }
@@ -1733,21 +1948,25 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
     let jitter_pct = state.jitter_pct.load(Ordering::Relaxed);
     let cycle_us = ((data.cycle_len_us() as f64 / speed) as u64) + repeat_delay_us;
 
-    // Re-anchor absolute coordinates if the target window has moved since recording.
-    let offset = match (state.use_window_anchor.load(Ordering::Relaxed), data.anchor.as_ref()) {
-        (true, Some(anchor)) => match platform::find_window_rect(&anchor.title) {
-            Some((x, y)) => {
-                let off = (x - anchor.x, y - anchor.y);
-                info!("anchored to '{}': offset {:?}", anchor.title, off);
-                off
+    // Re-anchor absolute coordinates if the target window moved *or resized*.
+    let allow_scale = state.anchor_scale.load(Ordering::Relaxed);
+    let map = match (state.use_window_anchor.load(Ordering::Relaxed), data.anchor.as_ref()) {
+        (true, Some(anchor)) => match CoordMap::build(anchor, allow_scale) {
+            Some(m) => {
+                info!(
+                    "anchored to '{}': origin {},{} -> {},{}  scale {:.3}x{:.3}",
+                    anchor.title, m.rx, m.ry, m.ox, m.oy, m.sx, m.sy
+                );
+                m
             }
             None => {
                 warn!("anchor window '{}' not found - playing unshifted", anchor.title);
-                (0, 0)
+                CoordMap::IDENTITY
             }
         },
-        _ => (0, 0),
+        _ => CoordMap::IDENTITY,
     };
+    let mut mover = MoveEngine::new(&state);
 
     let loop_play = state.loop_play.load(Ordering::Relaxed);
     let max_count = if loop_play {
@@ -1862,7 +2081,7 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
 
         #[cfg(windows)]
         unsafe {
-            send_input_event(&ev.kind, &state, &mut pressed, offset);
+            send_input_event(&ev.kind, &state, &mut pressed, map, &mut mover);
         }
 
         prev_scaled_t = scaled_t;
@@ -1895,7 +2114,8 @@ unsafe fn send_input_event(
     kind: &InputEventKind,
     state: &AppState,
     pressed: &mut PressedInputs,
-    offset: (i32, i32),
+    map: CoordMap,
+    mv: &mut MoveEngine,
 ) {
     use win32::*;
     unsafe {
@@ -1932,14 +2152,18 @@ unsafe fn send_input_event(
             }
             InputEventKind::MouseMove { x, y, dx, dy } => {
                 if state.absolute_mouse.load(Ordering::Relaxed) {
-                    platform::send_absolute_mouse_move(*x + offset.0, *y + offset.1);
+                    let (nx, ny) = map.map(*x, *y);
+                    mv.goto(nx, ny);
                 } else {
+                    // Relative deltas are scaled too, so a drag keeps its shape when
+                    // the anchored window is a different size than it was.
+                    let (sdx, sdy) = map.map_delta(*dx, *dy);
                     let input = INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
                             mi: MOUSEINPUT {
-                                dx: *dx,
-                                dy: *dy,
+                                dx: sdx,
+                                dy: sdy,
                                 mouseData: 0,
                                 dwFlags: MOUSEEVENTF_MOVE,
                                 time: 0,
@@ -1952,7 +2176,8 @@ unsafe fn send_input_event(
             }
             InputEventKind::MouseButton { button, down, x, y } => {
                 if state.absolute_mouse.load(Ordering::Relaxed) && (*x != 0 || *y != 0) {
-                    platform::send_absolute_mouse_move(*x + offset.0, *y + offset.1);
+                    let (nx, ny) = map.map(*x, *y);
+                    mv.goto(nx, ny);
                 }
                 let (flags, data) = match (button, down) {
                     (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
@@ -2685,6 +2910,7 @@ define_strings!(
     dir_up, dir_down, dir_left, dir_right, btn_l, btn_r, btn_m,
     insp_title, insp_none, insp_time, insp_key, insp_delta, insp_horiz, insp_extended,
     insp_dup, insp_del_one, st_down, st_up, bulk_replace, bulk_shift,
+    mouse_rel, human_mouse, human_curve, mouse_jitter, anchor_scale, tip_human,
 );
 
 const EN: Strings = Strings {
@@ -2700,7 +2926,7 @@ const EN: Strings = Strings {
     sec_files: "📁 Files", sec_editor: "✂ Editor", sec_profiles: "📋 Profiles",
     loop_cb: "Loop playback", play_count: "Play count:", speed: "Speed",
     repeat_delay: "Delay between loops (ms)", jitter: "Timing jitter (%)",
-    abs_mouse: "Absolute mouse (DPI fix)", anchor_use: "Follow the anchored window",
+    abs_mouse: "Absolute mouse", anchor_use: "Follow the anchored window",
     capture_moves: "Capture mouse movement", sample_rate: "Movement sampling (ms)",
     anchor_rec: "Remember the target window", anchor_of: "⚓ Anchor: {}", anchor_none: "none",
     time_limit_cb: "Stop after time limit", time_limit_h: "H", time_limit_m: "M",
@@ -2743,6 +2969,10 @@ const EN: Strings = Strings {
     insp_extended: "Extended", insp_dup: "Duplicate", insp_del_one: "Delete action",
     st_down: "press", st_up: "release",
     bulk_replace: "Replace in selection", bulk_shift: "Shift coordinates",
+    mouse_rel: "Relative mouse", human_mouse: "Human-like movement",
+    human_curve: "Curvature", mouse_jitter: "Aim spread (px)",
+    anchor_scale: "Scale with the window size",
+    tip_human: "Glides along a curved path instead of teleporting, with a random arc every time.",
 };
 
 const RU: Strings = Strings {
@@ -2759,7 +2989,7 @@ const RU: Strings = Strings {
     sec_profiles: "📋 Профили",
     loop_cb: "Циклическое воспроизведение", play_count: "Проигрываний:", speed: "Скорость",
     repeat_delay: "Пауза между циклами (мс)", jitter: "Джиттер таймингов (%)",
-    abs_mouse: "Абсолютная мышь (фикс DPI)", anchor_use: "Следовать за окном привязки",
+    abs_mouse: "Абсолютная мышь", anchor_use: "Следовать за окном привязки",
     capture_moves: "Записывать движения мыши", sample_rate: "Шаг выборки движений (мс)",
     anchor_rec: "Запоминать целевое окно", anchor_of: "⚓ Привязка: {}", anchor_none: "нет",
     time_limit_cb: "Остановиться по таймеру", time_limit_h: "Ч", time_limit_m: "М",
@@ -2804,6 +3034,10 @@ const RU: Strings = Strings {
     insp_extended: "Расширенная", insp_dup: "Дублировать", insp_del_one: "Удалить действие",
     st_down: "нажатие", st_up: "отпускание",
     bulk_replace: "Заменить в выделении", bulk_shift: "Сдвинуть координаты",
+    mouse_rel: "Относительная мышь", human_mouse: "Человеческое движение",
+    human_curve: "Кривизна", mouse_jitter: "Разброс прицела (px)",
+    anchor_scale: "Масштабировать вместе с окном",
+    tip_human: "Курсор едет по дуге, а не телепортируется, и дуга каждый раз новая.",
 };
 
 const UK: Strings = Strings {
@@ -2820,7 +3054,7 @@ const UK: Strings = Strings {
     sec_profiles: "📋 Профілі",
     loop_cb: "Циклічне відтворення", play_count: "Відтворень:", speed: "Швидкість",
     repeat_delay: "Пауза між циклами (мс)", jitter: "Джитер таймінгів (%)",
-    abs_mouse: "Абсолютна миша (фікс DPI)", anchor_use: "Слідувати за вікном прив'язки",
+    abs_mouse: "Абсолютна миша", anchor_use: "Слідувати за вікном прив'язки",
     capture_moves: "Записувати рухи миші", sample_rate: "Крок вибірки рухів (мс)",
     anchor_rec: "Запам'ятовувати цільове вікно", anchor_of: "⚓ Прив'язка: {}",
     anchor_none: "немає",
@@ -2866,6 +3100,10 @@ const UK: Strings = Strings {
     insp_extended: "Розширена", insp_dup: "Дублювати", insp_del_one: "Видалити дію",
     st_down: "натискання", st_up: "відпускання",
     bulk_replace: "Замінити у виділенні", bulk_shift: "Зсунути координати",
+    mouse_rel: "Відносна миша", human_mouse: "Людський рух",
+    human_curve: "Кривизна", mouse_jitter: "Розкид прицілу (px)",
+    anchor_scale: "Масштабувати разом з вікном",
+    tip_human: "Курсор їде по дузі, а не телепортується, і дуга щоразу нова.",
 };
 
 const PT: Strings = Strings {
@@ -2881,7 +3119,7 @@ const PT: Strings = Strings {
     sec_files: "📁 Arquivos", sec_editor: "✂ Editor", sec_profiles: "📋 Perfis",
     loop_cb: "Reprodução em loop", play_count: "Contagem:", speed: "Velocidade",
     repeat_delay: "Pausa entre loops (ms)", jitter: "Variação de tempo (%)",
-    abs_mouse: "Mouse absoluto (fix DPI)", anchor_use: "Seguir a janela ancorada",
+    abs_mouse: "Mouse absoluto", anchor_use: "Seguir a janela ancorada",
     capture_moves: "Gravar movimento do mouse", sample_rate: "Amostragem (ms)",
     anchor_rec: "Lembrar a janela alvo", anchor_of: "⚓ Âncora: {}", anchor_none: "nenhuma",
     time_limit_cb: "Parar após o limite", time_limit_h: "H", time_limit_m: "M",
@@ -2925,6 +3163,10 @@ const PT: Strings = Strings {
     insp_extended: "Estendida", insp_dup: "Duplicar", insp_del_one: "Excluir ação",
     st_down: "pressionar", st_up: "soltar",
     bulk_replace: "Substituir na seleção", bulk_shift: "Deslocar coordenadas",
+    mouse_rel: "Mouse relativo", human_mouse: "Movimento humano",
+    human_curve: "Curvatura", mouse_jitter: "Dispersão da mira (px)",
+    anchor_scale: "Escalar com o tamanho da janela",
+    tip_human: "Desliza por uma curva em vez de teleportar, com um arco aleatório a cada vez.",
 };
 
 const ES: Strings = Strings {
@@ -2942,7 +3184,7 @@ const ES: Strings = Strings {
     sec_editor: "✂ Editor", sec_profiles: "📋 Perfiles",
     loop_cb: "Reproducción en bucle", play_count: "Repeticiones:", speed: "Velocidad",
     repeat_delay: "Pausa entre bucles (ms)", jitter: "Variación de tiempo (%)",
-    abs_mouse: "Ratón absoluto (fijo DPI)", anchor_use: "Seguir la ventana anclada",
+    abs_mouse: "Ratón absoluto", anchor_use: "Seguir la ventana anclada",
     capture_moves: "Grabar movimiento del ratón", sample_rate: "Muestreo (ms)",
     anchor_rec: "Recordar la ventana objetivo", anchor_of: "⚓ Ancla: {}", anchor_none: "ninguna",
     time_limit_cb: "Detener tras el límite", time_limit_h: "H", time_limit_m: "M",
@@ -2986,6 +3228,10 @@ const ES: Strings = Strings {
     insp_extended: "Extendida", insp_dup: "Duplicar", insp_del_one: "Eliminar acción",
     st_down: "pulsar", st_up: "soltar",
     bulk_replace: "Reemplazar en la selección", bulk_shift: "Desplazar coordenadas",
+    mouse_rel: "Ratón relativo", human_mouse: "Movimiento humano",
+    human_curve: "Curvatura", mouse_jitter: "Dispersión de puntería (px)",
+    anchor_scale: "Escalar con el tamaño de la ventana",
+    tip_human: "Se desliza por una curva en vez de teletransportarse, con un arco aleatorio cada vez.",
 };
 
 const ZH: Strings = Strings {
@@ -3001,7 +3247,7 @@ const ZH: Strings = Strings {
     sec_files: "📁 文件", sec_editor: "✂ 编辑器", sec_profiles: "📋 配置",
     loop_cb: "循环播放", play_count: "播放次数:", speed: "速度",
     repeat_delay: "循环间隔 (毫秒)", jitter: "时间抖动 (%)",
-    abs_mouse: "绝对鼠标 (修复DPI)", anchor_use: "跟随锚定窗口",
+    abs_mouse: "绝对鼠标", anchor_use: "跟随锚定窗口",
     capture_moves: "记录鼠标移动", sample_rate: "移动采样 (毫秒)",
     anchor_rec: "记住目标窗口", anchor_of: "⚓ 锚点: {}", anchor_none: "无",
     time_limit_cb: "到达时限后停止", time_limit_h: "时", time_limit_m: "分",
@@ -3044,6 +3290,10 @@ const ZH: Strings = Strings {
     insp_extended: "扩展键", insp_dup: "复制", insp_del_one: "删除动作",
     st_down: "按下", st_up: "松开",
     bulk_replace: "在选区中替换", bulk_shift: "偏移坐标",
+    mouse_rel: "相对鼠标", human_mouse: "拟人移动",
+    human_curve: "弯曲度", mouse_jitter: "瞄准抖动 (px)",
+    anchor_scale: "随窗口大小缩放",
+    tip_human: "沿曲线滑动而不是瞬移，每次弧线都不同。",
 };
 
 const LANG_CODES: [&str; 6] = ["en", "ru", "uk", "pt", "es", "zh"];
@@ -4732,8 +4982,33 @@ impl eframe::App for MacroApp {
                         ui.label(s.jitter);
                         ui.add(egui::DragValue::new(&mut self.config.jitter_pct).range(0..=50));
                     });
-                    ui.checkbox(&mut self.config.absolute_mouse, s.abs_mouse);
+                    // One setting, two switches: picking either turns the other off.
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.radio(self.config.absolute_mouse, s.abs_mouse).clicked() {
+                            self.config.absolute_mouse = true;
+                        }
+                        if ui.radio(!self.config.absolute_mouse, s.mouse_rel).clicked() {
+                            self.config.absolute_mouse = false;
+                        }
+                    });
+                    ui.checkbox(&mut self.config.human_mouse, s.human_mouse)
+                        .on_hover_text(s.tip_human);
+                    if self.config.human_mouse {
+                        ui.add(
+                            egui::Slider::new(&mut self.config.human_curve, 0..=100)
+                                .text(s.human_curve),
+                        );
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(s.mouse_jitter);
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.mouse_jitter_px).range(0..=60),
+                        );
+                    });
                     ui.checkbox(&mut self.config.use_window_anchor, s.anchor_use);
+                    if self.config.use_window_anchor {
+                        ui.checkbox(&mut self.config.anchor_scale, s.anchor_scale);
+                    }
                     let anchor = self
                         .state
                         .macro_data
@@ -5528,6 +5803,62 @@ mod tests {
     }
 
     #[test]
+    fn coord_map_identity_changes_nothing() {
+        assert_eq!(CoordMap::IDENTITY.map(640, 480), (640, 480));
+        assert_eq!(CoordMap::IDENTITY.map_delta(-3, 9), (-3, 9));
+    }
+
+    #[test]
+    fn coord_map_follows_a_moved_window() {
+        let m = CoordMap { rx: 100, ry: 100, ox: 400, oy: 250, sx: 1.0, sy: 1.0 };
+        assert_eq!(m.map(150, 130), (450, 280));
+    }
+
+    #[test]
+    fn coord_map_follows_a_resized_window() {
+        // Recorded in a 800x600 window at (100,100); now 1600x600 at (0,0).
+        let anchor = WindowAnchor { title: "t".into(), x: 100, y: 100, w: 800, h: 600 };
+        let m = CoordMap {
+            rx: anchor.x,
+            ry: anchor.y,
+            ox: 0,
+            oy: 0,
+            sx: 1600.0 / 800.0,
+            sy: 1.0,
+        };
+        // A click halfway across the old window stays halfway across the new one.
+        assert_eq!(m.map(500, 400), (800, 300));
+        assert_eq!(m.map_delta(10, 10), (20, 10));
+    }
+
+    #[test]
+    fn bezier_path_starts_and_ends_near_the_line() {
+        let mut rng = Rng::new();
+        let pts = bezier_path((0, 0), (100, 0), 0.0, &mut rng, 10);
+        assert_eq!(pts.len(), 9);
+        // With zero curvature the arc collapses onto the straight line.
+        assert!(pts.iter().all(|p| p.1.abs() <= 1), "{pts:?}");
+        assert!(pts[0].0 < pts[8].0, "points must advance towards the target");
+    }
+
+    #[test]
+    fn bezier_bows_away_when_curved() {
+        let mut rng = Rng::new();
+        let pts = bezier_path((0, 0), (400, 0), 1.0, &mut rng, 16);
+        assert!(pts.iter().any(|p| p.1.abs() > 5), "a curved path must leave the line");
+    }
+
+    #[test]
+    fn rng_signed_and_unit_stay_in_range() {
+        let mut rng = Rng::new();
+        for _ in 0..2000 {
+            assert!((-5..=5).contains(&rng.signed(5)));
+            let u = rng.unit();
+            assert!((-1.0..=1.0).contains(&u), "{u}");
+        }
+    }
+
+    #[test]
     fn set_event_swaps_the_button() {
         let mut d = MacroData::new(vec![btn(0, true, 1, 2), btn(1000, false, 1, 2)], 1000);
         editor_set_event(
@@ -5844,3 +6175,4 @@ mod tests {
         assert!(p.file_name().unwrap().to_string_lossy().starts_with("farm_"));
     }
 }
+
