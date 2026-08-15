@@ -7,6 +7,13 @@ description = "A modern, DPI-aware macro recorder with native Windows 11 Mica/Ac
 license = "MIT"
 build = "build.rs"
 
+[features]
+# OCR through Windows.Media.Ocr: no models to ship, uses the language packs already
+# installed in Windows. On by default; if it ever fails to build, everything else
+# still works with --no-default-features.
+default = ["winocr"]
+winocr = []
+
 [dependencies]
 # GUI & Serialization
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
@@ -14,6 +21,9 @@ egui = "0.36"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 flate2 = "1.1.9"
+# PNG only: templates are loaded from and saved as ordinary images so users can
+# crop them in any editor. No other codecs are pulled in.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Concurrency & Timing
 crossbeam-channel = "0.5.16"
@@ -51,6 +61,9 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation", # GetLocalTime for the scheduler
+    "Win32_System_DataExchange",    # clipboard
+    "Win32_System_Memory",          # GlobalLock for the clipboard DIB
     "Win32_Media",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -63,6 +76,14 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_System_Com",
     "Win32_System_Power",
+    # WinRT namespaces for OCR. Harmless when the winocr feature is off - they only
+    # add bindings, never code.
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Security_Cryptography",
+    "Foundation",
+    "Foundation_Collections",
+    "Storage_Streams",
     "Win32_Storage_FileSystem",
     "Win32_System_SystemServices",
 ] }
