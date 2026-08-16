@@ -1,6 +1,6 @@
 [package]
 name = "macro-recorder"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "A modern, DPI-aware macro recorder with native Windows 11 Mica/Acrylic, Virtual Desktop isolation, and secure shutdown"
@@ -97,4 +97,5 @@ strip = true
 # abort, so it was removed from the hook callbacks entirely; those paths are now written
 # to be panic-free (null-pointer guards, no unwrap, no slice indexing).
 panic = "abort"
+
 
