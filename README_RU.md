@@ -836,7 +836,7 @@ Issues и PR приветствуются. Если сообщаете о баг
     <img src="https://img.shields.io/badge/VirusTotal-2%2F71%20Safe-brightgreen?style=for-the-badge&logo=virustotal&logoColor=white&color=2e7d32" alt="VirusTotal Build 1">
   </a>
   <a href="https://www.virustotal.com/gui/file/f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4/">
-    <img src="https://img.shields.io/badge/VirusTotal-2%2F71%20Safe-brightgreen?style=for-the-badge&logo=virustotal&logoColor=white&color=2e7d32" alt="VirusTotal Build 2">
+    <img src="https://img.shields.io/badge/VirusTotal-3%2F71%20Safe-brightgreen?style=for-the-badge&logo=virustotal&logoColor=white&color=2e7d32" alt="VirusTotal Build 2">
   </a>
   <a href="#-почему-возникают-ложные-срабатывания-false-positives">
     <img src="https://img.shields.io/badge/Status-False%20Positives%20Verified-blue?style=for-the-badge&logo=shield&logoColor=white" alt="False Positives Verified">
