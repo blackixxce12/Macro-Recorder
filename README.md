@@ -873,8 +873,8 @@ Issues and PRs are welcome. If you're reporting a playback bug, please attach th
 
 | File / Build | SHA-256 Hash | VT Detection | VirusTotal Report |
 | :--- | :--- | :---: | :---: |
-| **Release Build 1** | `21cab5702a58699c1b2f14ac4dec322ea591cfed52cde2bb9e361e22496413a7` | <mark>**2 / 71**</mark> | [🔍 View Report](https://www.virustotal.com/gui/file/21cab5702a58699c1b2f14ac4dec322ea591cfed52cde2bb9e361e22496413a7/) |
-| **Release Build 2** | `f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4` | <mark>**2 / 71**</mark> | [🔍 View Report](https://www.virustotal.com/gui/file/f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4/) |
+| **MacroRecorder.exe** | `60b39eff30746a6f7e00fc6ec8f91bbdc377b4e38d319001e7292b156b02a818` | <mark>**2 / 71**</mark> | [🔍 View Report](https://www.virustotal.com/gui/file/60b39eff30746a6f7e00fc6ec8f91bbdc377b4e38d319001e7292b156b02a818?nocache=1) |
+| **MacroRecorder.v3.exe** | `ce43ff5b81bab37f5b95fb6c9433eefbf33d357696bef1cf7933883789a8e48c` | <mark>**3 / 71**</mark> | [🔍 View Report](https://www.virustotal.com/gui/file/ce43ff5b81bab37f5b95fb6c9433eefbf33d357696bef1cf7933883789a8e48c?nocache=1) |
 
 ---
 
