@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [1.2.0] — unreleased
+## [1.2.0] — released
 
 Window-related settings gathered into one place, and three things that quietly did not work.
 
@@ -62,7 +62,7 @@ Window-related settings gathered into one place, and three things that quietly d
 
 ---
 
-## [1.1.0] — unreleased
+## [1.1.0] — released
 
 Playback that survives a target application which cannot keep up.
 
