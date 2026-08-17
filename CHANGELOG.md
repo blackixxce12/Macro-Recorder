@@ -7,6 +7,61 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [1.2.0] — unreleased
+
+Window-related settings gathered into one place, and three things that quietly did not work.
+
+### Added
+
+- **The `🖥 Target window` section now holds everything that depends on which window
+  the macro is aimed at**, in three groups: which window it is, how coordinates follow
+  it, and how well it keeps up. The frame guard, its automatic mode, the responsiveness
+  readout, *Follow the anchored window*, *Scale with the window size* and *Remember the
+  target window* have all moved here from `▶ Playback` and `🎬 Recording`, and the
+  separate responsiveness section is gone.
+- **`⤵ From the recording`** fills the target title from the window the recording was
+  made against, so it never has to be typed by hand. It needs *Remember the target
+  window* to have been on while recording; the anchored title is shown beside the
+  button either way, and the button is disabled when there is none.
+- **A dropdown of saved templates** beside the name field in `Click image` steps and in
+  `image` conditions. A script using several pictures no longer needs any of their file
+  names typed from memory. The list is read when the dropdown opens, so a template saved
+  a moment ago is already in it.
+- `templates/`, `profiles/`, `lang/` and `logs/` are now created at startup.
+
+### Changed
+
+- Human movement is seeded from where the pointer actually is, so the first jump of a
+  run curves like every other one instead of teleporting.
+- Time spent drawing a curved path is charged to the playback schedule. Each curve costs
+  up to ~60 ms, and until now that was stolen from the events behind it, which then
+  bunched up to make the difference back.
+- The *Human-like movement* hint is shown under the setting instead of only on hover,
+  and says plainly when it applies.
+
+### Fixed
+
+- **Human movement appeared to do nothing.** It draws a curve only when the pointer has
+  to jump more than about 24 px, and a recording samples movement every 5 ms — so
+  consecutive points are a few pixels apart and the threshold is never reached. That is
+  correct behaviour, since a recording already contains real human movement, but it was
+  indistinguishable from a broken setting. It applies to click-only macros (*Capture
+  mouse movement* off) and to the `Click at` and `Click image` script steps, and the UI
+  now says so.
+- **`templates/` was not created until a PNG had been saved into it.** Folders were made
+  on first use, which is no help to somebody who wanted to drop a picture in beforehand.
+
+### Notes
+
+- A script can use as many pictures and text regions as it likes. Every `Click image`,
+  `Wait for`, `If` and `While` step carries its own template name, threshold, region and
+  search text, and templates are cached per run, so a chain like *Game Results →
+  Claim Rewards → the icon that opens the menu* is just three steps with three different
+  templates. The only thing that was awkward was typing the names, which the new
+  dropdown solves.
+
+---
+
 ## [1.1.0] — unreleased
 
 Playback that survives a target application which cannot keep up.
@@ -99,3 +154,4 @@ condition · built-in editor with three views · script engine with 17 step kind
 6 conditions and variables · image search · OCR through `Windows.Media.Ocr` · scheduler ·
 target window · 7 rebindable hotkeys · 9 themes · 6 languages · `.exe` and AutoHotkey
 export · settings profiles · headless CLI.
+
