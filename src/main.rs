@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -298,6 +298,146 @@ fn template_picker(ui: &mut egui::Ui, salt: &str, current: &mut String) -> bool 
         },
     );
     changed
+}
+
+// ============================================================================
+// Self-test instrumentation
+// ============================================================================
+
+/// Scaffolding for `--selftest`.
+///
+/// The scheduler cannot be judged from outside the process: an event that fires
+/// 40 ms late looks exactly like one that fires on time. So a self-test run is made
+/// *dry* - every call into Windows is suppressed and nothing moves on screen - while
+/// the real scheduler, the real frame guard and the real slip logic run untouched,
+/// and each dispatch is timestamped against the moment it was due.
+///
+/// Cost when idle: one relaxed load, on paths that were about to enter a syscall
+/// anyway.
+mod selftest {
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+
+    static DRY: AtomicBool = AtomicBool::new(false);
+    /// Tracing is separate from dryness: the churn test runs dry for ten minutes and
+    /// would otherwise fill memory with a trace nobody reads.
+    static TRACING: AtomicBool = AtomicBool::new(false);
+    /// Net synthetic presses outstanding. Has to come back to zero after a stop.
+    static HELD: AtomicI64 = AtomicI64::new(0);
+    /// Playback loops currently running, and the most that ever ran at once.
+    static LIVE: AtomicI64 = AtomicI64::new(0);
+    static PEAK_LIVE: AtomicI64 = AtomicI64::new(0);
+    static STALL_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static STALL_US: AtomicU64 = AtomicU64::new(0);
+    static SLIPS: AtomicU64 = AtomicU64::new(0);
+    static SLIPPED_US: AtomicU64 = AtomicU64::new(0);
+    /// (scheduled, actual), both on the playback clock.
+    static TRACE: LazyLock<Mutex<Vec<(u64, u64)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+    pub fn dry() -> bool {
+        DRY.load(Ordering::Relaxed)
+    }
+
+    /// Arms a run. `stall_at` is the event index to freeze the thread on, which is
+    /// how the anti-burst logic gets something to prove itself against.
+    pub fn arm(expected: usize, stall_at: usize, stall_us: u64) {
+        let mut t = TRACE.lock();
+        t.clear();
+        t.reserve(expected);
+        drop(t);
+        STALL_AT.store(stall_at, Ordering::Relaxed);
+        STALL_US.store(stall_us, Ordering::Relaxed);
+        SLIPS.store(0, Ordering::Relaxed);
+        SLIPPED_US.store(0, Ordering::Relaxed);
+        TRACING.store(true, Ordering::Relaxed);
+        DRY.store(true, Ordering::Relaxed);
+    }
+
+    /// Suppresses the OS calls without collecting a trace.
+    pub fn arm_dry() {
+        HELD.store(0, Ordering::Relaxed);
+        LIVE.store(0, Ordering::Relaxed);
+        PEAK_LIVE.store(0, Ordering::Relaxed);
+        DRY.store(true, Ordering::Relaxed);
+    }
+
+    pub fn held() -> i64 {
+        HELD.load(Ordering::Relaxed)
+    }
+    pub fn live() -> i64 {
+        LIVE.load(Ordering::Relaxed)
+    }
+    pub fn peak_live() -> i64 {
+        PEAK_LIVE.load(Ordering::Relaxed)
+    }
+
+    /// Counts a press or a release on its way out.
+    ///
+    /// A stop that leaves this above zero is the failure this application can least
+    /// afford: a key still down after the macro has finished.
+    pub fn note_input(kind: &crate::InputEventKind) {
+        if !dry() {
+            return;
+        }
+        let down = match kind {
+            crate::InputEventKind::Key { down, .. }
+            | crate::InputEventKind::MouseButton { down, .. } => *down,
+            _ => return,
+        };
+        if down {
+            HELD.fetch_add(1, Ordering::Relaxed);
+        } else {
+            HELD.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts a playback loop for as long as it runs, however it leaves.
+    pub struct LoopGuard;
+
+    impl Drop for LoopGuard {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn enter_playback() -> LoopGuard {
+        HELD.store(0, Ordering::Relaxed);
+        let n = LIVE.fetch_add(1, Ordering::Relaxed) + 1;
+        PEAK_LIVE.fetch_max(n, Ordering::Relaxed);
+        LoopGuard
+    }
+
+    /// Ends a run and hands back what it collected: trace, slip count, slipped time.
+    pub fn disarm() -> (Vec<(u64, u64)>, u64, u64) {
+        DRY.store(false, Ordering::Relaxed);
+        TRACING.store(false, Ordering::Relaxed);
+        STALL_AT.store(usize::MAX, Ordering::Relaxed);
+        let trace = std::mem::take(&mut *TRACE.lock());
+        (trace, SLIPS.load(Ordering::Relaxed), SLIPPED_US.load(Ordering::Relaxed))
+    }
+
+    /// Records one dispatch, then freezes if this is the armed index.
+    ///
+    /// The freeze happens after the record, so the stall shows up as lateness on the
+    /// events that follow - which is exactly where the scheduler has to deal with it.
+    pub fn note(index: usize, scheduled_us: u64, actual_us: u64) {
+        if !TRACING.load(Ordering::Relaxed) {
+            return;
+        }
+        TRACE.lock().push((scheduled_us, actual_us));
+        if index == STALL_AT.load(Ordering::Relaxed) {
+            let us = STALL_US.load(Ordering::Relaxed);
+            if us > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(us));
+            }
+        }
+    }
+
+    pub fn note_slip(late_us: u64) {
+        SLIPS.fetch_add(1, Ordering::Relaxed);
+        SLIPPED_US.fetch_add(late_us, Ordering::Relaxed);
+    }
 }
 
 // ============================================================================
@@ -1250,9 +1390,10 @@ fn script_depths(steps: &[ScriptStep]) -> Vec<usize> {
     out
 }
 
-/// Macro container, format version 2.
+/// Macro container, format version 3.
 ///
-/// v1 files were a bare `[MacroEvent, ...]` array and are still accepted on load.
+/// v1 files were a bare `[MacroEvent, ...]` array; v2 had no `script` or `vars`.
+/// Both are still accepted on load, and both come back out as version 3.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MacroData {
     #[serde(default = "format_version")]
@@ -1757,7 +1898,26 @@ pub mod vision {
 
         // Coarse pass on a shrunken copy: a full-resolution sweep of a 4K screen is
         // billions of operations, and the answer is always in the same place anyway.
-        let step = (th.min(tw) / 12).clamp(1, 8);
+        // The grid was chosen from the template alone, but the work it implies also
+        // depends on the haystack, and a small template on a large screen was
+        // pathological: measured on a 2560x1440 desktop, a 32 px template took 465 ms
+        // against 64 ms for a 64 px one. It was handed a step of 2, so the coarse pass
+        // examined a quarter of every pixel position with a 16x16 kernel - 236 million
+        // operations against 25 million for the larger template.
+        //
+        // So coarsen until the pass fits a budget, and only then: on a small haystack
+        // the finer grid is cheap and is kept, which is where its accuracy is worth
+        // having.
+        const COARSE_BUDGET: u64 = 24_000_000;
+        let mut step = (th.min(tw) / 12).clamp(1, 8);
+        while step < 8 {
+            let positions = (hay.w as u64 / step as u64) * (hay.h as u64 / step as u64);
+            let kernel = ((tw / step).max(1) as u64) * ((th / step).max(1) as u64);
+            if positions.saturating_mul(kernel) <= COARSE_BUDGET {
+                break;
+            }
+            step += 1;
+        }
         let (chay, chw, chh) = shrink(&hg, hay.w, hay.h, step);
         let (ctpl, ctw, cth) = shrink(&tg, tw, th, step);
         let (cmask, _, _) = shrink_mask(&tm, tw, th, step);
@@ -2058,7 +2218,7 @@ pub mod perf {
     pub struct Stats {
         pub samples: u32,
         pub avg_us: u64,
-        /// Worst 1 % - the "1 % low" of the usual frame-time vocabulary.
+        /// Mean of the worst 1 % - the "1 % low" of the frame-time vocabulary.
         pub p99_us: u64,
         pub p999_us: u64,
         pub worst_us: u64,
@@ -2066,12 +2226,21 @@ pub mod perf {
         pub found: bool,
     }
 
-    fn percentile(sorted: &[u64], q: f64) -> u64 {
+    /// Mean of the worst `frac` of the samples.
+    ///
+    /// Deliberately not a percentile. The 99th percentile of a hundred samples is the
+    /// 99th value, which stops one short of the single worst one - precisely the
+    /// sample a reader asking for the "1 % low" wants to know about. Averaging the
+    /// tail rather than taking its edge also keeps one freak sample from deciding the
+    /// answer on its own, which matters because the frame guard is sized from this.
+    fn worst_mean(sorted: &[u64], frac: f64) -> u64 {
         if sorted.is_empty() {
             return 0;
         }
-        let i = (((sorted.len() - 1) as f64) * q).round() as usize;
-        sorted[i.min(sorted.len() - 1)]
+        // Always at least one sample, so a short window still answers.
+        let k = ((sorted.len() as f64 * frac).ceil() as usize).clamp(1, sorted.len());
+        let tail = &sorted[sorted.len() - k..];
+        tail.iter().sum::<u64>() / k as u64
     }
 
     pub fn summarize(samples: &[u64]) -> Stats {
@@ -2088,8 +2257,8 @@ pub mod perf {
         Stats {
             samples: v.len() as u32,
             avg_us: avg,
-            p99_us: percentile(&v, 0.99),
-            p999_us: percentile(&v, 0.999),
+            p99_us: worst_mean(&v, 0.01),
+            p999_us: worst_mean(&v, 0.001),
             worst_us: *v.last().unwrap_or(&0),
             stutters: v.iter().filter(|&&x| x > hitch).count() as u32,
             found: true,
@@ -2285,7 +2454,9 @@ mod platform {
                     },
                 },
             };
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            if !crate::selftest::dry() {
+                SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
         }
     }
 
@@ -2799,6 +2970,80 @@ mod platform {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
     }
+
+    /// What this process is currently costing: private bytes, open handles, GDI
+    /// objects.
+    ///
+    /// All three are resolved at run time rather than linked. `GetProcessMemoryInfo`
+    /// lives in a psapi feature nothing else here needs, and a number that only a
+    /// soak test reads is not worth widening the build's dependency surface for. The
+    /// same trick is used for `AttachConsole` a few lines up.
+    pub fn process_cost() -> (u64, u32, u32) {
+        #[repr(C)]
+        #[derive(Default)]
+        struct MemCountersEx {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set: usize,
+            working_set: usize,
+            quota_peak_paged_pool: usize,
+            quota_paged_pool: usize,
+            quota_peak_non_paged_pool: usize,
+            quota_non_paged_pool: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+            private_usage: usize,
+        }
+
+        unsafe {
+            let me = windows::Win32::System::Threading::GetCurrentProcess();
+            let mut private = 0u64;
+            let mut handles = 0u32;
+            let mut gdi = 0u32;
+
+            if let Ok(k32) = GetModuleHandleW(w!("kernel32.dll")) {
+                if let Some(sym) =
+                    GetProcAddress(k32, PCSTR(b"K32GetProcessMemoryInfo\0".as_ptr()))
+                {
+                    let f: unsafe extern "system" fn(
+                        windows::Win32::Foundation::HANDLE,
+                        *mut MemCountersEx,
+                        u32,
+                    ) -> i32 = std::mem::transmute(sym);
+                    let mut pmc = MemCountersEx {
+                        cb: std::mem::size_of::<MemCountersEx>() as u32,
+                        ..Default::default()
+                    };
+                    if f(me, &mut pmc, pmc.cb) != 0 {
+                        private = pmc.private_usage as u64;
+                    }
+                }
+                if let Some(sym) =
+                    GetProcAddress(k32, PCSTR(b"GetProcessHandleCount\0".as_ptr()))
+                {
+                    let f: unsafe extern "system" fn(
+                        windows::Win32::Foundation::HANDLE,
+                        *mut u32,
+                    ) -> i32 = std::mem::transmute(sym);
+                    let mut n = 0u32;
+                    if f(me, &mut n) != 0 {
+                        handles = n;
+                    }
+                }
+            }
+            if let Ok(u32dll) = GetModuleHandleW(w!("user32.dll")) {
+                if let Some(sym) = GetProcAddress(u32dll, PCSTR(b"GetGuiResources\0".as_ptr()))
+                {
+                    let f: unsafe extern "system" fn(
+                        windows::Win32::Foundation::HANDLE,
+                        u32,
+                    ) -> u32 = std::mem::transmute(sym);
+                    gdi = f(me, 0); // GR_GDIOBJECTS
+                }
+            }
+            (private, handles, gdi)
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -2839,6 +3084,9 @@ mod platform {
     }
     pub fn probe_window_us(_: &str, _: u32) -> Option<u64> {
         None
+    }
+    pub fn process_cost() -> (u64, u32, u32) {
+        (0, 0, 0)
     }
     pub fn acquire_single_instance() -> bool {
         true
@@ -4250,6 +4498,7 @@ fn run_script(
 }
 
 fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
+    let _live = selftest::enter_playback();
     if data.is_empty() {
         state.playing.store(false, Ordering::Relaxed);
         return;
@@ -4478,6 +4727,8 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
             let late = now_late - due;
             info!("playback is {} ms late - slipping the schedule", late / 1000);
             cycle_start_us = cycle_start_us.saturating_add(late);
+            due = due.saturating_add(late);
+            selftest::note_slip(late);
         }
 
         // Anything the guard adds shifts the schedule with it, so the events after
@@ -4490,6 +4741,11 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
                 break;
             }
             cycle_start_us = cycle_start_us.saturating_add(extra);
+            due = due.saturating_add(extra);
+        }
+
+        if selftest::dry() {
+            selftest::note(index, due, elapsed_us!());
         }
 
         #[cfg(windows)]
@@ -4535,6 +4791,7 @@ unsafe fn send_input_event(
     mv: &mut MoveEngine,
 ) {
     use win32::*;
+    selftest::note_input(kind);
     unsafe {
         match kind {
             InputEventKind::Key { vk, scan, down, extended } => {
@@ -4564,7 +4821,9 @@ unsafe fn send_input_event(
                     }
                 };
                 let input = INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki } };
+                if !crate::selftest::dry() {
                 SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
                 pressed.note_key(*vk, *scan, *extended, *down);
             }
             InputEventKind::MouseMove { x, y, dx, dy } => {
@@ -4588,7 +4847,9 @@ unsafe fn send_input_event(
                             },
                         },
                     };
-                    SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                    if !crate::selftest::dry() {
+                SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
                 }
             }
             InputEventKind::MouseButton { button, down, x, y } => {
@@ -4621,7 +4882,9 @@ unsafe fn send_input_event(
                         },
                     },
                 };
+                if !crate::selftest::dry() {
                 SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
                 pressed.note_button(*button, *down);
             }
             InputEventKind::MouseWheel { delta, horizontal, .. } => {
@@ -4639,7 +4902,9 @@ unsafe fn send_input_event(
                         },
                     },
                 };
+                if !crate::selftest::dry() {
                 SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
             }
         }
     }
@@ -6734,7 +6999,9 @@ fn editor_crop(data: &mut MacroData, from: usize, to: usize) {
 }
 
 fn editor_insert_delay(data: &mut MacroData, at: usize, ms: u64) {
-    let us = ms * 1_000;
+    // Saturating rather than plain: the UI bounds `ms`, but a function that is only
+    // total because of its callers is a trap for the next caller.
+    let us = ms.saturating_mul(1_000);
     for ev in data.events.iter_mut().skip(at) {
         ev.t_us = ev.t_us.saturating_add(us);
     }
@@ -6765,10 +7032,16 @@ fn editor_set_event(data: &mut MacroData, index: usize, kind: InputEventKind) {
 
 /// Moves one event in time, without letting it jump past its neighbours.
 fn editor_set_time(data: &mut MacroData, index: usize, t_us: u64) {
-    let lo = if index == 0 { 0 } else { data.events[index - 1].t_us };
+    // Both neighbours are read through `get`; this one used a raw index, and it sits
+    // ahead of the `get_mut` below that was meant to cover the whole function. A
+    // selection left pointing past a recording that another edit has since trimmed
+    // reached it first, and the release profile aborts on panic - so the editor took
+    // the whole application with it.
+    let lo = index.checked_sub(1).and_then(|i| data.events.get(i)).map_or(0, |e| e.t_us);
     let hi = data.events.get(index + 1).map(|e| e.t_us).unwrap_or(u64::MAX);
     if let Some(ev) = data.events.get_mut(index) {
-        ev.t_us = t_us.clamp(lo, hi);
+        // `clamp` panics on an inverted window, which unsorted timestamps would give.
+        ev.t_us = t_us.clamp(lo, hi.max(lo));
     }
     data.duration_us = data.duration_us.max(data.last_t());
 }
@@ -9144,6 +9417,7 @@ struct CliArgs {
     loops: Option<u64>,
     speed: Option<f64>,
     no_gui: bool,
+    selftest: Option<String>,
     help: bool,
     version: bool,
 }
@@ -9154,6 +9428,7 @@ fn parse_cli() -> CliArgs {
         loops: None,
         speed: None,
         no_gui: false,
+        selftest: None,
         help: false,
         version: false,
     };
@@ -9164,6 +9439,7 @@ fn parse_cli() -> CliArgs {
             "--loops" | "-n" => args.loops = it.next().and_then(|v| v.parse().ok()),
             "--speed" | "-s" => args.speed = it.next().and_then(|v| v.parse().ok()),
             "--no-gui" => args.no_gui = true,
+            "--selftest" => args.selftest = it.next(),
             "--help" | "-h" => args.help = true,
             "--version" | "-V" => args.version = true,
             _ => {}
@@ -9183,6 +9459,8 @@ OPTIONS:
     -n, --loops <N>      Repeat count (0 = infinite)
     -s, --speed <X>      Playback speed multiplier (0.05 - 10.0)
         --no-gui         Play the macro headless and exit
+        --selftest <W>   Run a self-test and exit.
+                         W: timing, vision, churn[=secs], soak[=hours]
     -h, --help           Show this help
     -V, --version        Show the version
 
@@ -9190,6 +9468,901 @@ Without --no-gui the options simply pre-load the GUI.
 ";
 
 /// Plays a macro without any window. Shared by `--no-gui` and exported executables.
+/// An evenly spaced recording of `n` events: move, press, release, repeating.
+///
+/// Synthetic on purpose. A real recording has uneven gaps, and uneven gaps make it
+/// impossible to tell scheduler jitter from the recording's own shape.
+fn synthetic_macro(n: usize, gap_us: u64) -> MacroData {
+    let events: Vec<MacroEvent> = (0..n)
+        .map(|i| {
+            let t = i as u64 * gap_us;
+            let x = 200 + (i % 300) as i32;
+            let kind = match i % 3 {
+                0 => InputEventKind::MouseMove { x, y: 300, dx: 1, dy: 0 },
+                1 => InputEventKind::MouseButton {
+                    button: MouseButton::Left,
+                    down: true,
+                    x,
+                    y: 300,
+                },
+                _ => InputEventKind::MouseButton {
+                    button: MouseButton::Left,
+                    down: false,
+                    x,
+                    y: 300,
+                },
+            };
+            MacroEvent { t_us: t, kind }
+        })
+        .collect();
+    let dur = events.last().map(|e| e.t_us).unwrap_or(0);
+    MacroData::new(events, dur)
+}
+
+/// A recording shaped like a person: a stream of small moves with one click every
+/// 350 ms, rather than sixty-six clicks a second.
+///
+/// The evenly spaced macro above is deliberately pathological, and it makes the frame
+/// guard look ruinous - a press every 15 ms cannot be stretched to two frames without
+/// dominating the run. Real recordings leave far more room than the guard ever asks
+/// for, and this one exists to show by how much.
+fn human_paced_macro(cycles: usize) -> MacroData {
+    let mut events = Vec::new();
+    let mut t = 0u64;
+    for c in 0..cycles {
+        for i in 0..50i32 {
+            let x = 300 + (c % 200) as i32 + i;
+            events.push(MacroEvent {
+                t_us: t,
+                kind: InputEventKind::MouseMove { x, y: 400, dx: 1, dy: 0 },
+            });
+            t += 5_000;
+        }
+        let x = 300 + (c % 200) as i32;
+        events.push(MacroEvent {
+            t_us: t,
+            kind: InputEventKind::MouseButton { button: MouseButton::Left, down: true, x, y: 400 },
+        });
+        // A 60 ms press and a 40 ms gap before the next stream of moves.
+        t += 60_000;
+        events.push(MacroEvent {
+            t_us: t,
+            kind: InputEventKind::MouseButton { button: MouseButton::Left, down: false, x, y: 400 },
+        });
+        t += 40_000;
+    }
+    let dur = events.last().map(|e| e.t_us).unwrap_or(0);
+    MacroData::new(events, dur)
+}
+
+struct TimingReport {
+    label: String,
+    dispatched: usize,
+    mean_us: f64,
+    p50_us: u64,
+    p99_us: u64,
+    max_us: u64,
+    drift_us: i64,
+    slips: u64,
+    slipped_ms: u64,
+    longest_burst: usize,
+    guard_added_ms: u64,
+    wall_ms: u128,
+}
+
+/// Runs one scenario through the real `playback_loop` with the OS calls suppressed.
+fn timing_scenario(
+    label: &str,
+    data: &MacroData,
+    speed: f64,
+    guard_fps: Option<u64>,
+    human: bool,
+    stall_at: usize,
+    stall_us: u64,
+) -> TimingReport {
+    let (tx, _rx) = unbounded();
+    let state = AppState::new(tx);
+    state.loop_play.store(false, Ordering::Relaxed);
+    state.play_count_limit.store(1, Ordering::Relaxed);
+    state.absolute_mouse.store(true, Ordering::Relaxed);
+    state.human_mouse.store(human, Ordering::Relaxed);
+    *state.speed.lock() = speed;
+    match guard_fps {
+        Some(fps) => {
+            state.frame_guard.store(true, Ordering::Relaxed);
+            state.frame_guard_auto.store(false, Ordering::Relaxed);
+            state.frame_guard_fps.store(fps, Ordering::Relaxed);
+        }
+        None => state.frame_guard.store(false, Ordering::Relaxed),
+    }
+    state.playing.store(true, Ordering::Relaxed);
+    let generation = state.play_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+    selftest::arm(data.events.len(), stall_at, stall_us);
+    let started = Instant::now();
+    playback_loop(state.clone(), data.clone(), generation);
+    let wall_ms = started.elapsed().as_millis();
+    let (trace, slips, slipped_us) = selftest::disarm();
+
+    // Lateness against the schedule the scheduler was actually working to, so a
+    // deliberate slip or a guard hold is not counted twice: those move the schedule.
+    let mut late: Vec<u64> =
+        trace.iter().map(|(due, act)| act.saturating_sub(*due)).collect();
+    let drift_us = trace
+        .last()
+        .map(|(due, act)| *act as i64 - *due as i64)
+        .unwrap_or(0);
+
+    // The point of the whole exercise: after a stall, does the backlog go out as a
+    // burst? A healthy run has gaps near the recorded spacing; a catch-up storm has
+    // a long run of dispatches microseconds apart.
+    let mut longest_burst = 0usize;
+    let mut current = 0usize;
+    for w in trace.windows(2) {
+        if w[1].1.saturating_sub(w[0].1) < 500 {
+            current += 1;
+            longest_burst = longest_burst.max(current);
+        } else {
+            current = 0;
+        }
+    }
+
+    let n = late.len().max(1) as f64;
+    let mean_us = late.iter().sum::<u64>() as f64 / n;
+    late.sort_unstable();
+    let at = |q: f64| -> u64 {
+        if late.is_empty() {
+            0
+        } else {
+            late[(((late.len() - 1) as f64) * q).round() as usize]
+        }
+    };
+
+    TimingReport {
+        label: label.to_string(),
+        dispatched: trace.len(),
+        mean_us,
+        p50_us: at(0.5),
+        p99_us: at(0.99),
+        max_us: late.last().copied().unwrap_or(0),
+        drift_us,
+        slips,
+        slipped_ms: slipped_us / 1000,
+        longest_burst,
+        guard_added_ms: state.fg_added_us.load(Ordering::Relaxed) / 1000,
+        wall_ms,
+    }
+}
+
+/// Median of `n` runs. Screen capture varies enough that one sample is a rumour.
+fn median_ms(n: usize, mut f: impl FnMut()) -> f64 {
+    let mut v: Vec<u128> = (0..n)
+        .map(|_| {
+            let t = Instant::now();
+            f();
+            t.elapsed().as_micros()
+        })
+        .collect();
+    v.sort_unstable();
+    v[v.len() / 2] as f64 / 1000.0
+}
+
+/// The top-left `w` x `h` of a frame, so search cost can be measured against
+/// different haystack sizes without re-capturing and inheriting capture's noise.
+fn crop_frame(hay: &vision::Frame, w: u32, h: u32) -> vision::Frame {
+    let (w, h) = (w.min(hay.w), h.min(hay.h));
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h {
+        let src = (row * hay.w * 4) as usize;
+        rgba.extend_from_slice(&hay.rgba[src..src + (w * 4) as usize]);
+    }
+    vision::Frame { x: hay.x, y: hay.y, w, h, rgba }
+}
+
+/// A square cut out of whatever is on screen, which will therefore match.
+fn crop_template(hay: &vision::Frame, at: u32, size: u32, name: &str) -> vision::Template {
+    let size = size.min(hay.w.saturating_sub(at)).min(hay.h.saturating_sub(at)).max(2);
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for row in 0..size {
+        let src = (((at + row) * hay.w + at) * 4) as usize;
+        rgba.extend_from_slice(&hay.rgba[src..src + (size * 4) as usize]);
+    }
+    vision::Template { w: size, h: size, rgba, name: name.to_string() }
+}
+
+/// Random pixels, which will not match anything on screen.
+fn noise_template(size: u32, name: &str) -> vision::Template {
+    let mut rng = Rng::new();
+    let mut rgba = vec![255u8; (size * size * 4) as usize];
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = rng.below(256) as u8;
+        px[1] = rng.below(256) as u8;
+        px[2] = rng.below(256) as u8;
+    }
+    vision::Template { w: size, h: size, rgba, name: name.to_string() }
+}
+
+fn run_vision_selftest() -> Result<()> {
+    let (vx, vy, vw, vh) = platform::virtual_screen_rect();
+    let mpx = |w: u32, h: u32| (w as f64 * h as f64) / 1_000_000.0;
+    println!("Self-test: vision and OCR");
+    println!(
+        "Virtual screen: {vw}x{vh} at ({vx},{vy}), {:.2} megapixels\n",
+        mpx(vw as u32, vh as u32)
+    );
+
+    // ---- capture -----------------------------------------------------------
+    println!("Screen capture");
+    println!("{:<14} {:>9} {:>9} {:>8} {:>10}", "region", "Mpx", "ms", "MB", "ms/Mpx");
+    let sizes: Vec<(i32, i32)> = [(320, 240), (640, 480), (1280, 720), (1920, 1080), (vw, vh)]
+        .into_iter()
+        .filter(|(w, h)| *w <= vw && *h <= vh)
+        .collect();
+    for (w, h) in &sizes {
+        let (w, h) = (*w, *h);
+        let ms = median_ms(7, || {
+            let _ = platform::capture(vx, vy, w, h);
+        });
+        let m = mpx(w as u32, h as u32);
+        println!(
+            "{:<14} {:>9.2} {:>9.1} {:>8.1} {:>10.1}",
+            format!("{w}x{h}"),
+            m,
+            ms,
+            (w as f64 * h as f64 * 4.0) / 1_048_576.0,
+            if m > 0.0 { ms / m } else { 0.0 }
+        );
+    }
+
+    let Some(hay) = platform::capture(vx, vy, vw, vh) else {
+        println!("\nCould not capture the screen - the rest of this test needs it.");
+        return Ok(());
+    };
+
+    // ---- search, by template size -------------------------------------------
+    // `find` has no early exit: it sweeps every candidate and returns the best one.
+    // So a miss should cost what a hit costs, and if it does not, that is worth
+    // knowing - it would mean a script's poll rate depends on what is on screen.
+    println!("\nTemplate search, single scale, whole screen as haystack");
+    println!(
+        "{:<16} {:>9} {:>10} {:>9} {:>8}",
+        "template", "hit ms", "miss ms", "score", "err px"
+    );
+    for size in [32u32, 64, 128, 256] {
+        if size + 8 >= hay.w.min(hay.h) {
+            continue;
+        }
+        let hit_tpl = crop_template(&hay, size, size, "hit");
+        let miss_tpl = noise_template(size, "miss");
+        let hit_ms = median_ms(5, || {
+            let _ = vision::find(&hay, &hit_tpl, false);
+        });
+        let miss_ms = median_ms(5, || {
+            let _ = vision::find(&hay, &miss_tpl, false);
+        });
+        // Speed means nothing if the answer moved: the template was cut from a known
+        // spot, so the hit has to come back pointing at it.
+        let found = vision::find(&hay, &hit_tpl, false);
+        let want_x = hay.x + (size + size / 2) as i32;
+        let want_y = hay.y + (size + size / 2) as i32;
+        let (score, err) = match found {
+            Some(h) => (h.score, (h.x - want_x).abs().max((h.y - want_y).abs())),
+            None => (0.0, -1),
+        };
+        println!(
+            "{:<16} {:>9.1} {:>10.1} {:>9.3} {:>8}",
+            format!("{size}x{size}"),
+            hit_ms,
+            miss_ms,
+            score,
+            err
+        );
+    }
+
+    // ---- search, by haystack size -------------------------------------------
+    println!("\nSearch cost against haystack size, 64x64 template");
+    println!("{:<16} {:>9} {:>9} {:>10}", "haystack", "Mpx", "ms", "ms/Mpx");
+    let tpl64 = crop_template(&hay, 64, 64, "probe");
+    for (w, h) in &sizes {
+        let sub = crop_frame(&hay, *w as u32, *h as u32);
+        if sub.w < 128 || sub.h < 128 {
+            continue;
+        }
+        let ms = median_ms(5, || {
+            let _ = vision::find(&sub, &tpl64, false);
+        });
+        let m = mpx(sub.w, sub.h);
+        println!(
+            "{:<16} {:>9.2} {:>9.1} {:>10.1}",
+            format!("{}x{}", sub.w, sub.h),
+            m,
+            ms,
+            if m > 0.0 { ms / m } else { 0.0 }
+        );
+    }
+
+    let multi_ms = median_ms(3, || {
+        let _ = vision::find(&hay, &tpl64, true);
+    });
+    println!("\nThe same 64x64 template with 'try other scales' on: {multi_ms:.1} ms");
+
+    // ---- what a script step actually costs ----------------------------------
+    let step_ms = median_ms(5, || {
+        if let Some(f) = platform::capture(vx, vy, vw, vh) {
+            let _ = vision::find(&f, &tpl64, false);
+        }
+    });
+    println!(
+        "\nOne script image step, capture and search over the whole screen: {step_ms:.1} ms\n\
+         A `While` loop polling for that picture therefore runs at about {:.1} checks \
+         per second.",
+        if step_ms > 0.0 { 1000.0 / step_ms } else { 0.0 }
+    );
+
+    // ---- OCR ----------------------------------------------------------------
+    println!("\nText recognition");
+    println!("{:<14} {:>9} {:>8}", "region", "ms", "lines");
+    for (w, h) in [(200, 80), (400, 200), (800, 600)] {
+        if w > vw || h > vh {
+            continue;
+        }
+        let mut lines = 0usize;
+        let mut failed: Option<String> = None;
+        let ms = median_ms(3, || match ocr::read_region(vx, vy, w, h) {
+            Ok(boxes) => lines = boxes.len(),
+            Err(e) => failed = Some(e.to_string()),
+        });
+        match &failed {
+            Some(e) => {
+                println!("{:<14} {:>9} {:>8}   {e}", format!("{w}x{h}"), "-", "-");
+                break;
+            }
+            None => println!("{:<14} {:>9.1} {:>8}", format!("{w}x{h}"), ms, lines),
+        }
+    }
+
+    println!(
+        "\nHow to read this:\n\
+         - The step cost is the one that matters. It is the floor under how often a\n\
+           script can look at the screen, and nothing in a `Wait for` or a `While` can\n\
+           beat it.\n\
+         - hit and miss columns should be near-equal. `find` has no early exit, so a\n\
+           script polling for a button that is not there yet pays the same as one that\n\
+           finds it immediately. Predictable, if not cheap.\n\
+         - ms/Mpx says how the cost scales. Multiply it by 8.29 for a 4K screen or by\n\
+           the total area of a multi-monitor desktop, which is what a script step\n\
+           actually sweeps.\n\
+         - A zero in the lines column means OCR ran but read nothing where it looked,\n\
+           so the timing is for an empty region. Point it at some text to price a real\n\
+           read.\n\
+         - err px is how far the hit landed from where the template was cut out. It has\n\
+           to stay at 0 or 1. A faster search that answers in the wrong place is not a\n\
+           faster search."
+    );
+    Ok(())
+}
+
+/// Hammers the playback lifecycle looking for races.
+///
+/// Everything here is one transition away from another one: start while a previous
+/// run is still winding down, pause between the schedule check and the send, stop
+/// during a frame-guard hold. None of it shows up in ordinary use, because ordinary
+/// use makes one transition every few minutes rather than a hundred a second.
+///
+/// Recording is deliberately left out. Its lifecycle installs global hooks and would
+/// capture whatever the machine's owner did for the next ten minutes, and the races
+/// worth hunting - generation cancellation, released presses, the pause clock - all
+/// live on the playback side.
+fn run_churn_selftest(seconds: u64) -> Result<()> {
+    let (tx, _rx) = unbounded();
+    let state = AppState::new(tx);
+    // Long enough that a run is almost always in progress when the next transition
+    // arrives, which is the whole point.
+    *state.macro_data.lock() = synthetic_macro(4000, 5_000);
+    state.loop_play.store(true, Ordering::Relaxed);
+    state.absolute_mouse.store(true, Ordering::Relaxed);
+    *state.speed.lock() = 1.0;
+
+    selftest::arm_dry();
+    println!("Self-test: lifecycle churn");
+    println!("{seconds} s, no input is actually sent.\n");
+
+    // If a transition wedges, nothing below will ever report it - so something has to
+    // be watching from outside.
+    let beat = Arc::new(AtomicU64::new(0));
+    {
+        let beat = beat.clone();
+        std::thread::spawn(move || {
+            let mut last = 0u64;
+            let mut idle = 0u32;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let now = beat.load(Ordering::Relaxed);
+                idle = if now == last { idle + 1 } else { 0 };
+                last = now;
+                if idle >= 30 {
+                    println!("\nDEADLOCK: no transition completed for 30 s. Aborting.");
+                    std::process::exit(2);
+                }
+            }
+        });
+    }
+
+    let mut rng = Rng::new();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(seconds);
+    let mut transitions = 0u64;
+    let mut stuck_presses = 0u64;
+    let mut extra_releases = 0u64;
+    let mut overlapped = 0u64;
+    let mut blamed = [0u64; 7];
+    let mut next_report = started + Duration::from_secs(30);
+
+    while Instant::now() < deadline {
+        let pick = rng.below(7) as usize;
+        match pick {
+            0 => start_playback(&state),
+            1 => stop_playback(&state),
+            2 => toggle_playback(&state),
+            3 => toggle_pause(&state),
+            4 => state.skip_step.store(true, Ordering::Relaxed),
+            5 => *state.speed.lock() = 0.1 + (rng.below(30) as f64) / 10.0,
+            _ => {
+                let on = rng.below(2) == 1;
+                state.frame_guard.store(on, Ordering::Relaxed);
+                state.frame_guard_fps.store(5 + rng.below(236), Ordering::Relaxed);
+            }
+        }
+        transitions += 1;
+        beat.fetch_add(1, Ordering::Relaxed);
+
+        // Two loops at once would mean a generation escaped cancellation.
+        if selftest::live() > 1 {
+            overlapped += 1;
+        }
+
+        // Every so often, stop properly and check that nothing was left held down.
+        if rng.below(20) == 0 {
+            stop_playback(&state);
+            // Waiting for `playing` alone is not enough: the loop clears that flag
+            // and then releases what it held, so a check racing in between would
+            // report a press that was about to be let go.
+            let settle = Instant::now() + Duration::from_millis(600);
+            while (state.playing.load(Ordering::Relaxed) || selftest::live() > 0)
+                && Instant::now() < settle
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let held = selftest::held();
+            if held > 0 {
+                stuck_presses += 1;
+                blamed[pick] += 1;
+                println!(
+                    "  STUCK PRESS: {held} still down after a stop, transition {transitions}"
+                );
+            } else if held < 0 {
+                extra_releases += 1;
+                blamed[pick] += 1;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(1 + rng.below(20)));
+
+        if Instant::now() >= next_report {
+            println!(
+                "  {:>4} s  {transitions} transitions, live {}, peak {}, held {}",
+                started.elapsed().as_secs(),
+                selftest::live(),
+                selftest::peak_live(),
+                selftest::held()
+            );
+            next_report += Duration::from_secs(30);
+        }
+    }
+
+    stop_playback(&state);
+    let settle = Instant::now() + Duration::from_secs(3);
+    while (state.playing.load(Ordering::Relaxed) || selftest::live() > 0)
+        && Instant::now() < settle
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let live = selftest::live();
+    let peak = selftest::peak_live();
+    println!("\n{:<36} {}", "transitions", transitions);
+    println!("{:<36} {}", "playback loops still running", live);
+    println!("{:<36} {}", "most loops running at once", peak);
+    println!("{:<36} {}", "moments with two loops at once", overlapped);
+    println!("{:<36} {}", "stops that left a press down", stuck_presses);
+    println!("{:<36} {}", "stops with an unmatched release", extra_releases);
+    if stuck_presses + extra_releases > 0 {
+        const NAMES: [&str; 7] =
+            ["start", "stop", "toggle", "pause", "skip", "speed", "guard"];
+        print!("  last transition before each:");
+        for (i, n) in NAMES.iter().enumerate() {
+            if blamed[i] > 0 {
+                print!("  {n}={}", blamed[i]);
+            }
+        }
+        println!();
+    }
+
+    let serious = live > 0 || peak > 1 || overlapped > 0 || stuck_presses > 0;
+    println!(
+        "\n{}",
+        if serious {
+            "NOT clean. A press left down, or a generation that escaped cancellation, \
+             is a real fault - the counters above say which."
+        } else if extra_releases > 0 {
+            "No press was ever left down and no generation escaped cancellation.\n\
+             The unmatched releases come from pausing mid-press: the pause lets the \
+             button go, and on resume the recording plays its own release for a button \
+             that is no longer held. Harmless to Windows, but it is a real deviation \
+             from the recording and the count above says how often it happens."
+        } else {
+            "Clean. Every stop released what it was holding, no generation escaped \
+             cancellation, and nothing wedged."
+        }
+    );
+    Ok(())
+}
+
+/// Runs for hours doing what a long unattended session does, and records what it
+/// costs while doing it.
+///
+/// Leaks are invisible below an hour, and a soak that needs somebody sitting in front
+/// of Task Manager writing numbers down is a soak that does not get run. So it samples
+/// itself: private bytes, open handles and GDI objects, which between them cover the
+/// three things this application allocates in bulk - replay buffers, the WinRT objects
+/// behind OCR, and the bitmaps behind screen capture.
+fn run_soak_selftest(hours: f64) -> Result<()> {
+    let (tx, _rx) = unbounded();
+    let state = AppState::new(tx);
+    *state.macro_data.lock() = synthetic_macro(2000, 5_000);
+    state.loop_play.store(true, Ordering::Relaxed);
+    state.absolute_mouse.store(true, Ordering::Relaxed);
+    state.frame_guard.store(true, Ordering::Relaxed);
+    state.frame_guard_auto.store(false, Ordering::Relaxed);
+    state.frame_guard_fps.store(30, Ordering::Relaxed);
+    *state.speed.lock() = 1.0;
+
+    selftest::arm_dry();
+    println!("Self-test: soak");
+    println!(
+        "{hours:.1} h. Replay runs continuously; the screen is captured every 2 s and \n\
+         read every 5 s, which is what a script polling for a picture does. No input \n\
+         is sent, but the screen is being looked at, so leave something on it.\n"
+    );
+
+    // A twelve-hour run that stops doing anything after ten minutes reports nothing
+    // useful unless something is watching where it stopped. Phases are numbered so a
+    // second thread can name the one the loop is stuck in.
+    const PHASES: [&str; 5] =
+        ["waiting", "capturing the screen", "reading text", "sampling cost", "restarting"];
+    let phase = Arc::new(AtomicUsize::new(0));
+    let beat = Arc::new(AtomicU64::new(0));
+    {
+        let (phase, beat) = (phase.clone(), beat.clone());
+        std::thread::spawn(move || {
+            let mut last = 0u64;
+            let mut idle = 0u64;
+            loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let now = beat.load(Ordering::Relaxed);
+                idle = if now == last { idle + 30 } else { 0 };
+                last = now;
+                if idle >= 120 && idle % 120 == 0 {
+                    println!(
+                        "  STALLED {idle}s in: {}",
+                        PHASES[phase.load(Ordering::Relaxed).min(4)]
+                    );
+                }
+            }
+        });
+    }
+
+    // The console stops accepting writes while text is selected in it, and a soak
+    // whose only record is a console it cannot write to has no record at all.
+    let csv = paths::log_dir().join("soak.csv");
+    let append = |line: &str| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&csv) {
+            let _ = writeln!(f, "{line}");
+        }
+    };
+    append("minute,private_mb,handles,gdi,peak_gdi,captures,reads,restarts,slept_s,worst_stall_s");
+    println!("A copy of every row is appended to {}\n", csv.display());
+
+    start_playback(&state);
+    let (vx, vy, vw, vh) = platform::virtual_screen_rect();
+    let tpl = platform::capture(vx, vy, vw.min(256), vh.min(256))
+        .map(|f| vision::Template { w: f.w, h: f.h, rgba: f.rgba, name: "soak".into() });
+
+    let started = Instant::now();
+    let end = started + Duration::from_secs_f64(hours * 3600.0);
+    let mut next_capture = started;
+    let mut next_ocr = started;
+    let mut next_report = started;
+    let mut captures = 0u64;
+    let mut reads = 0u64;
+    let mut restarts = 0u64;
+    let mut first: Option<(u64, u32, u32)> = None;
+
+    println!(
+        "{:>8} {:>12} {:>10} {:>8} {:>10} {:>9} {:>9} {:>9}",
+        "elapsed", "private MB", "handles", "GDI", "captures", "reads", "restarts", "slept s"
+    );
+
+    // Two clocks: `Instant` stops while the machine is asleep, wall time does not.
+    // Their divergence is how a suspended laptop is told apart from a wedged loop.
+    let wall0 = std::time::SystemTime::now();
+    let mut worst_stall = 0u64;
+    let mut worst_phase = 0usize;
+    let mut peak_gdi = 0u32;
+    let mut ocr_failures = 0u64;
+    let mut ocr_enabled = true;
+
+    while Instant::now() < end {
+        let now = Instant::now();
+        beat.fetch_add(1, Ordering::Relaxed);
+
+        let mark = |p: usize, phase: &AtomicUsize| {
+            phase.store(p, Ordering::Relaxed);
+            Instant::now()
+        };
+
+        if !state.playing.load(Ordering::Relaxed) {
+            let t = mark(4, &phase);
+            restarts += 1;
+            start_playback(&state);
+            let took = t.elapsed().as_secs();
+            if took > worst_stall {
+                worst_stall = took;
+                worst_phase = 4;
+            }
+        }
+
+        if now >= next_capture {
+            let t = mark(1, &phase);
+            if let (Some(frame), Some(t2)) = (platform::capture(vx, vy, vw, vh), tpl.as_ref())
+            {
+                let _ = vision::find(&frame, t2, false);
+                captures += 1;
+            }
+            let took = t.elapsed().as_secs();
+            if took > worst_stall {
+                worst_stall = took;
+                worst_phase = 1;
+            }
+            next_capture = Instant::now() + Duration::from_secs(2);
+        }
+
+        if ocr_enabled && now >= next_ocr {
+            let t = mark(2, &phase);
+            match ocr::read_region(vx, vy, 400.min(vw), 200.min(vh)) {
+                Ok(_) => reads += 1,
+                Err(_) => ocr_failures += 1,
+            }
+            let took = t.elapsed().as_secs();
+            if took > worst_stall {
+                worst_stall = took;
+                worst_phase = 2;
+            }
+            // One slow read is the machine being busy. A minute is the engine not
+            // coming back, and there is no sense spending eleven hours finding that
+            // out over and over.
+            if took >= 60 {
+                ocr_enabled = false;
+                println!("  Text recognition took {took}s and has been switched off for the rest of the run.");
+            }
+            next_ocr = Instant::now() + Duration::from_secs(5);
+        }
+
+        let (_, _, gdi_now) = platform::process_cost();
+        peak_gdi = peak_gdi.max(gdi_now);
+
+        if now >= next_report {
+            let t = mark(3, &phase);
+            let (private, handles, gdi) = platform::process_cost();
+            let mono = started.elapsed().as_secs();
+            let wall = wall0.elapsed().map(|d| d.as_secs()).unwrap_or(mono);
+            let slept = wall.saturating_sub(mono);
+            if first.is_none() && mono >= 300 {
+                // The first five minutes are warm-up: caches fill and allocators
+                // settle, and counting that as growth would cry wolf every time.
+                first = Some((private, handles, gdi));
+            }
+            let mb = private as f64 / 1_048_576.0;
+            println!(
+                "{:>7}m {:>12.1} {:>10} {:>8} {:>10} {:>9} {:>9} {:>9}",
+                mono / 60,
+                mb,
+                handles,
+                gdi,
+                captures,
+                reads,
+                restarts,
+                slept
+            );
+            append(&format!(
+                "{},{:.1},{},{},{},{},{},{},{},{}",
+                mono / 60,
+                mb,
+                handles,
+                gdi,
+                peak_gdi,
+                captures,
+                reads,
+                restarts,
+                slept,
+                worst_stall
+            ));
+            let _ = t;
+            // Every minute for the first ten, then every ten. Ten minutes of silence
+            // at the start says nothing about whether the loop is alive, which is the
+            // first thing anybody watching a soak wants to know.
+            let interval = if mono < 600 { 60 } else { 600 };
+            next_report = Instant::now() + Duration::from_secs(interval);
+        }
+
+        phase.store(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    stop_playback(&state);
+    std::thread::sleep(Duration::from_secs(2));
+    let (private, handles, gdi) = platform::process_cost();
+    let mono = started.elapsed().as_secs();
+    let wall = wall0.elapsed().map(|d| d.as_secs()).unwrap_or(mono);
+    let slept = wall.saturating_sub(mono);
+    println!("\n{:<30} {}", "captures", captures);
+    println!("{:<30} {}", "OCR reads", reads);
+    println!("{:<30} {}", "OCR failures", ocr_failures);
+    println!("{:<30} {}", "playback restarts", restarts);
+    println!("{:<30} {}", "peak GDI objects", peak_gdi);
+    println!("{:<30} {} s", "time the machine was asleep", slept);
+    println!(
+        "{:<30} {} s in: {}",
+        "longest single stall", worst_stall, PHASES[worst_phase]
+    );
+
+    // A run that spent most of itself asleep or wedged has not soaked anything, and
+    // saying so is more use than a growth figure computed from four samples.
+    let expected = (mono / 2).max(1);
+    if captures * 4 < expected {
+        println!(
+            "\nOnly {captures} captures in {} minutes - this run did far less work than \
+             it should have. Look at the stall and sleep figures above before reading \
+             anything into the growth numbers.",
+            mono / 60
+        );
+    }
+
+    match first {
+        Some((p0, h0, g0)) => {
+            let dp = private as f64 / 1_048_576.0 - p0 as f64 / 1_048_576.0;
+            let dh = handles as i64 - h0 as i64;
+            let dg = gdi as i64 - g0 as i64;
+            println!("\ngrowth since the five-minute mark:");
+            println!("  {:<28} {dp:+.1} MB", "private bytes");
+            println!("  {:<28} {dh:+}", "handles");
+            println!("  {:<28} {dg:+}", "GDI objects");
+            // A few MB of allocator drift over hours is normal; a steady climb is not,
+            // and handles or GDI objects should be flat to within a handful.
+            let ok = dp < 32.0 && dh.abs() < 50 && dg.abs() < 50;
+            println!(
+                "\n{}",
+                if ok {
+                    "Flat. Nothing accumulated over the run."
+                } else {
+                    "Something is accumulating. Compare the per-sample rows above: a \
+                     straight climb points at a leak, a step points at one operation."
+                }
+            );
+        }
+        None => println!("\nToo short to judge growth - run for at least fifteen minutes."),
+    }
+    Ok(())
+}
+
+fn run_selftest(which: &str) -> Result<()> {
+    // `churn=600` runs for ten minutes; plain `churn` for five.
+    let (name, arg) = match which.split_once('=') {
+        Some((n, a)) => (n, a.parse::<u64>().ok()),
+        None => (which, None),
+    };
+    match name {
+        "timing" => run_timing_selftest(),
+        "vision" => run_vision_selftest(),
+        "churn" => run_churn_selftest(arg.unwrap_or(300).clamp(5, 7200)),
+        "soak" => run_soak_selftest((arg.unwrap_or(12) as f64).clamp(0.1, 48.0)),
+        _ => {
+            println!(
+                "unknown self-test '{which}'. \
+                 Available: timing, vision, churn[=seconds], soak[=hours]"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn run_timing_selftest() -> Result<()> {
+    // 3000 events 5 ms apart is 15 seconds per scenario: long enough for drift to
+    // show, short enough that the whole set runs in about two minutes.
+    const N: usize = 3000;
+    const GAP_US: u64 = 5_000;
+    let data = synthetic_macro(N, GAP_US);
+    // Same order of length, but paced the way a person clicks.
+    let paced = human_paced_macro(45);
+    println!("Self-test: replay timing");
+    println!("{N} events, {} ms apart, no input is actually sent.\n", GAP_US / 1000);
+
+    let runs = [
+        timing_scenario("baseline 1.0x", &data, 1.0, None, false, usize::MAX, 0),
+        timing_scenario("slow 0.1x", &data, 0.1, None, false, usize::MAX, 0),
+        timing_scenario("fast 3.0x", &data, 3.0, None, false, usize::MAX, 0),
+        timing_scenario("400 ms stall", &data, 1.0, None, false, N / 2, 400_000),
+        timing_scenario("guard 30 FPS", &data, 1.0, Some(30), false, usize::MAX, 0),
+        timing_scenario("guard + stall", &data, 1.0, Some(30), false, N / 2, 400_000),
+        timing_scenario("human movement", &data, 1.0, None, true, usize::MAX, 0),
+        timing_scenario("paced, no guard", &paced, 1.0, None, false, usize::MAX, 0),
+        timing_scenario("paced + guard", &paced, 1.0, Some(30), false, usize::MAX, 0),
+    ];
+
+    println!(
+        "{:<16} {:>6} {:>9} {:>8} {:>9} {:>9} {:>8} {:>6} {:>8} {:>7} {:>8}",
+        "scenario",
+        "events",
+        "mean us",
+        "p50 us",
+        "p99 us",
+        "max us",
+        "drift ms",
+        "slips",
+        "slip ms",
+        "burst",
+        "guard ms"
+    );
+    for r in &runs {
+        println!(
+            "{:<16} {:>6} {:>9.0} {:>8} {:>9} {:>9} {:>8} {:>6} {:>8} {:>7} {:>8}",
+            r.label,
+            r.dispatched,
+            r.mean_us,
+            r.p50_us,
+            r.p99_us,
+            r.max_us,
+            r.drift_us / 1000,
+            r.slips,
+            r.slipped_ms,
+            r.longest_burst,
+            r.guard_added_ms
+        );
+    }
+
+    println!("\nwall clock per scenario:");
+    for r in &runs {
+        println!("  {:<16} {:>6} ms", r.label, r.wall_ms);
+    }
+
+    println!(
+        "\nHow to read this:\n\
+         - p99 is the honest accuracy figure. Under one frame of whatever the target\n\
+           renders at is fine; tens of milliseconds on an idle machine is not.\n\
+         - drift is the last event's lateness. It should not grow with the run.\n\
+         - burst is the longest run of dispatches under 500 us apart. On a 5 ms\n\
+           recording anything above 1 means the backlog went out in a clump, which is\n\
+           the failure the slip logic exists to prevent. The stall rows are the ones\n\
+           that matter: they should slip once and keep burst low.\n\
+         - guard ms is what the frame guard added. Compare the two `paced` rows, not\n\
+           the `guard 30 FPS` one: the evenly spaced macro clicks every 15 ms, which no\n\
+           person does, so the guard has to stretch every press and the cost is an\n\
+           artefact of the test shape rather than a forecast for real use."
+    );
+    Ok(())
+}
+
 fn run_headless(data: MacroData, loops: u64, speed: f64, absolute: bool, delay_ms: u64) -> Result<()> {
     let (tx, rx) = unbounded();
     let state = AppState::new(tx);
@@ -9275,6 +10448,11 @@ fn main() -> Result<()> {
             print!("{HELP_TEXT}");
         }
         return Ok(());
+    }
+
+    if let Some(which) = args.selftest.as_deref() {
+        platform::attach_parent_console();
+        return run_selftest(which);
     }
 
     let mut config = load_config();
@@ -9401,13 +10579,404 @@ mod tests {
         }
     }
 
+    /// A generator with a fixed seed. `Rng::new` seeds itself from the clock and the
+    /// process id, which is right for jitter and wrong for a test that has to fail
+    /// the same way twice.
+    fn seeded(seed: u64) -> Rng {
+        Rng(if seed == 0 { 1 } else { seed })
+    }
+
+    /// A macro with a bit of everything, so the operations that filter by event kind
+    /// have something to filter.
+    fn mixed(n: usize) -> MacroData {
+        let events: Vec<MacroEvent> = (0..n)
+            .map(|i| {
+                let t = i as u64 * 1_000;
+                match i % 3 {
+                    0 => ev(t),
+                    1 => btn(t, i % 2 == 0, 10, 20),
+                    _ => key(t, 65, i % 2 == 0),
+                }
+            })
+            .collect();
+        let dur = events.last().map(|e| e.t_us).unwrap_or(0);
+        MacroData::new(events, dur)
+    }
+
+    // ---- fuzzing -----------------------------------------------------------
+
     #[test]
-    fn roundtrip_v2() {
+    fn editor_operations_survive_any_range() {
+        // Ranges here are deliberately wrong: reversed, past the end, both. The UI
+        // clamps them, but a saved script can name events that a later edit deleted.
+        // Tests build without `--release`, so overflow checks are on and any
+        // arithmetic that wraps in production panics here instead.
+        let mut rng = seeded(0xC0FFEE);
+        for round in 0..6_000u32 {
+            let mut data = mixed(rng.below(10) as usize + 1);
+            let before = data.events.len();
+            let from = rng.below(15) as usize;
+            let to = rng.below(15) as usize;
+
+            match round % 8 {
+                0 => editor_delete_range(&mut data, from, to),
+                1 => editor_crop(&mut data, from, to),
+                2 => {
+                    editor_replace_button(
+                        &mut data,
+                        from,
+                        to,
+                        MouseButton::Left,
+                        MouseButton::Right,
+                    );
+                }
+                3 => editor_shift_coords(&mut data, from, to, 40, -40),
+                4 => editor_insert_delay(&mut data, from, rng.below(600_000)),
+                5 => editor_scale(&mut data, rng.below(4000) as f64 / 100.0),
+                6 => editor_drop_moves(&mut data),
+                _ => editor_trim_lead(&mut data),
+            }
+
+            assert!(
+                data.events.len() <= before,
+                "round {round}: an edit grew the recording"
+            );
+            assert!(
+                data.events.windows(2).all(|w| w[0].t_us <= w[1].t_us),
+                "round {round}: timestamps went backwards"
+            );
+            assert!(
+                data.duration_us >= data.last_t(),
+                "round {round}: duration {} is behind the last event {}",
+                data.duration_us,
+                data.last_t()
+            );
+            assert!(data.cycle_len_us() >= 1, "round {round}: zero-length cycle");
+        }
+    }
+
+    #[test]
+    fn editor_operations_survive_an_empty_recording() {
+        // Every one of these can be reached with nothing recorded yet.
+        let run = |f: &dyn Fn(&mut MacroData)| {
+            let mut d = MacroData::new(Vec::new(), 0);
+            f(&mut d);
+            assert!(d.events.is_empty());
+        };
+        run(&|d| editor_delete_range(d, 0, 9));
+        run(&|d| editor_crop(d, 3, 1));
+        run(&|d| editor_shift_coords(d, 0, 5, 10, 10));
+        run(&|d| editor_insert_delay(d, 7, 100));
+        run(&|d| editor_scale(d, 2.0));
+        run(&editor_drop_moves);
+        run(&editor_trim_lead);
+        run(&|d| editor_delete_one(d, 4));
+        run(&|d| editor_duplicate(d, 4));
+        run(&|d| editor_set_time(d, 4, 500));
+    }
+
+    #[test]
+    fn an_absurd_inserted_pause_saturates_instead_of_wrapping() {
+        let mut data = mixed(4);
+        editor_insert_delay(&mut data, 0, u64::MAX);
+        assert!(data.duration_us >= data.last_t());
+    }
+
+    #[test]
+    fn single_index_edits_survive_any_index() {
+        let mut rng = seeded(0xBADC0DE);
+        for _ in 0..2_000 {
+            let mut data = mixed(rng.below(8) as usize + 1);
+            let i = rng.below(12) as usize;
+            match rng.below(4) {
+                0 => editor_delete_one(&mut data, i),
+                1 => editor_duplicate(&mut data, i),
+                2 => editor_set_time(&mut data, i, rng.below(50_000)),
+                _ => editor_set_event(&mut data, i, InputEventKind::Key {
+                    vk: 32,
+                    scan: 0,
+                    down: true,
+                    extended: false,
+                }),
+            }
+            assert!(data.events.windows(2).all(|w| w[0].t_us <= w[1].t_us));
+        }
+    }
+
+    // ---- settings ----------------------------------------------------------
+
+    #[test]
+    fn a_config_with_every_key_missing_still_loads() {
+        // The documented promise for a config written by an older build.
+        let c: AppConfig = serde_json::from_str("{}").unwrap();
+        let d = AppConfig::default();
+        assert_eq!(c.speed, d.speed);
+        assert_eq!(c.frame_guard, d.frame_guard);
+        assert!(!c.frame_guard, "the guard must stay off unless asked for");
+    }
+
+    #[test]
+    fn sanitize_pulls_absurd_values_back_into_range() {
+        let json = r#"{
+            "speed": 1000000.0, "play_count_limit": 900000, "jitter_pct": 900000,
+            "human_curve": 900000, "mouse_jitter_px": 900, "frame_guard_fps": 900000,
+            "mouse_sample_ms": 900000, "schedule_h": 900, "schedule_m": 900,
+            "time_limit_h": 900000, "time_limit_m": 900, "time_limit_s": 900,
+            "shutdown_delay_s": 900000, "pixel_tolerance": 900000, "pixel_mode": 900,
+            "repeat_delay_ms": 900000000, "img_threshold": 42.0,
+            "img_rw": 900000, "img_rh": 900000, "default_theme": 900, "default_lang": 900
+        }"#;
+        let mut c: AppConfig = serde_json::from_str(json).unwrap();
+        c.sanitize();
+        assert!((0.05..=10.0).contains(&c.speed));
+        assert!((1..=9999).contains(&c.play_count_limit));
+        assert!(c.jitter_pct <= 50);
+        assert!(c.human_curve <= 100);
+        assert!((0..=60).contains(&c.mouse_jitter_px));
+        assert!((5..=240).contains(&c.frame_guard_fps));
+        assert!((1..=100).contains(&c.mouse_sample_ms));
+        assert!(c.schedule_h <= 23 && c.schedule_m <= 59);
+        assert!(c.time_limit_h <= 240 && c.time_limit_m <= 59 && c.time_limit_s <= 59);
+        assert!(c.shutdown_delay_s <= 600);
+        assert!(c.pixel_tolerance <= 255 && c.pixel_mode <= 1);
+        assert!(c.repeat_delay_ms <= 600_000);
+        assert!((0.3..=1.0).contains(&c.img_threshold));
+        assert!(c.default_theme < THEME_NAMES.len());
+        assert!(c.default_lang <= 6);
+    }
+
+    #[test]
+    fn a_broken_float_falls_back_rather_than_poisoning_playback() {
+        // JSON cannot carry NaN, but a hand-edited file or a bad merge can.
+        let mut c = AppConfig::default();
+        c.speed = f64::NAN;
+        c.img_threshold = f64::INFINITY;
+        c.sanitize();
+        assert_eq!(c.speed, 1.0);
+        assert_eq!(c.img_threshold, 0.85);
+    }
+
+    #[test]
+    fn the_time_limit_survives_its_own_maximum() {
+        let mut c = AppConfig::default();
+        c.time_limit_h = 240;
+        c.time_limit_m = 59;
+        c.time_limit_s = 59;
+        c.sanitize();
+        assert_eq!(c.time_limit_us(), (240 * 3600 + 59 * 60 + 59) * 1_000_000);
+    }
+
+    // ---- macro files -------------------------------------------------------
+
+    #[test]
+    fn a_gzipped_macro_round_trips_through_the_disk() {
+        let dir = std::env::temp_dir().join("mr_stage2_gzip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.mrz");
+        let mut data = mixed(50);
+        data.script.push(ScriptStep {
+            kind: StepKind::Wait { ms: 250 },
+            enabled: true,
+        });
+        save_macro(&path, &data).unwrap();
+        let back = load_macro(&path).unwrap();
+        assert_eq!(back.events.len(), data.events.len());
+        assert_eq!(back.script.len(), 1);
+        // Worth having a number: this is the claim the documentation makes.
+        let raw = serde_json::to_vec(&data).unwrap().len();
+        let packed = std::fs::metadata(&path).unwrap().len() as usize;
+        assert!(packed < raw, "gzip made it bigger: {packed} vs {raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_macro_files_are_refused_not_survived() {
+        assert!(parse_macro("").is_err());
+        assert!(parse_macro("{").is_err());
+        assert!(parse_macro("[]").is_err(), "an empty macro has nothing to play");
+        assert!(parse_macro(r#"{"events":[]}"#).is_err());
+        assert!(parse_macro("null").is_err());
+        // A script that cannot be resolved must be refused at load, not half-run.
+        let bad = r#"{"events":[{"t_us":0,"kind":{"MouseMove":{"x":1,"y":1,"dx":0,"dy":0}}}],
+                      "script":[{"kind":{"If":{"cond":"Always"}},"enabled":true}]}"#;
+        assert!(parse_macro(bad).is_err());
+    }
+
+    // ---- script blocks -----------------------------------------------------
+
+    #[test]
+    fn an_empty_script_resolves_to_nothing() {
+        let b = resolve_blocks(&[]).unwrap();
+        assert!(b.end_of.is_empty() && b.else_of.is_empty() && b.start_of.is_empty());
+    }
+
+    #[test]
+    fn a_second_else_is_refused() {
+        let steps = vec![
+            ScriptStep { kind: StepKind::If { cond: Condition::Always }, enabled: true },
+            ScriptStep { kind: StepKind::Else, enabled: true },
+            ScriptStep { kind: StepKind::Else, enabled: true },
+            ScriptStep { kind: StepKind::EndIf, enabled: true },
+        ];
+        assert!(resolve_blocks(&steps).is_err());
+    }
+
+    #[test]
+    fn deep_nesting_resolves_without_running_out_of_stack() {
+        // Resolution is iterative; this fails loudly if that ever stops being true.
+        const DEPTH: usize = 500;
+        let mut steps = Vec::new();
+        for _ in 0..DEPTH {
+            steps.push(ScriptStep {
+                kind: StepKind::While { cond: Condition::Always },
+                enabled: true,
+            });
+        }
+        for _ in 0..DEPTH {
+            steps.push(ScriptStep { kind: StepKind::EndWhile, enabled: true });
+        }
+        let b = resolve_blocks(&steps).unwrap();
+        assert_eq!(b.end_of[0], Some(DEPTH * 2 - 1));
+        assert_eq!(b.end_of[DEPTH - 1], Some(DEPTH));
+    }
+
+    // ---- frame guard on automatic ------------------------------------------
+
+    #[test]
+    fn the_guard_follows_the_measurement_when_on_automatic() {
+        let (tx, _rx) = unbounded();
+        let state = AppState::new(tx);
+        state.frame_guard.store(true, Ordering::Relaxed);
+        state.frame_guard_auto.store(true, Ordering::Relaxed);
+        state.frame_guard_fps.store(60, Ordering::Relaxed);
+
+        // Nothing measured yet, so the configured 60 FPS stands in: two 16.6 ms frames.
+        let mut g = FrameGuard::new(&state);
+        assert!((32_000..=34_000).contains(&g.hold_us), "hold was {}", g.hold_us);
+
+        // The window turns out to manage about 15 FPS.
+        state.perf_frame_us.store(66_000, Ordering::Relaxed);
+        g.retune(&state);
+        assert!(g.hold_us > 120_000, "hold was {}", g.hold_us);
+
+        // A 3 % wobble is ignored: the guard must not become a source of jitter.
+        let steady = g.hold_us;
+        state.perf_frame_us.store(68_000, Ordering::Relaxed);
+        g.retune(&state);
+        assert_eq!(g.hold_us, steady);
+
+        // A real recovery is followed.
+        state.perf_frame_us.store(8_000, Ordering::Relaxed);
+        g.retune(&state);
+        assert!(g.hold_us < 20_000, "hold was {}", g.hold_us);
+    }
+
+    #[test]
+    fn a_measurement_is_ignored_when_automatic_is_off() {
+        let (tx, _rx) = unbounded();
+        let state = AppState::new(tx);
+        state.frame_guard.store(true, Ordering::Relaxed);
+        state.frame_guard_auto.store(false, Ordering::Relaxed);
+        state.frame_guard_fps.store(60, Ordering::Relaxed);
+        state.perf_frame_us.store(200_000, Ordering::Relaxed);
+        let mut g = FrameGuard::new(&state);
+        let before = g.hold_us;
+        g.retune(&state);
+        assert_eq!(g.hold_us, before);
+        assert!(before < 40_000);
+    }
+
+    #[test]
+    fn a_disabled_guard_ignores_the_measurement_too() {
+        let (tx, _rx) = unbounded();
+        let state = AppState::new(tx);
+        state.frame_guard.store(false, Ordering::Relaxed);
+        state.frame_guard_auto.store(true, Ordering::Relaxed);
+        state.perf_frame_us.store(200_000, Ordering::Relaxed);
+        let mut g = FrameGuard::new(&state);
+        g.retune(&state);
+        let up = InputEventKind::MouseButton {
+            button: MouseButton::Left,
+            down: false,
+            x: 0,
+            y: 0,
+        };
+        assert_eq!(g.extra_wait(&up, 0), 0);
+    }
+
+    // ---- responsiveness maths ----------------------------------------------
+
+    #[test]
+    fn setting_a_time_on_a_stale_selection_keeps_the_process_alive() {
+        // Found by the fuzz above; kept by name because the fuzz reports a round
+        // number and this reports the scenario: a selection outliving its recording.
+        let mut data = mixed(3);
+        editor_set_time(&mut data, 9, 1_000);
+        assert_eq!(data.events.len(), 3);
+        let mut empty = MacroData::new(Vec::new(), 0);
+        editor_set_time(&mut empty, 4, 1_000);
+        assert!(empty.events.is_empty());
+    }
+
+    #[test]
+    fn one_percent_low_means_the_worst_one_percent() {
+        // Ninety-nine good frames and one bad one. What a reader wants from a
+        // "1 % low" is the bad one; a 99th percentile would hand back a good one.
+        let mut v = vec![10_000u64; 99];
+        v.push(200_000);
+        assert_eq!(perf::summarize(&v).p99_us, 200_000);
+
+        // Four bad frames in four hundred: the worst 1 % is all four, averaged, so no
+        // single sample decides the figure the guard is sized from.
+        let mut w = vec![10_000u64; 396];
+        w.extend([100_000, 120_000, 140_000, 160_000]);
+        assert_eq!(perf::summarize(&w).p99_us, 130_000);
+    }
+
+    #[test]
+    fn summarize_handles_the_small_cases() {
+        let one = perf::summarize(&[5_000]);
+        assert_eq!(one.samples, 1);
+        assert_eq!(one.avg_us, 5_000);
+        assert_eq!(one.p99_us, 5_000);
+        assert_eq!(one.stutters, 0);
+
+        // A perfectly steady window has no hitches, however tight the numbers.
+        assert_eq!(perf::summarize(&[200; 400]).stutters, 0);
+
+        // Ordering must not matter: the samples arrive in whatever order they arrive.
+        let mut v: Vec<u64> = (1..=100).map(|i| i * 1_000).collect();
+        let ascending = perf::summarize(&v);
+        v.reverse();
+        let descending = perf::summarize(&v);
+        assert_eq!(ascending.p99_us, descending.p99_us);
+        assert_eq!(ascending.avg_us, descending.avg_us);
+        assert_eq!(ascending.worst_us, 100_000);
+    }
+
+    #[test]
+    fn text_matching_stays_forgiving_without_becoming_useless() {
+        assert!(ocr::text_matches("YOU  WIN !", "you win"));
+        assert!(!ocr::text_matches("you lose", "you win"));
+        assert!(!ocr::text_matches("", "claim"));
+        assert!(ocr::first_number("no digits here").is_none());
+    }
+
+    #[test]
+    fn a_saved_macro_comes_back_unchanged() {
         let data = MacroData::new(vec![ev(0), ev(1000)], 5000);
         let back: MacroData = serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
         assert_eq!(back.events.len(), 2);
         assert_eq!(back.duration_us, 5000);
-        assert_eq!(back.version, 2);
+        assert_eq!(back.version, format_version());
+    }
+
+    #[test]
+    fn a_file_with_no_version_field_is_read_as_the_current_one() {
+        // What every macro saved before the field existed looks like.
+        let data = parse_macro(r#"{"events":[{"t_us":0,"kind":{"MouseMove":{"x":1,"y":2,"dx":0,"dy":0}}}]}"#)
+            .unwrap();
+        assert_eq!(data.version, format_version());
     }
 
     #[test]
