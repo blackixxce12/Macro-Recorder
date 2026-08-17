@@ -240,6 +240,64 @@ mod paths {
     pub fn lang_dir() -> PathBuf {
         sub_dir("lang")
     }
+    pub fn templates_dir() -> PathBuf {
+        sub_dir("templates")
+    }
+
+    /// Creates the folders the documentation tells people to look for.
+    ///
+    /// `sub_dir` makes a folder the moment something touches it, which meant
+    /// `templates/` only appeared once a PNG had already been saved - no use to
+    /// somebody who wanted to drop one in beforehand.
+    pub fn ensure_dirs() {
+        let _ = log_dir();
+        let _ = profiles_dir();
+        let _ = lang_dir();
+        let _ = templates_dir();
+    }
+}
+
+/// PNG files sitting in the templates folder.
+///
+/// Read on demand rather than cached: the list only matters while a picker is open,
+/// and somebody who has just saved a new template expects to see it there at once.
+fn template_names() -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(paths::templates_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")) {
+                return None;
+            }
+            Some(p.file_stem()?.to_string_lossy().into_owned())
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// A dropdown of saved templates beside the name field, so a script juggling
+/// several pictures needs none of their names typed from memory.
+fn template_picker(ui: &mut egui::Ui, salt: &str, current: &mut String) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(salt).selected_text("\u{25be}").width(34.0).show_ui(
+        ui,
+        |ui| {
+            let names = template_names();
+            if names.is_empty() {
+                ui.label("templates/");
+            }
+            for name in names {
+                if ui.selectable_label(*current == name, name.as_str()).clicked() {
+                    *current = name;
+                    changed = true;
+                }
+            }
+        },
+    );
+    changed
 }
 
 // ============================================================================
@@ -3291,22 +3349,41 @@ struct MoveEngine {
     human: bool,
     curve: f32,
     jitter: i32,
+    /// Microseconds spent drawing curved paths, for the scheduler to absorb.
+    spent_us: u64,
 }
 
 impl MoveEngine {
     fn new(state: &AppState) -> Self {
         Self {
-            last: None,
+            // Seeded from where the pointer actually is. Starting at `None` meant the
+            // first move of every run had no previous point to curve away from, and
+            // that first jump - from wherever the user left the cursor - is the one
+            // most likely to be watched.
+            last: Some(platform::cursor_pos()),
             rng: Rng::new(),
             human: state.human_mouse.load(Ordering::Relaxed),
             curve: state.human_curve.load(Ordering::Relaxed) as f32 / 100.0,
             jitter: state.mouse_jitter_px.load(Ordering::Relaxed),
+            spent_us: 0,
         }
     }
 
     /// A do-nothing engine for the paths that only release stuck buttons.
     fn inert() -> Self {
-        Self { last: None, rng: Rng::new(), human: false, curve: 0.0, jitter: 0 }
+        Self {
+            last: None,
+            rng: Rng::new(),
+            human: false,
+            curve: 0.0,
+            jitter: 0,
+            spent_us: 0,
+        }
+    }
+
+    /// Time spent on curved paths since this was last asked, in microseconds.
+    fn take_spent(&mut self) -> u64 {
+        std::mem::take(&mut self.spent_us)
     }
 
     fn goto(&mut self, x: i32, y: i32) {
@@ -3322,10 +3399,12 @@ impl MoveEngine {
                     // Roughly one step per 8 px, capped so a long haul cannot eat
                     // more than ~60 ms of the schedule.
                     let steps = ((d / 8.0) as usize).clamp(6, 48);
+                    let t0 = now_us();
                     for p in bezier_path(from, (tx, ty), self.curve, &mut self.rng, steps) {
                         unsafe { platform::send_absolute_mouse_move(p.0, p.1) };
                         spin_sleep::sleep(Duration::from_micros(1_200));
                     }
+                    self.spent_us = self.spent_us.saturating_add(now_us().saturating_sub(t0));
                 }
             }
         }
@@ -3668,7 +3747,7 @@ enum ScriptEnd {
 
 /// Loads a template from `<data>/templates/<name>.png`, once per run.
 fn load_template_file(name: &str) -> Option<Arc<vision::Template>> {
-    let mut path = paths::sub_dir("templates").join(name);
+    let mut path = paths::templates_dir().join(name);
     if path.extension().is_none() {
         path.set_extension("png");
     }
@@ -3871,6 +3950,7 @@ fn play_event_range(
             send_input_event(&ev.kind, ctx.state, pressed, ctx.map, mover);
         }
         guard.note_sent(&ev.kind, now_us());
+        due = due.saturating_add(mover.take_spent());
     }
     true
 }
@@ -3898,8 +3978,11 @@ fn send_guarded(
     }
     #[cfg(not(windows))]
     {
-        let _ = (&pressed, &mover);
+        let _ = &pressed;
     }
+    // Script clicks are not on a schedule, so the path time is simply discarded
+    // rather than left to shift the next `Play events`.
+    let _ = mover.take_spent();
     guard.note_sent(kind, now_us());
     true
 }
@@ -4414,6 +4497,9 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
             send_input_event(&ev.kind, &state, &mut pressed, map, &mut mover);
         }
         guard.note_sent(&ev.kind, now_us());
+        // Drawing a curved path costs real time. Charging it to the schedule stops
+        // the events behind it from bunching up to make the difference back.
+        cycle_start_us = cycle_start_us.saturating_add(mover.take_spent());
 
         prev_scaled_t = scaled_t;
         index += 1;
@@ -5263,7 +5349,7 @@ define_strings!(
     ocr_corner1, ocr_corner2, f_from_panel,
     fg_cb, fg_fps, fg_added, tip_frame_guard, fg_auto, fg_measured, fg_manual,
     sec_perf, perf_cb, perf_none, perf_frametime, perf_avg, perf_low1, perf_low01,
-    perf_stutter, tip_perf,
+    perf_stutter, tip_perf, tgt_from_rec, grp_anchor, grp_speed,
 );
 
 const EN: Strings = Strings {
@@ -5325,7 +5411,7 @@ const EN: Strings = Strings {
     mouse_rel: "Relative mouse", human_mouse: "Human-like movement",
     human_curve: "Curvature", mouse_jitter: "Aim spread (px)",
     anchor_scale: "Scale with the window size",
-    tip_human: "Glides along a curved path instead of teleporting, with a random arc every time.",
+    tip_human: "Draws a curved path, with a new arc every time, whenever the pointer has to jump more than about 24 px. Recorded movement is replayed exactly as recorded, so this changes nothing unless 'Capture mouse movement' is off or a script clicks by coordinate or by image.",
     sec_vision: "🔎 Image search", img_paste: "📋 Paste", img_load: "📂 Load PNG…",
     img_save: "💾 Save PNG…", img_none: "no template",
     img_find: "🔍 Find on screen", img_searching: "searching…",
@@ -5373,6 +5459,8 @@ const EN: Strings = Strings {
     perf_low1: "1 % low: {} FPS", perf_low01: "0.1 % low: {} FPS",
     perf_stutter: "Stutters: {} in the last 10 s",
     tip_perf: "Timed by sending an empty message through the window's own loop, not by counting frames — no driver hooks, no administrator rights. A game that drains its queue once per frame answers in about one frame, which is exactly the delay the guard has to cover. For true frame statistics use PresentMon or RTSS.",
+    tgt_from_rec: "\u{2935} From the recording", grp_anchor: "Coordinate anchoring",
+    grp_speed: "How well the window keeps up",
 };
 
 const RU: Strings = Strings {
@@ -5437,7 +5525,7 @@ const RU: Strings = Strings {
     mouse_rel: "Относительная мышь", human_mouse: "Человеческое движение",
     human_curve: "Кривизна", mouse_jitter: "Разброс прицела (px)",
     anchor_scale: "Масштабировать вместе с окном",
-    tip_human: "Курсор едет по дуге, а не телепортируется, и дуга каждый раз новая.",
+    tip_human: "Рисует дугу, каждый раз новую, когда курсору надо прыгнуть больше чем примерно на 24 px. Записанные движения воспроизводятся ровно как записаны, поэтому эффект виден, только если выключено «Записывать движения мыши» или скрипт кликает по координатам либо по картинке.",
     sec_vision: "🔎 Поиск по картинке", img_paste: "📋 Вставить", img_load: "📂 Открыть PNG…",
     img_save: "💾 Сохранить PNG…", img_none: "шаблон не задан",
     img_find: "🔍 Найти на экране", img_searching: "ищу…",
@@ -5487,6 +5575,8 @@ const RU: Strings = Strings {
     perf_low1: "1 % низких: {} FPS", perf_low01: "0,1 % низких: {} FPS",
     perf_stutter: "Фризов: {} за последние 10 с",
     tip_perf: "Измеряется временем прохождения пустого сообщения через цикл окна, а не подсчётом кадров — без хуков в драйвер и прав администратора. Игра, которая разбирает очередь раз в кадр, отвечает примерно за кадр, а это ровно та задержка, которую перекрывает защита. Для настоящей статистики кадров используйте PresentMon или RTSS.",
+    tgt_from_rec: "\u{2935} Из записи", grp_anchor: "Привязка координат",
+    grp_speed: "Насколько окно успевает",
 };
 
 const UK: Strings = Strings {
@@ -5552,7 +5642,7 @@ const UK: Strings = Strings {
     mouse_rel: "Відносна миша", human_mouse: "Людський рух",
     human_curve: "Кривизна", mouse_jitter: "Розкид прицілу (px)",
     anchor_scale: "Масштабувати разом з вікном",
-    tip_human: "Курсор їде по дузі, а не телепортується, і дуга щоразу нова.",
+    tip_human: "Малює дугу, щоразу нову, коли курсору треба стрибнути більше ніж приблизно на 24 px. Записані рухи відтворюються точно як записані, тож ефект помітний, лише якщо вимкнено «Записувати рухи миші» або скрипт клікає за координатами чи за картинкою.",
     sec_vision: "🔎 Пошук за картинкою", img_paste: "📋 Вставити", img_load: "📂 Відкрити PNG…",
     img_save: "💾 Зберегти PNG…", img_none: "шаблон не задано",
     img_find: "🔍 Знайти на екрані", img_searching: "шукаю…",
@@ -5602,6 +5692,8 @@ const UK: Strings = Strings {
     perf_low1: "1 % низьких: {} FPS", perf_low01: "0,1 % низьких: {} FPS",
     perf_stutter: "Фризів: {} за останні 10 с",
     tip_perf: "Вимірюється часом проходження порожнього повідомлення через цикл вікна, а не підрахунком кадрів — без хуків у драйвер і прав адміністратора. Гра, яка розбирає чергу раз на кадр, відповідає приблизно за кадр, а це саме та затримка, яку перекриває захист. Для справжньої статистики кадрів використовуйте PresentMon або RTSS.",
+    tgt_from_rec: "\u{2935} Із запису", grp_anchor: "Прив'язка координат",
+    grp_speed: "Наскільки вікно встигає",
 };
 
 const PT: Strings = Strings {
@@ -5664,7 +5756,7 @@ const PT: Strings = Strings {
     mouse_rel: "Mouse relativo", human_mouse: "Movimento humano",
     human_curve: "Curvatura", mouse_jitter: "Dispersão da mira (px)",
     anchor_scale: "Escalar com o tamanho da janela",
-    tip_human: "Desliza por uma curva em vez de teleportar, com um arco aleatório a cada vez.",
+    tip_human: "Desenha uma curva, com um arco novo de cada vez, sempre que o ponteiro tem de saltar mais de cerca de 24 px. O movimento gravado é reproduzido tal como foi gravado, por isto nada muda a menos que 'Capturar movimento do rato' esteja desligado ou um script clique por coordenada ou por imagem.",
     sec_vision: "🔎 Busca por imagem", img_paste: "📋 Colar", img_load: "📂 Abrir PNG…",
     img_save: "💾 Salvar PNG…", img_none: "sem modelo",
     img_find: "🔍 Procurar na tela", img_searching: "procurando…",
@@ -5714,6 +5806,8 @@ const PT: Strings = Strings {
     perf_low1: "1 % mais baixos: {} FPS", perf_low01: "0,1 % mais baixos: {} FPS",
     perf_stutter: "Engasgos: {} nos últimos 10 s",
     tip_perf: "Medido pelo tempo de uma mensagem vazia no ciclo da própria janela, não por contagem de fotogramas — sem ganchos no controlador nem direitos de administrador. Um jogo que esvazia a fila uma vez por fotograma responde em cerca de um fotograma, que é exatamente o atraso que a proteção cobre. Para estatísticas reais use PresentMon ou RTSS.",
+    tgt_from_rec: "\u{2935} Da gravação", grp_anchor: "Ancoragem de coordenadas",
+    grp_speed: "Quão bem a janela acompanha",
 };
 
 const ES: Strings = Strings {
@@ -5778,7 +5872,7 @@ const ES: Strings = Strings {
     mouse_rel: "Ratón relativo", human_mouse: "Movimiento humano",
     human_curve: "Curvatura", mouse_jitter: "Dispersión de puntería (px)",
     anchor_scale: "Escalar con el tamaño de la ventana",
-    tip_human: "Se desliza por una curva en vez de teletransportarse, con un arco aleatorio cada vez.",
+    tip_human: "Dibuja una curva, con un arco nuevo cada vez, cuando el puntero tiene que saltar más de unos 24 px. El movimiento grabado se reproduce tal cual, así que esto no cambia nada salvo que 'Capturar movimiento del ratón' esté desactivado o un script haga clic por coordenada o por imagen.",
     sec_vision: "🔎 Búsqueda por imagen", img_paste: "📋 Pegar", img_load: "📂 Abrir PNG…",
     img_save: "💾 Guardar PNG…", img_none: "sin plantilla",
     img_find: "🔍 Buscar en pantalla", img_searching: "buscando…",
@@ -5828,6 +5922,8 @@ const ES: Strings = Strings {
     perf_low1: "1 % más bajos: {} FPS", perf_low01: "0,1 % más bajos: {} FPS",
     perf_stutter: "Tirones: {} en los últimos 10 s",
     tip_perf: "Se mide con el tiempo de un mensaje vacío en el propio bucle de la ventana, no contando fotogramas — sin ganchos en el controlador ni permisos de administrador. Un juego que vacía su cola una vez por fotograma responde en torno a un fotograma, que es justo el retardo que cubre la protección. Para estadísticas reales usa PresentMon o RTSS.",
+    tgt_from_rec: "\u{2935} De la grabación", grp_anchor: "Anclaje de coordenadas",
+    grp_speed: "Cómo va siguiendo la ventana",
 };
 
 const ZH: Strings = Strings {
@@ -5889,7 +5985,7 @@ const ZH: Strings = Strings {
     mouse_rel: "相对鼠标", human_mouse: "拟人移动",
     human_curve: "弯曲度", mouse_jitter: "瞄准抖动 (px)",
     anchor_scale: "随窗口大小缩放",
-    tip_human: "沿曲线滑动而不是瞬移，每次弧线都不同。",
+    tip_human: "当指针需要跳跃约 24 像素以上时绘制曲线路径，每次弧线都不同。录制的移动会原样回放，因此除非关闭“记录鼠标移动”，或脚本按坐标、按图片点击，否则看不出区别。",
     sec_vision: "🔎 图像搜索", img_paste: "📋 粘贴", img_load: "📂 打开 PNG…",
     img_save: "💾 保存 PNG…", img_none: "未设置模板",
     img_find: "🔍 在屏幕上查找", img_searching: "查找中…",
@@ -5937,6 +6033,8 @@ const ZH: Strings = Strings {
     perf_low1: "1% 低帧：{} FPS", perf_low01: "0.1% 低帧：{} FPS",
     perf_stutter: "卡顿：最近 10 秒内 {} 次",
     tip_perf: "通过测量一条空消息在窗口自身消息循环中的往返时间得出，而不是统计帧数 — 无需驱动钩子，也无需管理员权限。每帧处理一次消息队列的游戏大约在一帧内回应，而这正是帧率保护需要覆盖的延迟。若需要真实的帧数统计，请使用 PresentMon 或 RTSS。",
+    tgt_from_rec: "\u{2935} 取自录制", grp_anchor: "坐标锚定",
+    grp_speed: "窗口跟得上的程度",
 };
 
 const LANG_CODES: [&str; 6] = ["en", "ru", "uk", "pt", "es", "zh"];
@@ -7095,6 +7193,7 @@ fn condition_ui(
                 changed |= ui
                     .add(egui::TextEdit::singleline(template).desired_width(150.0))
                     .changed();
+                changed |= template_picker(ui, &format!("{salt}_tpl"), template);
                 changed |= ui
                     .add(egui::DragValue::new(threshold).range(0.3..=1.0).speed(0.01))
                     .changed();
@@ -7413,6 +7512,7 @@ impl MacroApp {
                     changed |= ui
                         .add(egui::TextEdit::singleline(template).desired_width(140.0))
                         .changed();
+                    changed |= template_picker(ui, "ci_tpl", template);
                     changed |= ui
                         .add(egui::DragValue::new(threshold).range(0.3..=1.0).speed(0.01))
                         .changed();
@@ -8186,6 +8286,10 @@ impl eframe::App for MacroApp {
                             egui::Slider::new(&mut self.config.human_curve, 0..=100)
                                 .text(s.human_curve),
                         );
+                        // Spelled out instead of hidden in a tooltip: the setting does
+                        // nothing to a recording that already holds real movement, and
+                        // that is indistinguishable from it being broken.
+                        ui.label(egui::RichText::new(s.tip_human).weak().small());
                     }
                     ui.horizontal_wrapped(|ui| {
                         ui.label(s.mouse_jitter);
@@ -8193,6 +8297,71 @@ impl eframe::App for MacroApp {
                             egui::DragValue::new(&mut self.config.mouse_jitter_px).range(0..=60),
                         );
                     });
+                });
+
+                // ---- recording -------------------------------------------------
+                egui::CollapsingHeader::new(s.sec_recording).show(ui, |ui| {
+                    ui.checkbox(&mut self.config.capture_mouse_moves, s.capture_moves);
+                    ui.horizontal(|ui| {
+                        ui.label(s.sample_rate);
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.mouse_sample_ms).range(1..=100),
+                        );
+                    });
+                });
+
+                // ---- target window ---------------------------------------------
+                // Everything that depends on which window the macro is aimed at, in
+                // one place: what it is, how coordinates follow it, and how well it
+                // keeps up. Splitting these across Playback and Recording made three
+                // halves of one decision look like three unrelated settings.
+                egui::CollapsingHeader::new(s.sec_target).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(s.tgt_title);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.target_title)
+                                .desired_width(200.0),
+                        );
+                    });
+                    // The recording already noted which window was in front when it
+                    // started, so the title never has to be typed out by hand.
+                    let recorded = self
+                        .state
+                        .macro_data
+                        .lock()
+                        .anchor
+                        .as_ref()
+                        .map(|a| a.title.clone());
+                    ui.horizontal_wrapped(|ui| {
+                        let hit = ui
+                            .add_enabled(
+                                recorded.is_some(),
+                                egui::Button::new(s.tgt_from_rec),
+                            )
+                            .clicked();
+                        if hit {
+                            if let Some(t) = &recorded {
+                                self.config.target_title = t.clone();
+                            }
+                        }
+                    });
+                    let shown = recorded.unwrap_or_else(|| s.anchor_none.to_string());
+                    ui.label(
+                        egui::RichText::new(s.anchor_of.replace("{}", &shown)).weak().small(),
+                    );
+                    ui.checkbox(&mut self.config.target_pause_unfocused, s.tgt_focus);
+
+                    ui.separator();
+                    ui.label(egui::RichText::new(s.grp_anchor).strong());
+                    ui.checkbox(&mut self.config.record_window_anchor, s.anchor_rec);
+                    ui.checkbox(&mut self.config.use_window_anchor, s.anchor_use);
+                    if self.config.use_window_anchor {
+                        ui.checkbox(&mut self.config.anchor_scale, s.anchor_scale);
+                    }
+
+                    ui.separator();
+                    ui.label(egui::RichText::new(s.grp_speed).strong());
+                    ui.label(egui::RichText::new(s.tip_perf).weak().small());
                     ui.checkbox(&mut self.config.frame_guard, s.fg_cb)
                         .on_hover_text(s.tip_frame_guard);
                     if self.config.frame_guard {
@@ -8206,7 +8375,6 @@ impl eframe::App for MacroApp {
                                 s.fg_manual.to_string()
                             };
                             ui.label(egui::RichText::new(text).weak().small());
-                            ui.ctx().request_repaint_after(Duration::from_millis(500));
                         }
                         ui.horizontal_wrapped(|ui| {
                             ui.label(s.fg_fps);
@@ -8215,8 +8383,8 @@ impl eframe::App for MacroApp {
                                     .range(5..=240),
                             );
                         });
-                        // Seeing how much the guard cost is what tells you whether the
-                        // FPS figure is set sensibly.
+                        // Seeing what the guard cost is what tells you whether the FPS
+                        // figure is set sensibly.
                         let added = self.state.fg_added_us.load(Ordering::Relaxed);
                         if added > 0 {
                             ui.label(
@@ -8229,31 +8397,34 @@ impl eframe::App for MacroApp {
                             );
                         }
                     }
-                    ui.checkbox(&mut self.config.use_window_anchor, s.anchor_use);
-                    if self.config.use_window_anchor {
-                        ui.checkbox(&mut self.config.anchor_scale, s.anchor_scale);
-                    }
-                    let anchor = self
-                        .state
-                        .macro_data
-                        .lock()
-                        .anchor
-                        .as_ref()
-                        .map(|a| a.title.clone());
-                    let text = anchor.unwrap_or_else(|| s.anchor_none.to_string());
-                    ui.label(egui::RichText::new(s.anchor_of.replace("{}", &text)).weak().small());
-                });
-
-                // ---- recording -------------------------------------------------
-                egui::CollapsingHeader::new(s.sec_recording).show(ui, |ui| {
-                    ui.checkbox(&mut self.config.capture_mouse_moves, s.capture_moves);
-                    ui.horizontal(|ui| {
-                        ui.label(s.sample_rate);
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.mouse_sample_ms).range(1..=100),
+                    ui.checkbox(&mut self.config.perf_enabled, s.perf_cb);
+                    let st = *self.state.perf_stats.lock();
+                    // Under a handful of samples every percentile is the same number,
+                    // which would look like a measurement without being one.
+                    if !st.found || st.samples < 8 {
+                        ui.label(egui::RichText::new(s.perf_none).weak());
+                    } else {
+                        let fps =
+                            |us: u64| if us == 0 { 0.0 } else { 1_000_000.0 / us as f64 };
+                        ui.label(s.perf_frametime.replace(
+                            "{}",
+                            &format!("{:.1}", st.avg_us as f64 / 1000.0),
+                        ));
+                        ui.label(
+                            s.perf_avg.replace("{}", &format!("{:.0}", fps(st.avg_us))),
                         );
-                    });
-                    ui.checkbox(&mut self.config.record_window_anchor, s.anchor_rec);
+                        ui.label(
+                            s.perf_low1.replace("{}", &format!("{:.0}", fps(st.p99_us))),
+                        );
+                        ui.label(
+                            s.perf_low01
+                                .replace("{}", &format!("{:.0}", fps(st.p999_us))),
+                        );
+                        ui.label(s.perf_stutter.replace("{}", &st.stutters.to_string()));
+                    }
+                    if self.config.perf_enabled || self.config.frame_guard {
+                        ui.ctx().request_repaint_after(Duration::from_millis(400));
+                    }
                 });
 
                 // ---- time limit -------------------------------------------------
@@ -8408,48 +8579,6 @@ impl eframe::App for MacroApp {
                     }
                 });
 
-                // ---- target window ---------------------------------------------------
-                egui::CollapsingHeader::new(s.sec_target).show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(s.tgt_title);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.config.target_title)
-                                .desired_width(200.0),
-                        );
-                    });
-                    ui.checkbox(&mut self.config.target_pause_unfocused, s.tgt_focus);
-                });
-
-                // ---- window responsiveness -------------------------------------------
-                egui::CollapsingHeader::new(s.sec_perf).show(ui, |ui| {
-                    ui.label(egui::RichText::new(s.tip_perf).weak().small());
-                    ui.checkbox(&mut self.config.perf_enabled, s.perf_cb);
-                    let st = *self.state.perf_stats.lock();
-                    // Under a handful of samples every percentile is the same number,
-                    // which would look like a measurement without being one.
-                    if !st.found || st.samples < 8 {
-                        ui.label(egui::RichText::new(s.perf_none).weak());
-                    } else {
-                        let fps = |us: u64| {
-                            if us == 0 { 0.0 } else { 1_000_000.0 / us as f64 }
-                        };
-                        let ms = |us: u64| format!("{:.1}", us as f64 / 1000.0);
-                        ui.label(s.perf_frametime.replace("{}", &ms(st.avg_us)));
-                        ui.label(
-                            s.perf_avg.replace("{}", &format!("{:.0}", fps(st.avg_us))),
-                        );
-                        ui.label(
-                            s.perf_low1.replace("{}", &format!("{:.0}", fps(st.p99_us))),
-                        );
-                        ui.label(
-                            s.perf_low01
-                                .replace("{}", &format!("{:.0}", fps(st.p999_us))),
-                        );
-                        ui.label(s.perf_stutter.replace("{}", &st.stutters.to_string()));
-                    }
-                    ui.ctx().request_repaint_after(Duration::from_millis(400));
-                });
-
                 // ---- text on screen --------------------------------------------------
                 egui::CollapsingHeader::new(s.sec_ocr).show(ui, |ui| {
                     ui.label(egui::RichText::new(s.tip_ocr).weak().small());
@@ -8510,7 +8639,7 @@ impl eframe::App for MacroApp {
                         if ui.button(s.img_load).clicked() {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("PNG", &["png"])
-                                .set_directory(paths::sub_dir("templates"))
+                                .set_directory(paths::templates_dir())
                                 .pick_file()
                             {
                                 self.load_template_png(&path);
@@ -8522,7 +8651,7 @@ impl eframe::App for MacroApp {
                                 self.template.clone(),
                                 rfd::FileDialog::new()
                                     .add_filter("PNG", &["png"])
-                                    .set_directory(paths::sub_dir("templates"))
+                                    .set_directory(paths::templates_dir())
                                     .set_file_name("template.png")
                                     .save_file(),
                             ) {
@@ -9174,6 +9303,8 @@ fn main() -> Result<()> {
     let (tx, rx) = unbounded();
     let state = AppState::new(tx);
     apply_config_to_state(&config, &state);
+
+    paths::ensure_dirs();
 
     {
         let st = state.clone();
