@@ -7,7 +7,115 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [1.2.0] — released
+## [1.3.0]
+
+A hardening release. No new user-facing features — this is what a seven-stage test
+campaign found, fixed and measured. The plan is in [TESTING.md](TESTING.md).
+
+### Fixed
+
+- **The editor could take the whole application down.** `editor_set_time` read the
+  previous event's timestamp with a raw index while reading both of its neighbours
+  through `get`, and that read sits ahead of the guard meant to cover the function. A
+  selection left pointing past a recording another edit had since trimmed reached it
+  first; `panic = "abort"` in the release profile means the process goes, not the
+  operation. Found by the new editor fuzzing, which is what it was written for.
+- **A small template was searched for pathologically slowly.** The coarse grid was
+  chosen from the template alone, ignoring the haystack it would sweep, so a 32 px
+  template on a 2560x1440 screen was handed a step of 2 and examined a quarter of every
+  pixel position with a 16x16 kernel — 236 million operations against 25 million for a
+  64 px one. Measured: 465 ms against 64 ms, seven times slower for the smaller picture.
+  The grid is now coarsened until the pass fits a fixed budget, and only then, so a
+  small search area keeps the finer grid where it is cheap and its accuracy is worth
+  having. The same template now takes 48 ms, matches land in exactly the same place, and
+  the multi-scale option dropped from 390 ms to 274 ms with it.
+- **"1 % low" did not report the worst 1 %.** It computed a 99th percentile, which for
+  a hundred samples stops one sample short of the worst — exactly the sample the label
+  promises. It is now the mean of the worst 1 %, matching the frame-time vocabulary the
+  name borrows from, and averaging the tail keeps one freak sample from deciding the
+  figure the frame guard is sized from.
+- **`cargo test` did not pass.** `roundtrip_v2` asserted that a saved macro comes back
+  as format version 2, but `MacroData::new` has emitted version 3 since the script
+  engine landed. `cargo build` never noticed, because a wrong assertion is still a
+  well-typed one. The test now checks against `format_version()` rather than a literal,
+  so the next format bump cannot repeat it.
+- The `MacroData` doc comment still described the container as "format version 2".
+
+### Changed
+
+- `editor_insert_delay` multiplies its millisecond argument saturatingly. The UI bounds
+  that argument, so nothing could reach the overflow — but a function that is total only
+  because of its callers is a trap for the next caller.
+- Slip events are counted rather than only logged.
+
+### Added
+
+- **21 tests**, taking the suite from 60 to 83, including 8 000 rounds of fuzzing over
+  the editor's range and single-index operations with deliberately wrong indices, and
+  fuzzing of `sanitize` against absurd values, NaN and infinity. Seeded from fixed
+  values, so a failure reproduces exactly. Tests build without `--release`, which means
+  overflow checks are on and any arithmetic that would wrap silently in production
+  panics there instead.
+- **`--selftest timing`.** The scheduler cannot be judged from outside the process — an
+  event that fires 40 ms late looks exactly like one that fires on time — so this runs
+  the real `playback_loop`, the real frame guard and the real slip logic with every call
+  into Windows suppressed, and timestamps each dispatch against the moment it was due.
+  Nine scenarios covering speed extremes, a forced stall, the guard, and human-like
+  movement.
+- **`--selftest vision`.** Times capture and search across region and template sizes,
+  prices the multi-scale option, times OCR, and reports the cost of one script image
+  step. Costs are given per megapixel so a screen larger than the one under test can be
+  worked out rather than guessed at.
+- **`--selftest churn[=seconds]`.** Drives the playback lifecycle at about a hundred
+  transitions a second while asserting that no generation escapes cancellation, that two
+  playback loops never run at once, and that every stop leaves nothing held down. A
+  watchdog aborts the run if no transition completes for thirty seconds, because a
+  wedged process cannot report on itself.
+- **`--selftest soak[=hours]`.** Replays continuously while capturing and reading the
+  screen, and samples its own private bytes, handle count and GDI objects. Growth is
+  measured from the five-minute mark so allocator warm-up is not reported as a leak, and
+  every row is appended to `logs/soak.csv` because the Windows console stops accepting
+  writes while text is selected in it.
+
+### Measured
+
+Figures the documentation previously gave in words:
+
+| | |
+|---|---|
+| Scheduler accuracy, p99 | 4 µs; 103 µs in the worst scenario, measured under load from a running game |
+| Drift | none measurable — wall clock matched the recording to the millisecond in all nine scenarios |
+| Recovery from a 400 ms stall | one slip, and zero dispatches within 500 µs of each other afterwards: the backlog does not go out as a burst |
+| Frame guard cost, human-paced recording | +10 % wall clock |
+| Full-screen capture, 2560x1440 | 43 ms |
+| Full-screen search, 64x64 template | 68 ms; a miss costs the same as a hit, since `find` has no early exit |
+| One script image step | 111 ms, so a `While` polling for a picture runs at about 9 checks a second |
+| Lifecycle churn | 33 000 transitions over two runs: no press left held, no generation escaped cancellation, nothing wedged |
+| Soak, 2.5 h | 3 832 captures and 1 743 OCR reads; handle count flat at 212, memory settled at 12.8 MB |
+
+### Not done
+
+Stated plainly rather than left for someone to discover.
+
+- **The manual feature matrix ([TESTING_MATRIX.md](TESTING_MATRIX.md)) has not been
+  worked through.** Every automated stage ran dry: `SendInput` was suppressed
+  throughout. The frame guard, the slip logic and human-like movement have measured
+  timings but have never actually pressed a key on a live system.
+- **Script image steps still sweep the whole virtual desktop.** Giving them their own
+  search region would take the poll rate from about 9 a second to about 70. It changes
+  the macro format, so it is held over.
+- **The soak's GDI figure measures nothing.** Sampling and capture run on the same
+  thread in sequence, so the sample can never land inside a `BitBlt` and the count reads
+  zero whether objects leak or not. The absence of a leak is inferred instead from
+  3 832 captures completing without exhausting the per-process quota.
+- One unexplained event in the first churn run: a single release sent with no press
+  behind it, on the harmless side and not reproduced in 33 000 further transitions. The
+  mechanism proposed for it predicted roughly a hundred occurrences per run, so that
+  explanation is wrong and the cause is still open.
+
+---
+
+## [1.2.0]
 
 Window-related settings gathered into one place, and three things that quietly did not work.
 
@@ -62,7 +170,7 @@ Window-related settings gathered into one place, and three things that quietly d
 
 ---
 
-## [1.1.0] — released
+## [1.1.0]
 
 Playback that survives a target application which cannot keep up.
 
