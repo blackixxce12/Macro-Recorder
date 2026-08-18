@@ -7,6 +7,72 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [1.3.5] — pre-release
+
+The text expander, and the desktop fix that 1.3.0 went out without.
+
+### Added
+
+- **Text expander.** Type a short abbreviation and it becomes the longer text saved for
+  it, in any application. Three trigger modes — after a delimiter, behind a prefix
+  marker, or the moment the abbreviation appears — set globally and overridable on every
+  entry. Replacements carry `{date}` and `{time}` with optional patterns, `{datetime}`,
+  `{clipboard}`, `{cursor}`, `{key:Tab}` and `{random:a|b|c}`, with a backslash to
+  escape a literal placeholder. Multi-line text is supported, and each entry chooses
+  whether it is typed a character at a time or pasted through the clipboard. There is a
+  full guide in **[EXPANDER.md](EXPANDER.md)** ([по-русски](EXPANDER_RU.md)).
+- **An editor for the list** in the ⌨ section: add, remove and enable entries, and set
+  each one's trigger, marker and insert mode. Entries are stored in `expansions.json`,
+  which can still be edited by hand and reloaded.
+- Per-entry enable, a master switch that is **off until asked for**, a configurable
+  delimiter set, and a list of window titles where the expander stays quiet — a password
+  manager and a terminal belong there.
+- Two log lines that exist for one reason: `hotkey N delivered` on every `WM_HOTKEY`,
+  and the full slot list with failure bits whenever hotkeys are rebuilt. A hotkey that
+  quietly stops working leaves no trace otherwise, and whether Windows delivered the
+  message at all is the one fact that decides where to look next.
+
+### Fixed
+
+- **A macro kept running while Task View was open.** Virtual desktop isolation asks
+  `IsWindowOnCurrentVirtualDesktop`, which answers honestly and unhelpfully: Task View
+  is an overlay drawn *on* the current desktop, so nothing had changed as far as the
+  check was concerned, while synthetic clicks landed in the desktop switcher — where
+  they create desktops, close them and move windows between them. Playback and recording
+  now both hold while a shell switcher owns the foreground. Only the two unambiguous
+  switcher classes are matched; the Start menu shares a class with ordinary packaged
+  apps, and a macro that silently refused to run against one of those would be a worse
+  bug than the one being fixed.
+- Keystrokes sent by the expander carry a scan code and, where it applies, the extended
+  flag. Virtual key alone is not enough — this project already learned that once, which
+  is why the replay path has always sent scan codes.
+- Changing keyboard layout no longer counts as the end of a word. The rule was "a
+  modifier is held, so this is a command", but Alt+Shift is how half the world switches
+  layout: a Cyrillic word followed by an English one had the buffer cleared in between,
+  and the second word looked like the start of a line. A modifier pressed by itself, and
+  any Win combination, now leave the word alone; Ctrl and Alt with an ordinary key still
+  end it, because those really do edit and move the caret.
+
+### Notes
+
+- The expander never fires while a macro is recording or replaying: expanding into a
+  recording would write the expansion into the macro, and expanding during playback
+  would fight with it.
+- It refuses rather than guesses on input it cannot count. An IME commits characters
+  that never matched the keystrokes the hook saw, and a dead key turns two keystrokes
+  into one character; in both cases the number of backspaces needed is unknowable, so
+  the buffer is emptied and nothing fires.
+- The buffer of recently typed characters is capped at 64, never written to the log at
+  any level, never written to disk, and emptied whenever the foreground window changes,
+  a mouse button is pressed, or a modifier combination is used. Worth stating plainly:
+  this is a privacy surface, and a tool that already draws antivirus heuristics should
+  be explicit about what it keeps.
+- Independently implemented. CrossMacro was the reference for *what* a text expander
+  does, from its README and its interface — not for how one is written. Its code is
+  GPL-3.0 and this project is MIT.
+
+---
+
 ## [1.3.0]
 
 A hardening release. No new user-facing features — this is what a seven-stage test
