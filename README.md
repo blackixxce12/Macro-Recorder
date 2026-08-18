@@ -23,6 +23,23 @@
 
 ---
 
+> [!IMPORTANT]
+> **This page describes version 1.0.0**, and the project has moved on since. Everything
+> added, changed and fixed after it — the frame-rate guard, the window section, the text
+> expander, a crash in the editor and a template search that was seven times slower than
+> it needed to be — is recorded in **[CHANGELOG.md](CHANGELOG.md)**
+> ([по-русски](CHANGELOG_RU.md)). Read it before deciding what this program can do.
+>
+> Two features are large enough to have their own guides, both written for someone who
+> has never done any of this before:
+>
+> - **[SCRIPTS.md](SCRIPTS.md)** — making a macro wait, decide and repeat, instead of
+>   replaying blindly.
+> - **[EXPANDER.md](EXPANDER.md)** — turning a short abbreviation into a long piece of
+>   text as you type.
+
+---
+
 ## 🆕 Highlights
 
 | | |
@@ -921,3 +938,4 @@ Built with [egui / eframe](https://github.com/emilk/egui), [windows-rs](https://
 [tracing](https://github.com/tokio-rs/tracing).
 
 Inspired by **TinyTask** — thanks for a decade of quietly saving people's hands.
+
