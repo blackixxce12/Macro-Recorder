@@ -243,6 +243,9 @@ mod paths {
     pub fn templates_dir() -> PathBuf {
         sub_dir("templates")
     }
+    pub fn expansions_path() -> PathBuf {
+        data_dir().join("expansions.json")
+    }
 
     /// Creates the folders the documentation tells people to look for.
     ///
@@ -254,6 +257,28 @@ mod paths {
         let _ = profiles_dir();
         let _ = lang_dir();
         let _ = templates_dir();
+    }
+}
+
+fn trigger_index(t: &expander::Trigger) -> usize {
+    match t {
+        expander::Trigger::Inherit => 0,
+        expander::Trigger::Delimiter => 1,
+        expander::Trigger::Prefix(_) => 2,
+        expander::Trigger::Instant => 3,
+    }
+}
+
+fn trigger_from_index(i: usize, prefix: &str) -> expander::Trigger {
+    match i {
+        1 => expander::Trigger::Delimiter,
+        2 => expander::Trigger::Prefix(if prefix.is_empty() {
+            ";;".to_string()
+        } else {
+            prefix.to_string()
+        }),
+        3 => expander::Trigger::Instant,
+        _ => expander::Trigger::Inherit,
     }
 }
 
@@ -298,6 +323,823 @@ fn template_picker(ui: &mut egui::Ui, salt: &str, current: &mut String) -> bool 
         },
     );
     changed
+}
+
+// ============================================================================
+// Text expander
+// ============================================================================
+
+/// Turns a typed abbreviation into a longer piece of text.
+///
+/// The engine watches the keyboard hook, keeps a short rolling buffer of the
+/// characters that came out of it, and when the tail of that buffer matches an entry
+/// it deletes what was typed and writes the replacement instead.
+///
+/// Three things about it are worth knowing before reading the code.
+///
+/// **The buffer is a privacy surface.** It holds what you have just typed, in any
+/// application, which is a short step from what a keylogger holds. So it never
+/// reaches the log at any level, never reaches the disk, is capped at 64 characters,
+/// and is emptied whenever the foreground window changes.
+///
+/// **The hook must not do the work.** Detecting a match happens in the hook callback,
+/// which Windows will silently unhook if it dawdles. Everything after that - the
+/// backspaces, the replacement, the clipboard - is handed to a worker thread.
+///
+/// **Some input cannot be handled and is refused rather than guessed at.** An IME
+/// commits characters that never correspond to the keystrokes the hook saw, and a
+/// dead key turns two keystrokes into one character. In both cases the count of
+/// backspaces needed is unknowable, so the buffer is emptied and nothing fires.
+pub mod expander {
+    use serde::{Deserialize, Serialize};
+
+    /// When an entry fires.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub enum Trigger {
+        /// Follow the global setting. What almost every entry should say.
+        Inherit,
+        /// After the abbreviation and then a delimiter: `addr` then a space.
+        Delimiter,
+        /// As soon as the abbreviation is typed, but only behind a marker: `;;sig`.
+        Prefix(String),
+        /// The moment the abbreviation appears, anywhere. Short ones will misfire.
+        Instant,
+    }
+
+    /// How the replacement gets into the application.
+    #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+    pub enum Insert {
+        /// One synthetic keystroke per character. Works everywhere, slow for long text.
+        Type,
+        /// Through the clipboard and Ctrl+V. Instant, but not every window pastes
+        /// that way and the clipboard has to be borrowed and given back.
+        Paste,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct Entry {
+        #[serde(default = "yes")]
+        pub enabled: bool,
+        pub abbr: String,
+        pub text: String,
+        #[serde(default = "inherit")]
+        pub trigger: Trigger,
+        #[serde(default = "typing")]
+        pub insert: Insert,
+    }
+
+    fn yes() -> bool {
+        true
+    }
+    fn inherit() -> Trigger {
+        Trigger::Inherit
+    }
+    fn typing() -> Insert {
+        Insert::Type
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct Book {
+        /// The master switch. Off until asked for: this one types into other people's
+        /// windows.
+        #[serde(default)]
+        pub enabled: bool,
+        /// What `Trigger::Inherit` resolves to.
+        #[serde(default = "delimiter")]
+        pub default_trigger: Trigger,
+        /// Characters that count as the end of a word.
+        #[serde(default = "default_delims")]
+        pub delimiters: String,
+        /// Window titles, matched case-insensitively by substring, where the expander
+        /// stays quiet. A password manager and a terminal belong here.
+        #[serde(default)]
+        pub excluded_windows: Vec<String>,
+        #[serde(default)]
+        pub entries: Vec<Entry>,
+    }
+
+    fn delimiter() -> Trigger {
+        Trigger::Delimiter
+    }
+    fn default_delims() -> String {
+        " \t\n.,;:!?)]}\"'".to_string()
+    }
+
+    impl Default for Book {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                default_trigger: Trigger::Delimiter,
+                delimiters: default_delims(),
+                excluded_windows: Vec::new(),
+                entries: vec![
+                    Entry {
+                        enabled: true,
+                        abbr: "addr".into(),
+                        text: "221B Baker Street\nLondon".into(),
+                        trigger: Trigger::Inherit,
+                        insert: Insert::Type,
+                    },
+                    Entry {
+                        enabled: true,
+                        abbr: "today".into(),
+                        text: "{date}".into(),
+                        trigger: Trigger::Inherit,
+                        insert: Insert::Type,
+                    },
+                    Entry {
+                        enabled: true,
+                        abbr: ";sig".into(),
+                        text: "Kind regards,\n{cursor}".into(),
+                        trigger: Trigger::Instant,
+                        insert: Insert::Type,
+                    },
+                ],
+            }
+        }
+    }
+
+    /// One piece of a rendered replacement.
+    ///
+    /// A replacement is a list rather than a string because `{key:Tab}` and `{cursor}`
+    /// cannot be expressed as characters: a keystroke has to be sent as a keystroke,
+    /// and the cursor is moved after everything else has landed.
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Segment {
+        Text(String),
+        Key(u16),
+        Cursor,
+    }
+
+    /// What the hook decided, for the worker to carry out.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Fire {
+        /// Characters to delete, including the delimiter when there was one.
+        pub backspaces: usize,
+        pub segments: Vec<Segment>,
+        pub insert: Insert,
+    }
+
+    pub fn is_delimiter(book: &Book, c: char) -> bool {
+        book.delimiters.contains(c)
+    }
+
+    fn resolve(book: &Book, t: &Trigger) -> Trigger {
+        match t {
+            Trigger::Inherit => match &book.default_trigger {
+                Trigger::Inherit => Trigger::Delimiter,
+                other => other.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// Does `buf` end with `needle`, and is the character before it a word boundary?
+    fn ends_on_boundary(book: &Book, buf: &[char], needle: &str) -> bool {
+        let n: Vec<char> = needle.chars().collect();
+        if n.is_empty() || buf.len() < n.len() {
+            return false;
+        }
+        if buf[buf.len() - n.len()..] != n[..] {
+            return false;
+        }
+        // Without this, `addr` fires inside `readdr`.
+        match buf.len().checked_sub(n.len() + 1).map(|i| buf[i]) {
+            Some(prev) => is_delimiter(book, prev),
+            None => true,
+        }
+    }
+
+    /// Decides whether the character just typed completes an abbreviation.
+    ///
+    /// Pure, and separate from everything Windows-shaped, so the rules can be tested
+    /// without a keyboard.
+    pub fn match_at(book: &Book, buf: &[char], typed: char) -> Option<Fire> {
+        if !book.enabled || buf.is_empty() {
+            return None;
+        }
+        let mut best: Option<(usize, &Entry)> = None;
+        for e in book.entries.iter().filter(|e| e.enabled && !e.abbr.is_empty()) {
+            let hit = match resolve(book, &e.trigger) {
+                Trigger::Instant => ends_on_boundary(book, buf, &e.abbr)
+                    .then(|| e.abbr.chars().count()),
+                Trigger::Prefix(p) => {
+                    let whole = format!("{p}{}", e.abbr);
+                    ends_on_boundary(book, buf, &whole).then(|| whole.chars().count())
+                }
+                _ => {
+                    // The delimiter itself is the last character in the buffer, so the
+                    // abbreviation has to be checked against everything before it.
+                    if !is_delimiter(book, typed) {
+                        None
+                    } else {
+                        let head = &buf[..buf.len() - 1];
+                        ends_on_boundary(book, head, &e.abbr)
+                            .then(|| e.abbr.chars().count() + 1)
+                    }
+                }
+            };
+            if let Some(back) = hit {
+                // Longest wins, so `;sign` beats `;sig`.
+                if best.map_or(true, |(b, _)| back > b) {
+                    best = Some((back, e));
+                }
+            }
+        }
+        let (backspaces, entry) = best?;
+        let mut segments = render(&entry.text);
+        // In delimiter mode the delimiter was eaten with the abbreviation, so it has
+        // to come back or the next word runs into the replacement.
+        if matches!(resolve(book, &entry.trigger), Trigger::Delimiter) {
+            match segments.last_mut() {
+                Some(Segment::Text(t)) => t.push(typed),
+                _ => segments.push(Segment::Text(typed.to_string())),
+            }
+        }
+        Some(Fire { backspaces, segments, insert: entry.insert })
+    }
+
+    /// Splits a replacement into segments, expanding the placeholders.
+    ///
+    /// A backslash escapes the next character, which is how a replacement can contain
+    /// a literal `{date}`.
+    pub fn render(text: &str) -> Vec<Segment> {
+        let mut out: Vec<Segment> = Vec::new();
+        let mut lit = String::new();
+        let mut it = text.chars().peekable();
+        let push_lit = |out: &mut Vec<Segment>, lit: &mut String| {
+            if !lit.is_empty() {
+                out.push(Segment::Text(std::mem::take(lit)));
+            }
+        };
+        while let Some(c) = it.next() {
+            match c {
+                '\\' => {
+                    if let Some(n) = it.next() {
+                        lit.push(n);
+                    }
+                }
+                '{' => {
+                    let mut token = String::new();
+                    let mut closed = false;
+                    for t in it.by_ref() {
+                        if t == '}' {
+                            closed = true;
+                            break;
+                        }
+                        token.push(t);
+                    }
+                    if !closed {
+                        // An unclosed brace is a typo, not a token. Show it as typed.
+                        lit.push('{');
+                        lit.push_str(&token);
+                        continue;
+                    }
+                    let (name, arg) = match token.split_once(':') {
+                        Some((n, a)) => (n.trim(), a),
+                        None => (token.trim(), ""),
+                    };
+                    match name {
+                        "cursor" => {
+                            push_lit(&mut out, &mut lit);
+                            out.push(Segment::Cursor);
+                        }
+                        "key" => {
+                            if let Some(vk) = key_by_name(arg.trim()) {
+                                push_lit(&mut out, &mut lit);
+                                out.push(Segment::Key(vk));
+                            }
+                        }
+                        "date" => lit.push_str(&stamp(if arg.is_empty() {
+                            "yyyy-MM-dd"
+                        } else {
+                            arg
+                        })),
+                        "time" => {
+                            lit.push_str(&stamp(if arg.is_empty() { "HH:mm" } else { arg }))
+                        }
+                        "datetime" => lit.push_str(&stamp(if arg.is_empty() {
+                            "yyyy-MM-dd HH:mm"
+                        } else {
+                            arg
+                        })),
+                        "clipboard" => lit.push_str(&clipboard_text()),
+                        "random" => {
+                            let choices: Vec<&str> =
+                                arg.split('|').filter(|s| !s.is_empty()).collect();
+                            if !choices.is_empty() {
+                                let i = (super::now_us() as usize) % choices.len();
+                                lit.push_str(choices[i]);
+                            }
+                        }
+                        // Anything unrecognised is left as the user wrote it, which is
+                        // friendlier than swallowing a typo silently.
+                        _ => {
+                            lit.push('{');
+                            lit.push_str(&token);
+                            lit.push('}');
+                        }
+                    }
+                }
+                _ => lit.push(c),
+            }
+        }
+        push_lit(&mut out, &mut lit);
+        out
+    }
+
+    pub fn key_by_name(name: &str) -> Option<u16> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "tab" => 0x09,
+            "enter" | "return" => 0x0D,
+            "esc" | "escape" => 0x1B,
+            "space" => 0x20,
+            "backspace" => 0x08,
+            "delete" | "del" => 0x2E,
+            "home" => 0x24,
+            "end" => 0x23,
+            "up" => 0x26,
+            "down" => 0x28,
+            "left" => 0x25,
+            "right" => 0x27,
+            "pageup" => 0x21,
+            "pagedown" => 0x22,
+            _ => return None,
+        })
+    }
+
+    /// Formats the current local time. A hand-rolled subset of the .NET patterns,
+    /// which read better to a non-programmer than strftime and cost less than a date
+    /// library.
+    pub fn stamp(fmt: &str) -> String {
+        let (y, mo, d, h, mi, sec) = local_now();
+        fmt.replace("yyyy", &format!("{y:04}"))
+            .replace("yy", &format!("{:02}", y % 100))
+            .replace("MM", &format!("{mo:02}"))
+            .replace("dd", &format!("{d:02}"))
+            .replace("HH", &format!("{h:02}"))
+            .replace("mm", &format!("{mi:02}"))
+            .replace("ss", &format!("{sec:02}"))
+    }
+
+    #[cfg(windows)]
+    fn local_now() -> (u16, u16, u16, u16, u16, u16) {
+        unsafe {
+            let t = windows::Win32::System::SystemInformation::GetLocalTime();
+            (t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn local_now() -> (u16, u16, u16, u16, u16, u16) {
+        (2026, 1, 1, 0, 0, 0)
+    }
+
+    #[cfg(windows)]
+    fn clipboard_text() -> String {
+        use super::win32::*;
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return String::new();
+            }
+            let out = (|| {
+                const CF_UNICODETEXT: u32 = 13;
+                let handle = GetClipboardData(CF_UNICODETEXT).ok()?;
+                let hglobal = HGLOBAL(handle.0);
+                let ptr = GlobalLock(hglobal) as *const u16;
+                if ptr.is_null() {
+                    return None;
+                }
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 && len < 100_000 {
+                    len += 1;
+                }
+                let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+                let _ = GlobalUnlock(hglobal);
+                Some(text)
+            })();
+            let _ = CloseClipboard();
+            out.unwrap_or_default()
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn clipboard_text() -> String {
+        String::new()
+    }
+
+    // ---- live state ------------------------------------------------------
+
+    use crossbeam_channel::Sender;
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    static BOOK: LazyLock<Mutex<Book>> = LazyLock::new(|| Mutex::new(Book::default()));
+    /// The characters typed recently. Capped, never logged, never written to disk.
+    static BUF: LazyLock<Mutex<Vec<char>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+    static LAST_WINDOW: AtomicIsize = AtomicIsize::new(0);
+    static TX: OnceLock<Sender<Fire>> = OnceLock::new();
+
+    const BUF_MAX: usize = 64;
+
+    pub fn snapshot() -> Book {
+        BOOK.lock().clone()
+    }
+
+    pub fn enabled() -> bool {
+        BOOK.lock().enabled
+    }
+
+    pub fn set_enabled(on: bool) {
+        BOOK.lock().enabled = on;
+        reset();
+    }
+
+    /// Swaps in a book edited elsewhere. The buffer goes with it: entries that no
+    /// longer exist must not fire off half-typed words.
+    pub fn replace(book: Book) {
+        *BOOK.lock() = book;
+        reset();
+    }
+
+    pub fn reset() {
+        BUF.lock().clear();
+    }
+
+    pub fn load() {
+        let path = super::paths::expansions_path();
+        let book = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| match serde_json::from_str::<Book>(&t) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::warn!("expansions.json could not be read: {e}");
+                    None
+                }
+            });
+        match book {
+            Some(b) => *BOOK.lock() = b,
+            None => {
+                let d = Book::default();
+                let _ = save(&d);
+                *BOOK.lock() = d;
+            }
+        }
+    }
+
+    pub fn save(book: &Book) -> std::io::Result<()> {
+        let text = serde_json::to_string_pretty(book)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        std::fs::write(super::paths::expansions_path(), text)
+    }
+
+    pub fn save_current() -> std::io::Result<()> {
+        let b = BOOK.lock().clone();
+        save(&b)
+    }
+
+    // ---- the hook side ---------------------------------------------------
+
+    /// Feeds one keystroke in. Called from the keyboard hook, so it does the least
+    /// it can get away with and hands anything slow to the worker.
+    #[cfg(windows)]
+    pub fn on_key(vk: u16, scan: u16, down: bool) {
+        use super::win32::*;
+        if !down {
+            return;
+        }
+        // Never while the application is doing its own thing: expanding into a
+        // recording writes the expansion into the macro, and expanding during
+        // playback fights with it.
+        if let Some(st) = super::GLOBAL_STATE.get() {
+            if st.recording.load(Ordering::Relaxed)
+                || st.playing.load(Ordering::Relaxed)
+            {
+                reset();
+                return;
+            }
+        }
+        let book = BOOK.lock().clone();
+        if !book.enabled || book.entries.is_empty() {
+            return;
+        }
+
+        unsafe {
+            let fg = GetForegroundWindow();
+            // A buffer carried from one window into another would match text the
+            // user never typed here, so the window change empties it.
+            if LAST_WINDOW.swap(fg.0 as isize, Ordering::Relaxed) != fg.0 as isize {
+                reset();
+            }
+            if window_excluded(&book, fg) {
+                reset();
+                return;
+            }
+
+            // A modifier pressed by itself types nothing and moves nothing, and
+            // treating it as the end of a word broke the commonest case there is:
+            // Alt+Shift switches the keyboard layout, so a Cyrillic word followed by
+            // an English one had the buffer cleared in between, and the second word
+            // looked like the start of a line. Which is how `предt1` expanded.
+            let modifier_itself = matches!(
+                vk,
+                0x10..=0x12       // Shift, Ctrl, Alt
+                    | 0x14        // Caps Lock
+                    | 0x5B..=0x5C // Win
+                    | 0xA0..=0xA5 // the left and right halves of each
+            );
+            if modifier_itself {
+                return;
+            }
+            let ctrl = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
+            let alt = GetAsyncKeyState(VK_MENU.0 as i32) < 0;
+            let win = GetAsyncKeyState(VK_LWIN.0 as i32) < 0
+                || GetAsyncKeyState(VK_RWIN.0 as i32) < 0;
+            // A Win combination never writes into the focused field, so it leaves the
+            // word alone too - Win+Space being the other way people change layout.
+            if win {
+                return;
+            }
+            // Ctrl and Alt combinations do edit and do move the caret: Ctrl+A,
+            // Ctrl+V, Ctrl+Backspace. Those really are the end of a word.
+            if ctrl || alt {
+                reset();
+                return;
+            }
+
+            let mut ks = [0u8; 256];
+            if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 {
+                ks[VK_SHIFT.0 as usize] = 0x80;
+            }
+            if GetKeyState(VK_CAPITAL.0 as i32) & 1 != 0 {
+                ks[VK_CAPITAL.0 as usize] = 0x01;
+            }
+
+            let layout = GetKeyboardLayout(GetWindowThreadProcessId(fg, None));
+            let mut out = [0u16; 8];
+            let n = ToUnicodeEx(vk as u32, scan as u32, &ks, &mut out, 0, Some(layout));
+            if n < 0 {
+                // A dead key: the next keystroke will produce one character out of
+                // two, and the count of backspaces stops being knowable. Flush the
+                // kernel's dead-key state and give up on this word.
+                let _ = ToUnicodeEx(vk as u32, scan as u32, &ks, &mut out, 0, Some(layout));
+                reset();
+                return;
+            }
+            if n == 0 {
+                // Arrows, function keys, Home, End: no character, and the caret may
+                // have moved somewhere the buffer knows nothing about.
+                reset();
+                return;
+            }
+            let text = String::from_utf16_lossy(&out[..n as usize]);
+            for c in text.chars() {
+                feed(&book, c);
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn on_key(_vk: u16, _scan: u16, _down: bool) {}
+
+    /// Adds one character and fires if it completed an abbreviation.
+    fn feed(book: &Book, raw: char) {
+        let c = match raw {
+            '\r' => '\n',
+            '\u{8}' => {
+                BUF.lock().pop();
+                return;
+            }
+            c if (c as u32) < 0x20 && c != '\t' && c != '\n' => {
+                reset();
+                return;
+            }
+            c => c,
+        };
+        let fire = {
+            let mut buf = BUF.lock();
+            buf.push(c);
+            if buf.len() > BUF_MAX {
+                let cut = buf.len() - BUF_MAX;
+                buf.drain(..cut);
+            }
+            match match_at(book, &buf, c) {
+                Some(f) => {
+                    buf.clear();
+                    Some(f)
+                }
+                None => None,
+            }
+        };
+        if let Some(f) = fire {
+            if let Some(tx) = TX.get() {
+                let _ = tx.try_send(f);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn window_excluded(book: &Book, hwnd: super::win32::HWND) -> bool {
+        use super::win32::*;
+        if book.excluded_windows.is_empty() {
+            return false;
+        }
+        unsafe {
+            let mut buf = [0u16; 256];
+            let n = GetWindowTextW(hwnd, &mut buf);
+            if n <= 0 {
+                return false;
+            }
+            let title = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+            book.excluded_windows
+                .iter()
+                .any(|x| !x.trim().is_empty() && title.contains(&x.trim().to_lowercase()))
+        }
+    }
+
+    // ---- the worker side -------------------------------------------------
+
+    pub fn start_worker() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Fire>();
+        if TX.set(tx).is_err() {
+            return;
+        }
+        let _ = std::thread::Builder::new().name("expander".into()).spawn(move || {
+            for f in rx {
+                // The keystroke that triggered this was let through rather than
+                // swallowed, so give the application a moment to draw it before
+                // deleting it again.
+                std::thread::sleep(std::time::Duration::from_millis(12));
+                deliver(&f);
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    fn deliver(f: &Fire) {
+        for _ in 0..f.backspaces {
+            tap(0x08);
+        }
+        // Everything after the cursor marker has to be walked back over at the end.
+        let mut after_cursor: Option<usize> = None;
+        let plain: Option<&str> = match f.segments.as_slice() {
+            [Segment::Text(t)] => Some(t.as_str()),
+            _ => None,
+        };
+        if f.insert == Insert::Paste {
+            if let Some(t) = plain {
+                if paste(t) {
+                    return;
+                }
+            }
+        }
+        for seg in &f.segments {
+            match seg {
+                Segment::Text(t) => {
+                    for c in t.chars() {
+                        match c {
+                            // A carriage return is half of a Windows line ending and
+                            // has nothing of its own to show.
+                            '\r' => continue,
+                            // Edit controls ignore U+000A and U+0009 arriving as
+                            // unicode scan codes. A line break has to be a real
+                            // Return, and a tab a real Tab.
+                            '\n' => tap(0x0D),
+                            '\t' => tap(0x09),
+                            _ => unicode_char(c),
+                        }
+                        if let Some(n) = after_cursor.as_mut() {
+                            *n += 1;
+                        }
+                    }
+                }
+                Segment::Key(vk) => tap(*vk),
+                Segment::Cursor => after_cursor = Some(0),
+            }
+        }
+        for _ in 0..after_cursor.unwrap_or(0) {
+            tap(0x25); // VK_LEFT
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn deliver(_f: &Fire) {}
+
+    #[cfg(windows)]
+    fn tap(vk: u16) {
+        use super::win32::*;
+        // Virtual key alone is not enough. This project already learned that once -
+        // the replay path sends scan codes because that is what games and a good many
+        // controls actually read - and a synthetic Return with no scan code behind it
+        // is exactly the kind of keystroke that arrives nowhere.
+        let extended = matches!(
+            vk,
+            0x21..=0x28 // PageUp, PageDown, End, Home, arrows
+                | 0x2D    // Insert
+                | 0x2E    // Delete
+                | 0x5B    // Left Win
+                | 0x5C    // Right Win
+                | 0xA3    // Right Ctrl
+                | 0xA5 // Right Alt
+        );
+        unsafe {
+            let scan = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16;
+            for up in [false, true] {
+                let mut input = INPUT { r#type: INPUT_KEYBOARD, ..Default::default() };
+                input.Anonymous.ki.wVk = VIRTUAL_KEY(vk);
+                input.Anonymous.ki.wScan = scan;
+                let mut flags = KEYBD_EVENT_FLAGS(0);
+                if up {
+                    flags |= KEYEVENTF_KEYUP;
+                }
+                if extended {
+                    flags |= KEYEVENTF_EXTENDEDKEY;
+                }
+                input.Anonymous.ki.dwFlags = flags;
+                SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn unicode_char(c: char) {
+        use super::win32::*;
+        let mut units = [0u16; 2];
+        for unit in c.encode_utf16(&mut units).iter() {
+            unsafe {
+                for up in [false, true] {
+                    let mut input = INPUT { r#type: INPUT_KEYBOARD, ..Default::default() };
+                    input.Anonymous.ki.wScan = *unit;
+                    input.Anonymous.ki.dwFlags = if up {
+                        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                    } else {
+                        KEYEVENTF_UNICODE
+                    };
+                    SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                }
+            }
+        }
+    }
+
+    /// Borrows the clipboard, pastes, and gives it back. Returns false when the
+    /// clipboard would not cooperate, so the caller can type the text instead.
+    #[cfg(windows)]
+    fn paste(text: &str) -> bool {
+        use super::win32::*;
+        let saved = clipboard_text();
+        // Windows edit controls want CRLF, and normalising first keeps text that
+        // already had it from gaining a second carriage return.
+        let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        unsafe {
+            if !set_clipboard_text(&text) {
+                return false;
+            }
+            let ctrl = VIRTUAL_KEY(0x11);
+            let v = VIRTUAL_KEY(0x56);
+            for (key, up) in [(ctrl, false), (v, false), (v, true), (ctrl, true)] {
+                let mut input = INPUT { r#type: INPUT_KEYBOARD, ..Default::default() };
+                input.Anonymous.ki.wVk = key;
+                input.Anonymous.ki.dwFlags =
+                    if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
+                SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
+            // Long enough for the target to have taken the data before it is replaced.
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            if !saved.is_empty() {
+                set_clipboard_text(&saved);
+            }
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    unsafe fn set_clipboard_text(text: &str) -> bool {
+        use super::win32::*;
+        unsafe {
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            wide.push(0);
+            let bytes = wide.len() * 2;
+            let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
+                return false;
+            };
+            let ptr = GlobalLock(h) as *mut u16;
+            if ptr.is_null() {
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+            let _ = GlobalUnlock(h);
+            if OpenClipboard(None).is_err() {
+                return false;
+            }
+            let _ = EmptyClipboard();
+            const CF_UNICODETEXT: u32 = 13;
+            let ok = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))).is_ok();
+            let _ = CloseClipboard();
+            ok
+        }
+    }
 }
 
 // ============================================================================
@@ -2302,6 +3144,40 @@ mod virtual_desktop {
         })
     }
 
+    /// True when one of the shell's own window switchers owns the foreground.
+    ///
+    /// `IsWindowOnCurrentVirtualDesktop` answers honestly and unhelpfully here: Task
+    /// View is an overlay drawn *on* the current desktop, so the desktop has not
+    /// changed and the check below passes while synthetic clicks land in the switcher
+    /// - where they create desktops, close them and move windows between them.
+    ///
+    /// Asked every time rather than cached, unlike the desktop query: this is two
+    /// user32 calls and no COM, and a cache would let a couple of hundred milliseconds
+    /// of clicks through before it noticed. Only the two switcher classes are listed.
+    /// The Start menu and Search share a class with ordinary packaged apps, and a
+    /// macro that silently refuses to run against one of those would be a worse bug
+    /// than the one being fixed.
+    pub fn shell_switcher_in_front() -> bool {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return false;
+            }
+            let mut buf = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut buf);
+            if n <= 0 {
+                return false;
+            }
+            matches!(
+                String::from_utf16_lossy(&buf[..n as usize]).as_str(),
+                // Windows 11 Task View and Alt+Tab.
+                "XamlExplorerHostIslandWindow"
+                // Windows 10 Task View.
+                | "MultitaskingViewFrame"
+            )
+        }
+    }
+
     /// Throttled: a COM round-trip per keystroke would get the hook killed.
     pub fn is_app_on_active_desktop_cached(hwnd: HWND) -> bool {
         let now = now_us();
@@ -2321,6 +3197,9 @@ mod virtual_desktop {
     pub fn init_thread() {}
     pub fn is_app_on_active_desktop_cached(_: ()) -> bool {
         true
+    }
+    pub fn shell_switcher_in_front() -> bool {
+        false
     }
 }
 
@@ -4635,7 +5514,8 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
         }
 
         // ---- pause / virtual-desktop gate ---------------------------------
-        let on_desktop = virtual_desktop::is_app_on_active_desktop_cached(platform::app_hwnd());
+        let on_desktop = virtual_desktop::is_app_on_active_desktop_cached(platform::app_hwnd())
+            && !virtual_desktop::shell_switcher_in_front();
         state.held_by_desktop.store(!on_desktop, Ordering::Relaxed);
         let window_ok = target_window_ready(&state);
         state.waiting_window.store(!window_ok, Ordering::Relaxed);
@@ -5274,6 +6154,20 @@ unsafe fn register_hotkeys() {
         }
     }
     HK_FAILED.store(failed, Ordering::Relaxed);
+    // Which slots ended up live, every time the set is rebuilt. The log is the only
+    // place that can answer "was it ever registered?" once the moment has passed.
+    info!(
+        "hotkeys rebuilt, failure bits {failed:#04x}: {}",
+        hk.iter()
+            .enumerate()
+            .map(|(i, k)| format!(
+                "{i}={}{}",
+                k.label(),
+                if failed & (1 << i) != 0 { "!" } else { "" }
+            ))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 }
 
 #[cfg(windows)]
@@ -5303,16 +6197,24 @@ fn input_hook_thread(state: Arc<AppState>, mode: HookMode, with_tray: bool) {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             match msg.message {
-                WM_HOTKEY_ID => match msg.wParam.0 as i32 {
-                    HK_ID_RECORD => toggle_recording(&state),
-                    HK_ID_PLAY => toggle_playback(&state),
-                    HK_ID_STOP => stop_everything(&state),
-                    HK_ID_PAUSE => toggle_pause(&state),
-                    HK_ID_FASTER => nudge_speed(&state, 1.25),
-                    HK_ID_SLOWER => nudge_speed(&state, 0.8),
-                    HK_ID_SKIP => state.skip_step.store(true, Ordering::Relaxed),
-                    _ => {}
-                },
+                WM_HOTKEY_ID => {
+                    let id = msg.wParam.0 as i32;
+                    // A hotkey that quietly stops working leaves no trace, and the one
+                    // question that decides where to look next is whether Windows
+                    // delivered the message at all. Hotkeys are pressed a handful of
+                    // times a session, so this costs nothing.
+                    info!("hotkey {id} delivered");
+                    match id {
+                        HK_ID_RECORD => toggle_recording(&state),
+                        HK_ID_PLAY => toggle_playback(&state),
+                        HK_ID_STOP => stop_everything(&state),
+                        HK_ID_PAUSE => toggle_pause(&state),
+                        HK_ID_FASTER => nudge_speed(&state, 1.25),
+                        HK_ID_SLOWER => nudge_speed(&state, 0.8),
+                        HK_ID_SKIP => state.skip_step.store(true, Ordering::Relaxed),
+                        _ => {}
+                    }
+                }
                 WM_APP_REHOTKEY => register_hotkeys(),
                 WM_APP_HK_OFF => {
                     for id in HK_IDS {
@@ -5343,12 +6245,23 @@ fn input_hook_thread(state: Arc<AppState>, mode: HookMode, with_tray: bool) {
 
 /// Cheap by construction: one atomic load plus a cached desktop answer.
 #[cfg(windows)]
+/// Clicking moves the caret somewhere the typed-character buffer knows nothing
+/// about, so whatever was half-typed stops counting.
+#[cfg(windows)]
+fn note_mouse_for_expander() {
+    expander::reset();
+}
+
 fn should_record() -> Option<&'static Arc<AppState>> {
     let state = GLOBAL_STATE.get()?;
     if !state.recording.load(Ordering::Relaxed) {
         return None;
     }
-    if !virtual_desktop::is_app_on_active_desktop_cached(platform::app_hwnd()) {
+    if !virtual_desktop::is_app_on_active_desktop_cached(platform::app_hwnd())
+        || virtual_desktop::shell_switcher_in_front()
+    {
+        // Recording through the switcher is the same fault seen from the other side:
+        // it bakes clicks into the macro that will land in Task View on replay.
         return None;
     }
     Some(state)
@@ -5409,6 +6322,7 @@ unsafe extern "system" fn kb_proc(
                         return LRESULT(1);
                     }
                     if !is_hotkey_vk(data.vkCode) {
+                        expander::on_key(data.vkCode as u16, data.scanCode as u16, down);
                         if let Some(state) = should_record() {
                             emit_event(
                                 state,
@@ -5436,6 +6350,9 @@ unsafe extern "system" fn ms_proc(
 ) -> win32::LRESULT {
     use win32::*;
     if code == 0 && lp.0 != 0 {
+        if wp.0 as u32 != 0x0200 {
+            note_mouse_for_expander();
+        }
         if let Some(state) = should_record() {
             unsafe {
                 let data = &*(lp.0 as *const MSLLHOOKSTRUCT);
@@ -5615,6 +6532,10 @@ define_strings!(
     fg_cb, fg_fps, fg_added, tip_frame_guard, fg_auto, fg_measured, fg_manual,
     sec_perf, perf_cb, perf_none, perf_frametime, perf_avg, perf_low1, perf_low01,
     perf_stutter, tip_perf, tgt_from_rec, grp_anchor, grp_speed,
+    sec_expander, exp_enable, exp_count, exp_reload, exp_open, tip_expander,
+    exp_add, exp_abbr, exp_text, exp_prefix, exp_default_trigger, exp_delims,
+    exp_excluded_lbl, exp_tr_inherit, exp_tr_delim, exp_tr_prefix, exp_tr_instant,
+    exp_in_type, exp_in_paste,
 );
 
 const EN: Strings = Strings {
@@ -5726,6 +6647,14 @@ const EN: Strings = Strings {
     tip_perf: "Timed by sending an empty message through the window's own loop, not by counting frames — no driver hooks, no administrator rights. A game that drains its queue once per frame answers in about one frame, which is exactly the delay the guard has to cover. For true frame statistics use PresentMon or RTSS.",
     tgt_from_rec: "\u{2935} From the recording", grp_anchor: "Coordinate anchoring",
     grp_speed: "How well the window keeps up",
+    sec_expander: "⌨ Text expander", exp_enable: "Expand abbreviations as I type",
+    exp_count: "{} entries enabled", exp_reload: "Reload", exp_open: "Edit expansions.json",
+    tip_expander: "Type a short abbreviation and it becomes the longer text you saved for it. Entries live in expansions.json; edit it, then press Reload. Never expands while recording or replaying a macro.",
+    exp_add: "+ Add", exp_abbr: "short", exp_text: "becomes this", exp_prefix: "mark",
+    exp_default_trigger: "Default trigger", exp_delims: "Delimiters",
+    exp_excluded_lbl: "Never in windows", exp_tr_inherit: "default",
+    exp_tr_delim: "after a delimiter", exp_tr_prefix: "behind a marker",
+    exp_tr_instant: "immediately", exp_in_type: "type", exp_in_paste: "paste",
 };
 
 const RU: Strings = Strings {
@@ -5842,6 +6771,14 @@ const RU: Strings = Strings {
     tip_perf: "Измеряется временем прохождения пустого сообщения через цикл окна, а не подсчётом кадров — без хуков в драйвер и прав администратора. Игра, которая разбирает очередь раз в кадр, отвечает примерно за кадр, а это ровно та задержка, которую перекрывает защита. Для настоящей статистики кадров используйте PresentMon или RTSS.",
     tgt_from_rec: "\u{2935} Из записи", grp_anchor: "Привязка координат",
     grp_speed: "Насколько окно успевает",
+    sec_expander: "⌨ Текстовый расширитель", exp_enable: "Разворачивать сокращения при наборе",
+    exp_count: "включено записей: {}", exp_reload: "Перечитать", exp_open: "Открыть expansions.json",
+    tip_expander: "Набираете короткое сокращение — оно превращается в сохранённый под него текст. Записи лежат в expansions.json: отредактируйте и нажмите «Перечитать». Во время записи и воспроизведения макроса не срабатывает.",
+    exp_add: "+ Добавить", exp_abbr: "кратко", exp_text: "превращается в это", exp_prefix: "знак",
+    exp_default_trigger: "Срабатывание по умолчанию", exp_delims: "Разделители",
+    exp_excluded_lbl: "Молчать в окнах", exp_tr_inherit: "по умолчанию",
+    exp_tr_delim: "после разделителя", exp_tr_prefix: "за префиксом",
+    exp_tr_instant: "сразу", exp_in_type: "печатать", exp_in_paste: "вставить",
 };
 
 const UK: Strings = Strings {
@@ -5959,6 +6896,14 @@ const UK: Strings = Strings {
     tip_perf: "Вимірюється часом проходження порожнього повідомлення через цикл вікна, а не підрахунком кадрів — без хуків у драйвер і прав адміністратора. Гра, яка розбирає чергу раз на кадр, відповідає приблизно за кадр, а це саме та затримка, яку перекриває захист. Для справжньої статистики кадрів використовуйте PresentMon або RTSS.",
     tgt_from_rec: "\u{2935} Із запису", grp_anchor: "Прив'язка координат",
     grp_speed: "Наскільки вікно встигає",
+    sec_expander: "⌨ Текстовий розширювач", exp_enable: "Розгортати скорочення під час набору",
+    exp_count: "увімкнено записів: {}", exp_reload: "Перечитати", exp_open: "Відкрити expansions.json",
+    tip_expander: "Набираєте коротке скорочення — воно перетворюється на збережений під нього текст. Записи лежать у expansions.json: відредагуйте та натисніть «Перечитати». Під час запису та відтворення макроса не спрацьовує.",
+    exp_add: "+ Додати", exp_abbr: "коротко", exp_text: "перетворюється на це", exp_prefix: "знак",
+    exp_default_trigger: "Спрацювання за умовчанням", exp_delims: "Роздільники",
+    exp_excluded_lbl: "Мовчати у вікнах", exp_tr_inherit: "за умовчанням",
+    exp_tr_delim: "після роздільника", exp_tr_prefix: "за префіксом",
+    exp_tr_instant: "одразу", exp_in_type: "друкувати", exp_in_paste: "вставити",
 };
 
 const PT: Strings = Strings {
@@ -6073,6 +7018,14 @@ const PT: Strings = Strings {
     tip_perf: "Medido pelo tempo de uma mensagem vazia no ciclo da própria janela, não por contagem de fotogramas — sem ganchos no controlador nem direitos de administrador. Um jogo que esvazia a fila uma vez por fotograma responde em cerca de um fotograma, que é exatamente o atraso que a proteção cobre. Para estatísticas reais use PresentMon ou RTSS.",
     tgt_from_rec: "\u{2935} Da gravação", grp_anchor: "Ancoragem de coordenadas",
     grp_speed: "Quão bem a janela acompanha",
+    sec_expander: "⌨ Expansor de texto", exp_enable: "Expandir abreviaturas ao escrever",
+    exp_count: "{} entradas ativas", exp_reload: "Recarregar", exp_open: "Abrir expansions.json",
+    tip_expander: "Escreva uma abreviatura curta e ela transforma-se no texto que guardou para ela. As entradas estão em expansions.json: edite e carregue em Recarregar. Nunca expande durante a gravação ou a reprodução de um macro.",
+    exp_add: "+ Adicionar", exp_abbr: "curto", exp_text: "torna-se isto", exp_prefix: "marca",
+    exp_default_trigger: "Disparo predefinido", exp_delims: "Delimitadores",
+    exp_excluded_lbl: "Nunca em janelas", exp_tr_inherit: "predefinido",
+    exp_tr_delim: "após delimitador", exp_tr_prefix: "atrás de marca",
+    exp_tr_instant: "imediatamente", exp_in_type: "escrever", exp_in_paste: "colar",
 };
 
 const ES: Strings = Strings {
@@ -6189,6 +7142,14 @@ const ES: Strings = Strings {
     tip_perf: "Se mide con el tiempo de un mensaje vacío en el propio bucle de la ventana, no contando fotogramas — sin ganchos en el controlador ni permisos de administrador. Un juego que vacía su cola una vez por fotograma responde en torno a un fotograma, que es justo el retardo que cubre la protección. Para estadísticas reales usa PresentMon o RTSS.",
     tgt_from_rec: "\u{2935} De la grabación", grp_anchor: "Anclaje de coordenadas",
     grp_speed: "Cómo va siguiendo la ventana",
+    sec_expander: "⌨ Expansor de texto", exp_enable: "Expandir abreviaturas al escribir",
+    exp_count: "{} entradas activas", exp_reload: "Recargar", exp_open: "Abrir expansions.json",
+    tip_expander: "Escribe una abreviatura corta y se convierte en el texto que guardaste para ella. Las entradas están en expansions.json: edítalo y pulsa Recargar. Nunca expande mientras se graba o reproduce un macro.",
+    exp_add: "+ Añadir", exp_abbr: "corto", exp_text: "se convierte en esto", exp_prefix: "marca",
+    exp_default_trigger: "Disparo por defecto", exp_delims: "Delimitadores",
+    exp_excluded_lbl: "Nunca en ventanas", exp_tr_inherit: "por defecto",
+    exp_tr_delim: "tras delimitador", exp_tr_prefix: "tras marca",
+    exp_tr_instant: "al instante", exp_in_type: "escribir", exp_in_paste: "pegar",
 };
 
 const ZH: Strings = Strings {
@@ -6300,6 +7261,14 @@ const ZH: Strings = Strings {
     tip_perf: "通过测量一条空消息在窗口自身消息循环中的往返时间得出，而不是统计帧数 — 无需驱动钩子，也无需管理员权限。每帧处理一次消息队列的游戏大约在一帧内回应，而这正是帧率保护需要覆盖的延迟。若需要真实的帧数统计，请使用 PresentMon 或 RTSS。",
     tgt_from_rec: "\u{2935} 取自录制", grp_anchor: "坐标锚定",
     grp_speed: "窗口跟得上的程度",
+    sec_expander: "⌨ 文本扩展", exp_enable: "输入时展开缩写",
+    exp_count: "已启用条目：{}", exp_reload: "重新载入", exp_open: "打开 expansions.json",
+    tip_expander: "输入一个短缩写，它会变成你为它保存的长文本。条目保存在 expansions.json 中：编辑后按“重新载入”。录制或回放宏时不会触发。",
+    exp_add: "+ 添加", exp_abbr: "缩写", exp_text: "展开为", exp_prefix: "标记",
+    exp_default_trigger: "默认触发方式", exp_delims: "分隔符",
+    exp_excluded_lbl: "在这些窗口中不触发", exp_tr_inherit: "默认",
+    exp_tr_delim: "分隔符之后", exp_tr_prefix: "标记之后",
+    exp_tr_instant: "立即", exp_in_type: "逐字输入", exp_in_paste: "粘贴",
 };
 
 const LANG_CODES: [&str; 6] = ["en", "ru", "uk", "pt", "es", "zh"];
@@ -7183,6 +8152,14 @@ struct MacroApp {
     profile_name: String,
     /// Fill for the central panel - this is what makes the window translucent.
     panel_fill: egui::Color32,
+    /// The expander's entries while they are being edited. A working copy rather
+    /// than the live one: the keyboard hook reads the live book on every keystroke,
+    /// and holding that lock across a frame of rendering is exactly how a low-level
+    /// hook gets itself unhooked.
+    exp_book: expander::Book,
+    /// The exclusion list is a `Vec` in the file and one line in the UI.
+    exp_excluded: String,
+    exp_dirty: bool,
     // pixel picking
     pick_deadline: Option<Instant>,
     /// When the current "press a key" session started.
@@ -7194,7 +8171,11 @@ impl MacroApp {
         setup_fonts(&cc.egui_ctx);
         let panel_fill =
             apply_theme(&cc.egui_ctx, theme_at(config.default_theme), config.transparent_ui);
+        let exp_book = expander::snapshot();
         Self {
+            exp_excluded: exp_book.excluded_windows.join(", "),
+            exp_book,
+            exp_dirty: false,
             panel_fill,
             state,
             config,
@@ -8852,6 +9833,201 @@ impl eframe::App for MacroApp {
                     }
                 });
 
+                // ---- text expander ---------------------------------------------------
+                egui::CollapsingHeader::new(s.sec_expander).show(ui, |ui| {
+                    ui.label(egui::RichText::new(s.tip_expander).weak().small());
+                    let triggers =
+                        [s.exp_tr_inherit, s.exp_tr_delim, s.exp_tr_prefix, s.exp_tr_instant];
+                    let inserts = [s.exp_in_type, s.exp_in_paste];
+
+                    self.exp_dirty |=
+                        ui.checkbox(&mut self.exp_book.enabled, s.exp_enable).changed();
+
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(s.exp_default_trigger);
+                        let mut idx = trigger_index(&self.exp_book.default_trigger).max(1);
+                        egui::ComboBox::from_id_salt("exp_deftrig")
+                            .selected_text(triggers[idx])
+                            .show_ui(ui, |ui| {
+                                // Inherit is meaningless as the global answer, so the
+                                // global list starts at the one after it.
+                                for (i, name) in triggers.iter().enumerate().skip(1) {
+                                    if ui.selectable_label(idx == i, *name).clicked() {
+                                        idx = i;
+                                    }
+                                }
+                            });
+                        let picked = trigger_from_index(idx, "");
+                        if picked != self.exp_book.default_trigger {
+                            self.exp_book.default_trigger = picked;
+                            self.exp_dirty = true;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(s.exp_delims);
+                        self.exp_dirty |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.exp_book.delimiters)
+                                    .desired_width(180.0),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(s.exp_excluded_lbl);
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.exp_excluded)
+                                    .desired_width(180.0),
+                            )
+                            .changed()
+                        {
+                            self.exp_book.excluded_windows = self
+                                .exp_excluded
+                                .split(',')
+                                .map(|x| x.trim().to_string())
+                                .filter(|x| !x.is_empty())
+                                .collect();
+                            self.exp_dirty = true;
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(s.exp_count.replace(
+                            "{}",
+                            &self
+                                .exp_book
+                                .entries
+                                .iter()
+                                .filter(|e| e.enabled)
+                                .count()
+                                .to_string(),
+                        ))
+                        .weak(),
+                    );
+
+                    let mut remove: Option<usize> = None;
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        for i in 0..self.exp_book.entries.len() {
+                            ui.horizontal_wrapped(|ui| {
+                                let e = &mut self.exp_book.entries[i];
+                                self.exp_dirty |= ui.checkbox(&mut e.enabled, "").changed();
+                                self.exp_dirty |= ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut e.abbr)
+                                            .hint_text(s.exp_abbr)
+                                            .desired_width(80.0),
+                                    )
+                                    .changed();
+
+                                let mut ti = trigger_index(&e.trigger);
+                                egui::ComboBox::from_id_salt(format!("exp_tr{i}"))
+                                    .selected_text(triggers[ti])
+                                    .width(110.0)
+                                    .show_ui(ui, |ui| {
+                                        for (k, name) in triggers.iter().enumerate() {
+                                            if ui.selectable_label(ti == k, *name).clicked() {
+                                                ti = k;
+                                            }
+                                        }
+                                    });
+                                let prefix = match &e.trigger {
+                                    expander::Trigger::Prefix(p) => p.clone(),
+                                    _ => ";;".to_string(),
+                                };
+                                let picked = trigger_from_index(ti, &prefix);
+                                if picked != e.trigger {
+                                    e.trigger = picked;
+                                    self.exp_dirty = true;
+                                }
+                                if let expander::Trigger::Prefix(p) = &mut e.trigger {
+                                    self.exp_dirty |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(p)
+                                                .hint_text(s.exp_prefix)
+                                                .desired_width(44.0),
+                                        )
+                                        .changed();
+                                }
+
+                                let mut ii = usize::from(e.insert == expander::Insert::Paste);
+                                egui::ComboBox::from_id_salt(format!("exp_in{i}"))
+                                    .selected_text(inserts[ii])
+                                    .width(84.0)
+                                    .show_ui(ui, |ui| {
+                                        for (k, name) in inserts.iter().enumerate() {
+                                            if ui.selectable_label(ii == k, *name).clicked() {
+                                                ii = k;
+                                            }
+                                        }
+                                    });
+                                let want = if ii == 1 {
+                                    expander::Insert::Paste
+                                } else {
+                                    expander::Insert::Type
+                                };
+                                if want != e.insert {
+                                    e.insert = want;
+                                    self.exp_dirty = true;
+                                }
+
+                                if ui.button("🗑").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                            self.exp_dirty |= ui
+                                .add(
+                                    egui::TextEdit::multiline(
+                                        &mut self.exp_book.entries[i].text,
+                                    )
+                                    .hint_text(s.exp_text)
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY),
+                                )
+                                .changed();
+                            ui.separator();
+                        }
+                    });
+                    if let Some(i) = remove {
+                        self.exp_book.entries.remove(i);
+                        self.exp_dirty = true;
+                    }
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button(s.exp_add).clicked() {
+                            self.exp_book.entries.push(expander::Entry {
+                                enabled: true,
+                                abbr: String::new(),
+                                text: String::new(),
+                                trigger: expander::Trigger::Inherit,
+                                insert: expander::Insert::Type,
+                            });
+                            self.exp_dirty = true;
+                        }
+                        if ui.button(s.exp_reload).clicked() {
+                            expander::load();
+                            self.exp_book = expander::snapshot();
+                            self.exp_excluded = self.exp_book.excluded_windows.join(", ");
+                            self.exp_dirty = false;
+                        }
+                        if ui.button(s.exp_open).clicked() {
+                            run_program(&paths::expansions_path().to_string_lossy(), "");
+                        }
+                    });
+
+                    // Applied at the end of the frame rather than on each keystroke:
+                    // an entry is edited a character at a time, and writing the file
+                    // that often would be silly.
+                    if self.exp_dirty {
+                        expander::replace(self.exp_book.clone());
+                        if let Err(e) = expander::save_current() {
+                            self.status_msg = format!("expansions.json: {e}");
+                        }
+                        self.exp_dirty = false;
+                    }
+                });
+
                 // ---- text on screen --------------------------------------------------
                 egui::CollapsingHeader::new(s.sec_ocr).show(ui, |ui| {
                     ui.label(egui::RichText::new(s.tip_ocr).weak().small());
@@ -10483,6 +11659,8 @@ fn main() -> Result<()> {
     apply_config_to_state(&config, &state);
 
     paths::ensure_dirs();
+    expander::load();
+    expander::start_worker();
 
     {
         let st = state.clone();
@@ -10905,6 +12083,142 @@ mod tests {
     }
 
     // ---- responsiveness maths ----------------------------------------------
+
+    fn book_with(entries: Vec<expander::Entry>) -> expander::Book {
+        expander::Book { enabled: true, entries, ..Default::default() }
+    }
+
+    fn entry(abbr: &str, text: &str, t: expander::Trigger) -> expander::Entry {
+        expander::Entry {
+            enabled: true,
+            abbr: abbr.into(),
+            text: text.into(),
+            trigger: t,
+            insert: expander::Insert::Type,
+        }
+    }
+
+    fn typed(book: &expander::Book, s: &str) -> Option<expander::Fire> {
+        let mut buf: Vec<char> = Vec::new();
+        let mut last = None;
+        for c in s.chars() {
+            buf.push(c);
+            last = expander::match_at(book, &buf, c);
+            if last.is_some() {
+                break;
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn delimiter_mode_waits_for_the_space() {
+        let b = book_with(vec![entry("addr", "Baker Street", expander::Trigger::Inherit)]);
+        assert!(typed(&b, "addr").is_none(), "fired before the delimiter");
+        let f = typed(&b, "addr ").expect("did not fire on the space");
+        // Four characters and the space, and the space comes back after the text.
+        assert_eq!(f.backspaces, 5);
+        assert_eq!(f.segments, vec![expander::Segment::Text("Baker Street ".into())]);
+    }
+
+    #[test]
+    fn an_abbreviation_inside_a_word_does_not_fire() {
+        let b = book_with(vec![entry("addr", "Baker Street", expander::Trigger::Inherit)]);
+        assert!(typed(&b, "readdr ").is_none());
+        assert!(typed(&b, "my addr ").is_some());
+    }
+
+    #[test]
+    fn instant_and_prefix_modes_fire_without_a_delimiter() {
+        let b = book_with(vec![
+            entry(";sig", "Kind regards", expander::Trigger::Instant),
+            entry("me", "Sherlock", expander::Trigger::Prefix(";;".into())),
+        ]);
+        assert_eq!(typed(&b, ";sig").expect("instant").backspaces, 4);
+        assert_eq!(typed(&b, ";;me").expect("prefix").backspaces, 4);
+        // Without its prefix the short abbreviation stays inert, which is the whole
+        // reason the mode exists.
+        assert!(typed(&b, "me ").is_none());
+    }
+
+    #[test]
+    fn the_longest_abbreviation_wins_when_two_match_at_once() {
+        // `;` is a delimiter, so the moment `;sig` is typed both entries match: the
+        // short one behind a word boundary, the long one from the start of the buffer.
+        // That is the collision the rule is for.
+        let b = book_with(vec![
+            entry("sig", "short", expander::Trigger::Instant),
+            entry(";sig", "long", expander::Trigger::Instant),
+        ]);
+        let f = typed(&b, ";sig").expect("fired");
+        assert_eq!(f.segments, vec![expander::Segment::Text("long".into())]);
+        assert_eq!(f.backspaces, 4);
+    }
+
+    #[test]
+    fn instant_mode_fires_before_a_longer_abbreviation_can_be_finished() {
+        // Not a defect but a property worth pinning down: instant expansion cannot
+        // wait to find out whether more is coming, so `;sig` goes off halfway through
+        // `;signature`.
+        let b = book_with(vec![
+            entry(";sig", "short", expander::Trigger::Instant),
+            entry(";signature", "long", expander::Trigger::Instant),
+        ]);
+        assert_eq!(
+            typed(&b, ";signature").expect("fired").segments,
+            vec![expander::Segment::Text("short".into())]
+        );
+
+        // Delimiter mode has no such problem, because nothing is decided until the
+        // word has ended. Which is why it is the default.
+        let d = book_with(vec![
+            entry("sig", "short", expander::Trigger::Inherit),
+            entry("signature", "long", expander::Trigger::Inherit),
+        ]);
+        assert_eq!(
+            typed(&d, "signature ").expect("fired").segments,
+            vec![expander::Segment::Text("long ".into())]
+        );
+    }
+
+    #[test]
+    fn a_disabled_entry_and_a_disabled_book_stay_quiet() {
+        let mut b = book_with(vec![entry("addr", "x", expander::Trigger::Inherit)]);
+        b.entries[0].enabled = false;
+        assert!(typed(&b, "addr ").is_none());
+        b.entries[0].enabled = true;
+        b.enabled = false;
+        assert!(typed(&b, "addr ").is_none());
+    }
+
+    #[test]
+    fn placeholders_become_segments() {
+        use expander::Segment::*;
+        assert_eq!(
+            expander::render("a{cursor}b"),
+            vec![Text("a".into()), Cursor, Text("b".into())]
+        );
+        assert_eq!(
+            expander::render("name{key:Tab}mail"),
+            vec![Text("name".into()), Key(0x09), Text("mail".into())]
+        );
+        // A backslash is how a replacement contains a literal placeholder.
+        assert_eq!(expander::render("\\{date}"), vec![Text("{date}".into())]);
+        // An unknown token is left as written rather than swallowed.
+        assert_eq!(expander::render("{nope}"), vec![Text("{nope}".into())]);
+        // So is an unclosed brace, which is a typo and not a token.
+        assert_eq!(expander::render("{oops"), vec![Text("{oops".into())]);
+        assert!(expander::render("{random:a|a|a}") == vec![Text("a".into())]);
+    }
+
+    #[test]
+    fn date_patterns_are_substituted() {
+        let out = expander::stamp("yyyy-MM-dd HH:mm:ss");
+        assert_eq!(out.len(), 19, "unexpected shape: {out}");
+        assert!(out.chars().all(|c| c.is_ascii_digit() || "-: ".contains(c)));
+        assert_eq!(expander::key_by_name("enter"), Some(0x0D));
+        assert_eq!(expander::key_by_name("nonsense"), None);
+    }
 
     #[test]
     fn setting_a_time_on_a_stale_selection_keeps_the_process_alive() {
