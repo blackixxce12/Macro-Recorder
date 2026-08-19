@@ -244,6 +244,12 @@ If you want "shut the PC down when the script finishes", use a `Run` step with t
 | **Quit the app** | Close Macro Recorder itself |
 | **Note** | Write text to the log file (for debugging) |
 | **Read number** | Recognise a number on screen into a variable |
+| **Find image** | Look for a picture and report where it is, without clicking |
+| **Read text** | Recognise a rectangle into a **text** variable |
+| **Get text** | Clipboard, window title, program in front or a file → variable |
+| **Put text** | Variable or literal text → clipboard or file |
+| **Find element** | Ask Windows for an interface element and report where it is |
+| **Press element** | Press an interface element, through the application itself |
 
 ---
 
@@ -310,14 +316,28 @@ The condition is polled about eight times a second.
 
 ### 🖼 Click image
 
-**Fields:** `Template` (file name) · threshold (0.30–1.00) · mouse button.
+**Fields:** `Template` (file name) · threshold (0.30–1.00) · mouse button · `outlines` · **Area**.
 
 Finds a picture on screen and clicks its **centre**.
 
-- The template is the name of a PNG in the `templates/` folder. Both `claim_button` and `claim_button.png` work.
+- The template is the name of a PNG in the `templates/` folder. Both `claim_button` and `claim_button.png` work. A **folder** of that name is a set of variants — see [section 11](#11-image-templates-how-to-make-good-ones).
 - If the picture is **not found**, the step quietly does nothing and the script carries on.
 - There's a 30 ms gap between press and release.
 - Window anchoring does **not** apply here: the coordinates come from the actual match, so they're already correct.
+
+**Area** is the field that decides how fast this is, and it is on every image step and image condition:
+
+| Area | What it searches | When to use it |
+|---|---|---|
+| **whole screen** | every monitor | the default, and the slowest |
+| **active window** | whatever is in front | almost always right, and much faster |
+| **a rectangle** | X, Y, W, H you type | a HUD that never moves |
+| **near the last match** | a margin around where this same picture was last seen | anything that stays put; falls back to the whole screen if it is not there |
+| **relative to another picture** | find an *anchor* first, then a rectangle placed relative to it | a row of identical buttons, where the heading decides which one |
+
+Measured on a 2560×1440 desktop, a full-screen step is about 111 ms; a few hundred pixels square is about 12. Everything else in this release is smaller than that difference.
+
+**outlines** compares shapes instead of shades. Slower by one pass, and the thing to switch on when a template that used to work stops after a theme change or under a highlighted row.
 
 How to make templates — [section 11](#11-image-templates-how-to-make-good-ones).
 
@@ -439,7 +459,7 @@ Does nothing at all — it just writes your line into the log file. This is the 
 
 ### 🔤 Read number
 
-**Fields:** `Variable` · `Region` (X, Y, W, H).
+**Fields:** `Variable` · **Prep** · **Expect** · `Region` (X, Y, W, H).
 
 Recognises the text in a screen rectangle, pulls a number out of it and stores it in a variable.
 
@@ -465,13 +485,134 @@ What the number parser understands:
 
 > ⚠️ If the OCR engine errors out (a region smaller than 40×40 px, for instance), the variable **keeps its old value**. Reset it with a `Set` step before the first read.
 
+**Prep** is what is done to the pixels before the engine sees them. Windows OCR was built for documents — dark text, light paper, generous size — and it has no settings at all. Screen text is none of those, so everything that can be done has to be done to the pixels first:
+
+| Profile | What it does | For |
+|---|---|---|
+| **none** | nothing but the enlargement the engine needs | text that already reads well |
+| **interface** | grey, contrast pulled out to the full range | ordinary menus and labels |
+| **small text** | the same, enlarged harder | text too small to have enough pixels |
+| **game HUD** | grey, stretched, then cut to black and white at Otsu's threshold | a pale number over moving artwork |
+| **digits** | black and white, enlarged hard | a counter on a plate |
+| **try each** | walks the list and keeps the best reading | when you do not know which |
+
+Light text on a dark panel is turned the other way round automatically — the engine was trained on documents, and reads dark-on-light markedly better.
+
+**Expect** says what the reading is supposed to look like:
+
+| Expect | Passes | Fails |
+|---|---|---|
+| **anything** | any non-empty reading | nothing |
+| **whole number** | `Gems: 1,250` | `no digits here` |
+| **decimal** | `12.5%` | a reading with no digits |
+| **clock** | `02:34`, `1:02:03` | `1250` |
+| **pattern** | what the pattern says | everything else |
+
+A pattern is a small thing you can type: `#` one digit, `@` one letter, `?` any one character, `*` any run including none. `##:##` matches `12:34` and not `1:34`. It is deliberately not a regular expression.
+
+**A reading that does not fit the expected format is refused, and the variable keeps its old value.** That is the point of the field: a mis-read clock is not a small error, it is a different number, and quietly writing a zero is worse than doing nothing.
+
+It also sets `<name>.quality`, from 0 to 1: half of it is whether the format parses at all, half is how much of the reading belongs to the alphabet that format implies. A clock that came back as `O2:3A` fails the first; a clock lifted out of a sentence fails the second. With **try each**, this is also what chooses the profile.
+
+> 💡 The **🔤 Text on screen** panel in the main window has the same two pickers and shows the fit score next to the reading, so a profile can be chosen by comparing numbers instead of squinting.
+
+---
+
+### 🔍 Find image
+
+**Fields:** `Template` · threshold · `outlines` · **into** (a name) · **Area**.
+
+Looks for a picture and writes down what it found. It never clicks, which is what makes it the step to use when you want to *decide* something rather than press it.
+
+With **into** set to `target`, it fills:
+
+| Variable | Holds |
+|---|---|
+| `target.found` | 1 if the score reached the threshold, 0 if it did not |
+| `target.score` | the best score it saw, whether or not it passed |
+| `target.x`, `target.y` | the centre of the best match |
+| `target.w`, `target.h` | the size of the variant that won |
+
+`target.score` is the useful one when a step is not matching: it tells "nothing like it on screen" (0.4) apart from "almost, lower the threshold" (0.83).
+
+```
+Find image   claim → target
+If           target.found == 1
+  Click at   {target.x}, {target.y}
+End if
+```
+
+---
+
+### 🔤 Read text
+
+**Fields:** `Variable` · **Prep** · `Region` (X, Y, W, H).
+
+The same as **Read number**, except the whole reading is kept, as text. Use it when what is on screen is a name, a status or a message rather than a quantity.
+
+It also sets `<name>.quality` — see **Read number** below for what that number means.
+
+---
+
+### 📋 Get text
+
+**Fields:** source · `into` (a variable).
+
+| Source | What lands in the variable |
+|---|---|
+| **clipboard** | whatever was last copied, as text |
+| **title of the window in front** | e.g. `Roblox - Level 7` |
+| **program in front** | e.g. `RobloxPlayerBeta.exe` |
+| **file** | the contents of a file, up to 1 MB |
+
+---
+
+### 📤 Put text
+
+**Fields:** text · destination (clipboard, or a file with an *add to the end* switch).
+
+`{name}` anywhere in the text is replaced by what that variable holds, so this is how a script keeps a log of its own:
+
+```
+Put text   "{now} run finished with {gems} gems" → C:/logs/farm.txt  (add to the end)
+```
+
+`{{` is a literal brace. A name nobody set is left as written rather than vanishing — a message that silently loses a word is much harder to diagnose than one that shows `{typo}`.
+
+---
+
+### 🪟 Find element
+
+**Fields:** `Name` · `Kind` · `Id` · *in the window in front* · `into` · timeout.
+
+Asks **Windows** what is on screen instead of looking at the pixels. Where it works it is better than everything else here: no threshold, no resolution, no theme, no language.
+
+- **Name** is the text a screen reader would read out. Matched exactly first (ignoring case), then as a substring.
+- **Kind** narrows it to `Button`, `Edit`, `Text`, `CheckBox`, `ComboBox`, `List`, `ListItem`, `MenuItem`, `Tab`, `Window`. Worth filling in: it turns a whole window into a handful of elements.
+- **Id** is the identifier the application gives the control. The most reliable field there is, when the application bothers to set one.
+- **timeout** keeps looking for that long. An interface still drawing itself is the normal case just after a click.
+
+With `into` set to `elem` it fills `elem` (the control's value, or its label if it has no value), `elem.found`, `elem.name`, `elem.x`, `elem.y`, `elem.w`, `elem.h`.
+
+> ⚠️ **It will find nothing in a game.** Unity, DirectX, OpenGL and canvas interfaces draw themselves and expose nothing to Windows. This is a feature for automating ordinary programs. The right arrangement is a cascade: element → picture → text → coordinates.
+
+---
+
+### 🖲 Press element
+
+**Fields:** the same query · mouse button · *ask the app* · timeout.
+
+Finds the element and presses it.
+
+With **ask the app** on it uses the application's own press: nothing moves on screen, the cursor stays where it is, the window does not even have to be in front, and a control that has shifted since it was found is still the one that gets pressed. If the control offers nothing to press, the step falls back to a real click on its centre.
+
 ---
 
 ## 8. Conditions: how the macro looks at the screen
 
 A condition is a yes/no question. Conditions are used by three steps: `Wait for`, `If` and `While`.
 
-There are six of them.
+There are eight of them.
 
 ### 1️⃣ always
 
@@ -482,26 +623,35 @@ The answer is always yes. Useful for:
 
 ### 2️⃣ variable
 
-**Fields:** name · comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`) · number.
+**Fields:** name · comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`, `has`) · a number **or a piece of text**.
 
 ```
 While  rounds < 20
 If     gems >= 500
+If     window has "level"
 ```
 
 A variable that was never assigned counts as **0**.
+
+If both sides read as numbers they are compared as numbers, whichever way they are stored — a count recognised off the screen lands as text and still compares against `10`. Otherwise the comparison is textual, trimmed and case-insensitive. `has` asks about containment, as forgivingly as screen text needs.
 
 > ⚠️ `==` on fractional numbers is a bad idea. `0.1 + 0.2` isn't exactly `0.3` in a computer. Use `>=` and `<=`.
 
 ### 3️⃣ image
 
-**Fields:** `Template` · threshold (0.30–1.00).
+**Fields:** `Template` · threshold (0.30–1.00) · **Area** · **lost below** · **stable N / M** · `outlines`.
 
 "Is this picture on screen right now?"
 
-- Searches the **whole desktop** (all monitors) at 1:1 scale.
+- **Area** works exactly as it does on `Click image` above, and is the single biggest thing you can do for speed.
 - Side effect: it fills the built-in variables `match_x`, `match_y`, `match_score` — handy for debugging.
 - 0.85 is a good starting threshold. Lower means more false hits; higher and antialiasing starts breaking matches.
+
+**lost below** is a second, lower threshold, and it is worth understanding. A score that wobbles around a single threshold — 0.79, 0.81, 0.79, 0.82 against 0.80 — reads as *four* changes of state, and a `While` acting on each of them will thrash. Set **lost below** to 0.70 and the picture appears once at 0.81 and is not lost until it drops under 0.70: one change of state instead of four. Leave it at 0 for the old all-or-nothing behaviour.
+
+**stable N / M** wants the answer in N of the last M looks. `2 / 3` tells an object (0.82, 0.84, 0.83) from a flicker (0.83, 0.51, 0.74). Both at 0 means every look decides on its own.
+
+Both are kept per template, not per step, so two steps watching the same picture agree about it.
 
 ### 4️⃣ pixel
 
@@ -541,6 +691,24 @@ So `You win!` matches a recognised `YOU  WIN !`.
 >
 > ⚠️ It uses the text recognition built into Windows. If your game isn't in English, add the language in *Windows Settings → Time & language*. Stylised game fonts read badly — check first with the **🔤 Read now** button.
 
+It has a **Prep** picker too, and the word you are looking for doubles as the format that **try each** judges its attempts by.
+
+### 7️⃣ process running
+
+**Field:** name.
+
+"Is a program with this name running?"
+
+Matched on part of the name, without case, so `roblox` finds `RobloxPlayerBeta.exe`. Cheaper than the window condition and answers even when the program has no window yet.
+
+### 8️⃣ element on screen
+
+**Fields:** the same query as **Find element** above.
+
+"Does Windows know about an interface element like this?"
+
+One look, not a wait — `Wait for` is already a loop. Silent in anything that draws its own interface; see the warning under **Find element**.
+
 ---
 
 ## 9. Variables: the script's memory
@@ -562,11 +730,22 @@ Storing a value — the **Set** step:
 | `-=` | Subtract | `lives -= 1` |
 | `*=` | Multiply | `bet *= 2` |
 
+A value is either a **number** or a piece of **text** — the `Set` step has a picker for which. Adding text to text joins it, which is how a message is built up a piece at a time; two numbers that happen to be stored as text are still two numbers and are added.
+
+```
+Set  msg  =   "run "
+Set  msg  +=  {rounds}
+Set  msg  +=  " finished"
+```
+
+`{name}` in any step's text — `Note`, `Run`, `Put text`, and a text value in `Set` — is replaced by what that variable holds. `{{` is a literal brace, and a name nobody set is left as written rather than vanishing.
+
 Checking a value — the **variable** condition:
 
 ```
 While  rounds < 20
 If     gems >= 500
+If     title has "level"
 ```
 
 ### The classic counter
@@ -592,6 +771,10 @@ Filled in automatically whenever the script searches for something:
 | `match_x` | X of the centre of the last image match |
 | `match_y` | Y of the centre of the last image match |
 | `match_score` | How well it matched: 0.00 … 1.00 |
+
+Steps that name their own prefix fill more. `Find image → target` gives `target.found`, `target.score`, `target.x`, `target.y`, `target.w`, `target.h`; `Find element → elem` gives `elem` itself plus `elem.found`, `elem.name` and the same four numbers; `Read number → gold` and `Read text → line` add `gold.quality` and `line.quality`.
+
+A dot in a name is nothing special — variable names are plain strings, and `target.x` is simply a variable called `target.x`.
 
 The most useful application is diagnosis. Picture not being found? Put this after the check:
 
@@ -756,14 +939,27 @@ Fully transparent pixels in the PNG are **excluded from the comparison**.
 
 So in any editor (Paint.NET, GIMP, Photoshop) you can erase the background around a round icon to transparency — and it will then be found on any backdrop: grass, stone, water.
 
+### One object, several pictures
+
+A **folder** under `templates/` is a set. Put `normal.png`, `hover.png` and `dark.png` inside `templates/Claim/`, write `Claim` in the step, and all three are tried against the same screenshot; the best one wins, and `target.w`/`target.h` report the size of the variant that actually matched.
+
+The screen is taken once for the whole set, so the extra cost is only the comparisons — but it is linear in the number of variants, which is exactly why a folder wants a **search area** rather than the whole desktop.
+
+Files are tried in alphabetical order, so which variant wins a tie does not depend on the file system.
+
+### The scale it was cut at
+
+A picture snipped on a display at 150 % is half again the size of the same button on a display at 100 %, and no threshold bridges that.
+
+When you press **💾 Save** in the image panel, a small `Name.png.json` is written beside the PNG recording the display scale at that moment. Loading the template rescales it for whatever display it is about to be looked for on.
+
+Templates made before 1.4.0 have no such file, and nothing is guessed for them — they are used exactly as they are.
+
 ### Important for scripts
 
-The **Search area only** and **Try other scales** options in the panel apply to the **test button only**. Inside a script the search is always:
+**Try other scales** in the panel applies to the **test button only**; inside a script the search is always at 1:1, with the rescaling above as the answer to a different display.
 
-- across the **whole** screen;
-- at **1:1** scale.
-
-Practical consequence: if a scripted search feels slow, shrink the template, not the area.
+The **search area** is not panel-only any more — every image step and image condition has its own, and setting it is the single biggest thing you can do for speed. If a scripted search feels slow, tell it where to look before you start shrinking templates.
 
 ---
 
@@ -850,7 +1046,7 @@ Walking through it:
 
 ## 13. Debugging: seeing what's going on
 
-A script runs silently. Here are four ways to look inside.
+A script runs silently. Here are five ways to look inside.
 
 ### Method 1. Notes in the log — the main tool
 
@@ -882,7 +1078,10 @@ Your notes will be in there, alongside the engine's own entries:
 | `playing events 0..=240 of 241` | A `Play events` step started |
 | `wait timed out` | `Wait for` gave up and moved on |
 | `while at #3: condition false, leaving the loop` | The loop ended |
-| `ocr read 'Gems: 1,250' -> gems = 1250` | `Read number` worked, and what it read |
+| `ocr read 'Gems: 1,250' [Ui q0.95] -> gems = 1250` | `Read number` worked: what it read, which profile read it, and how well it fits |
+| `ocr read '…' does not fit Integer - gems kept` | The reading was the wrong shape, so the variable was left alone |
+| `element 'Save' at 812,540 (74x28)` | `Find element` found something |
+| `template 'Claim' rescaled 90x30 -> 135x45` | The sidecar said it was cut at a different display scale |
 | `template 'claim' could not be loaded` | Template file not found — check the name and `templates/` |
 | `ocr failed: …` | Recognition failed; the variable was left alone |
 | `script rejected: unbalanced blocks near …` | Blocks don't match up; nothing ran |
@@ -900,7 +1099,20 @@ It is **unbound** by default. Bind it under **⌨ Hotkeys → Skip step:** (to `
 
 Now pressing it mid-run abandons the current step and moves to the next one. Invaluable when the script is stuck on a `Wait for` and you want to see what happens afterwards.
 
-### Method 4. Test conditions on their own
+### Method 4. Watch where it is looking
+
+Switch on **Show what the script looks at** in **🔎 Image search**. A see-through window appears over everything — it cannot be clicked, and it draws, while the script runs:
+
+- a blue rectangle: where the search was allowed to look;
+- a green or red rectangle with a number: what it found, and how sure it was (green means it would pass an ordinary threshold);
+- an amber rectangle: where text was read from;
+- a violet rectangle: the interface element that was found.
+
+This answers the question a score cannot. A failing search gives you `0.41`, and `0.41` does not say whether it looked in the wrong place, at the wrong size, or at the right thing with a tooltip over it. A rectangle says immediately.
+
+It is a diagnostic, not something to leave on — turn it off when you are done.
+
+### Method 5. Test conditions on their own
 
 Before putting a condition in a script, try it by hand in the main window:
 
@@ -1063,3 +1275,4 @@ text "word" <region>
 ---
 
 Still stuck? Open an [issue](../../issues) with the macro file and the relevant part of the log. The `Note` step writes straight there — scatter a few in first.
+
