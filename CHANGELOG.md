@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [1.4.0] — unreleased
+## [1.4.0]
 
 The release about looking at the screen. Four ways to find something, in the order
 they should be tried, and a way to see which one is failing.
