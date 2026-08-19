@@ -4,8 +4,8 @@
 
 # 🦀 Macro Recorder
 
-**A modern, open-source alternative to TinyTask.**
-*Born from Roblox grind. Forged in Rust.*
+**Современная опенсорсная альтернатива TinyTask.**
+*Рождён из гринда в Roblox. Выкован на Rust.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?logo=windows&logoColor=white)]()
@@ -13,650 +13,628 @@
 [![egui](https://img.shields.io/badge/UI-egui%20%2F%20eframe%200.36-blue)]()
 [![Latest Release](https://img.shields.io/github/v/release/blackixxce12/Macro-Recorder?label=release&color=green)](https://github.com/blackixxce12/macro-recorder/releases)
 
-*Record mouse & keyboard → replay it forever, exactly N times, or until a timer runs out → or write a little program that watches the screen and decides for itself.* ☕
+*Записал мышь и клавиатуру → повторяй вечно, ровно N раз или до таймера → или напиши маленькую программу, которая сама смотрит на экран и решает, что делать.* ☕
 
-[📥 Download](../../releases) • [✨ Features](#-features) • [🧠 Scripts](SCRIPTS.md) • [🆚 vs TinyTask](#-macro-recorder-vs-tinytask) • [🇷🇺 Русская версия](README_RU.md)
+[📥 Скачать](../../releases) • [✨ Возможности](#-возможности) • [🧠 Скрипты](SCRIPTS_RU.md) • [🆚 vs TinyTask](#-macro-recorder-vs-tinytask) • [🇬🇧 English version](README.md)
 
-<img src="assets/screenshot.png" width="330" alt="Macro Recorder window">
+<img src="assets/screenshot.png" width="330" alt="Окно Macro Recorder">
 
 </div>
 
 ---
 
-## 🆕 Highlights
+## 🆕 Коротко о главном
 
 | | |
 |---|---|
-| 🧠 **Script engine** | 23 step kinds with `If` / `While` / `Break`, variables that hold numbers **or text**, and eight conditions that look at the screen. **[Full guide → SCRIPTS.md](SCRIPTS.md)** |
-| 🔎 **Image search** | Paste a snippet with `Win+Shift+S` and the macro can wait for it, or click it wherever it appears — told **where** to look, so a step costs 8 ms instead of 78 |
-| 🪟 **UI Automation** | Ask Windows for a button by name: no threshold, no resolution, no theme. 9.5 ms, and silent in anything that draws its own interface |
-| 🔤 **Text on screen (OCR)** | Uses the recognition already built into Windows — five preparation profiles, an expected format, and a fit score |
-| 📅 **Scheduler** | Start the macro at a set time on chosen weekdays, even while minimised to the tray |
-| 🪟 **Target window** | Pause automatically whenever your game or app isn't the one in front |
-| 🖱 **Human-like movement** | Curved cursor paths with a random arc, plus an aim-spread in pixels |
-| ✂ **Built-in editor** | A plain-English list of what you did, a raw event list, and a per-action inspector — with undo |
-| ⚙ **Compile to a standalone .exe** | Export a self-running player — scripts included. No compiler involved |
-| ⚓ **Window anchoring** | Follows the target window if it moved *or was resized* |
-| ⌨ **Live speed control** | Hotkeys for faster / slower / skip-this-step, usable mid-run |
-| 👁 **See what it looks at** | A see-through window over everything, drawing the search area, the match and its score |
+| 🧠 **Движок скриптов** | 23 вида шагов с `Если` / `Пока` / `Прервать`, переменные с числами **или текстом** и восемь условий, которые смотрят на экран. **[Полное руководство → SCRIPTS_RU.md](SCRIPTS_RU.md)** |
+| 🔎 **Поиск по картинке** | Вырезал кусок экрана через `Win+Shift+S` — и макрос ждёт эту картинку или кликает по ней, где бы она ни появилась; теперь ему можно сказать, **где** искать, и шаг стоит 8 мс вместо 78 |
+| 🪟 **UI Automation** | Спросить у Windows кнопку по имени: ни порога, ни разрешения, ни темы. 9.5 мс — и полное молчание там, где интерфейс рисуют сами |
+| 🔤 **Текст на экране (OCR)** | Использует распознавание, уже встроенное в Windows: пять профилей обработки, ожидаемый формат и оценка соответствия |
+| 📅 **Расписание** | Запуск в заданное время по выбранным дням недели — даже когда окно свёрнуто в трей |
+| 🪟 **Целевое окно** | Автопауза, пока игра или программа не на переднем плане |
+| 🖱 **Человеческое движение** | Курсор едет по дуге со случайным изгибом, плюс разброс прицела в пикселях |
+| ✂ **Встроенный редактор** | Список действий человеческим языком, сырые события и инспектор каждого действия — с отменой |
+| ⚙ **Сборка в отдельный .exe** | Самозапускающийся плеер — вместе со скриптом. Компилятор не нужен |
+| ⚓ **Привязка к окну** | Следует за целевым окном, если оно переехало *или изменило размер* |
+| ⌨ **Скорость на лету** | Горячие клавиши «быстрее / медленнее / пропустить шаг» прямо во время прогона |
+| 👁 **Видно, куда он смотрит** | Прозрачное окно поверх всего рисует область поиска, найденное совпадение и его оценку |
 
 <details>
-<summary>Under the hood</summary>
+<summary>Что внутри</summary>
 
-Pause/resume with a proper schedule clock · 7 rebindable hotkeys + emergency stop · X1/X2 capture ·
-Open/Save dialogs and recent files · gzip `.mrz` macros · shutdown/restart/sleep/hibernate/log-off ·
-headless CLI · Fluent (Mica) theme · 9 themes · 6 languages · timing jitter · single instance ·
-rotating log file · virtual-desktop isolation · per-monitor DPI awareness.
+Пауза и продолжение с честными часами расписания · 7 переназначаемых горячих клавиш + аварийный стоп ·
+запись X1/X2 · диалоги открытия/сохранения и недавние файлы · сжатые макросы `.mrz` ·
+выключение/перезагрузка/сон/гибернация/выход из системы · безоконный CLI · тема Fluent (Mica) ·
+9 тем · 6 языков · джиттер таймингов · единственный экземпляр · ротация логов ·
+изоляция виртуальных рабочих столов · честный per-monitor DPI.
 
 </details>
 
 ---
 
-## 📑 Contents
+## 📑 Содержание
 
-- [The story](#-the-story-roblox-anime-tower-defenses-and-a-tired-hand)
-- [Why Rust](#-why-rust)
+- [История](#-история-roblox-аниме-тавер-дефенсы-и-уставшая-рука)
+- [Почему Rust](#-почему-rust)
 - [Macro Recorder vs TinyTask](#-macro-recorder-vs-tinytask)
-- [Features](#-features)
-- [How it works](#-how-it-works)
-- [Hotkeys](#️-hotkeys)
-- [Scripts](#-scripts)
-- [Image search](#-image-search)
+- [Возможности](#-возможности)
+- [Как это работает](#-как-это-работает)
+- [Горячие клавиши](#️-горячие-клавиши)
+- [Скрипты](#-скрипты)
+- [Поиск по картинке](#-поиск-по-картинке)
 - [UI Automation](#-ui-automation)
-- [Text on screen (OCR)](#-text-on-screen-ocr)
-- [Editor](#-editor)
-- [Schedule & target window](#-schedule--target-window)
-- [Exports & extras](#-exports--extras)
-- [Themes](#-themes)
-- [Languages](#-languages)
-- [Files & folders](#-files--folders)
-- [Command line](#-command-line)
-- [Download](#-download)
-- [Build from source](#️-build-from-source)
-- [Known limitations](#️-known-limitations)
+- [Текст на экране (OCR)](#-текст-на-экране-ocr)
+- [Редактор](#-редактор)
+- [Расписание и целевое окно](#-расписание-и-целевое-окно)
+- [Экспорт и прочее](#-экспорт-и-прочее)
+- [Темы](#-темы)
+- [Языки](#-языки)
+- [Файлы и папки](#-файлы-и-папки)
+- [Командная строка](#-командная-строка)
+- [Скачать](#-скачать)
+- [Сборка из исходников](#️-сборка-из-исходников)
+- [Известные ограничения](#️-известные-ограничения)
 - [FAQ](#-faq)
-- [License & credits](#-license--credits)
+- [Лицензия и благодарности](#-лицензия-и-благодарности)
 
 ---
 
-## 📖 The story: Roblox, anime tower defenses, and a tired hand
+## 📖 История: Roblox, аниме тавер-дефенсы и уставшая рука
 
-I play a lot of **Roblox** — especially anime tower defense games. If you've ever played one, you know *the loop*:
+Я много играю в **Roblox** — особенно в аниме тавер-дефенсы. Кто играл, тот знает *этот цикл*:
 
-> Place units → wait for the wave → collect gems → upgrade → repeat.
-> And again. And again. **Hundreds of times per session.**
+> Поставил юнитов → дождался волны → собрал гемы → апнул → повторил.
+> И ещё раз. И ещё. **Сотни раз за сессию.**
 
-One evening, after manually clicking the same "summon / upgrade / claim" buttons for the third hour in a row, my hand said *«no»*. So I did what everyone does — I downloaded **TinyTask**.
+Однажды вечером, на третьем часу ручного тыканья в одни и те же кнопки «призвать / улучшить / забрать», рука сказала *«нет»*. И я сделал то же, что делают все — скачал **TinyTask**.
 
-And honestly? **It worked.** TinyTask is a genuinely great piece of software: 36 KB of hand-written C that has been quietly automating people's work since the Windows XP era. It's a masterclass in minimalism, and this project would not exist without it.
+И честно? **Он работал.** TinyTask — правда отличная программа: 36 КБ рукописного C, которые тихо автоматизируют людям работу со времён Windows XP. Это образец минимализма, и без него этого проекта бы не было.
 
-But minimalism cuts both ways. After a few evenings of farming I kept hitting the same walls:
+Но у минимализма две стороны. За несколько вечеров фарма я упёрся в одни и те же стены:
 
-- ⏰ **No "stop after N hours"** — I wanted to farm while asleep and have the PC shut itself down afterwards. TinyTask can loop forever or loop N times, but it has no concept of *time*;
-- 🖥️ **Absolute pixel coordinates, no DPI awareness** — change Windows scaling from 100% to 125%, dock a laptop, or move the game to another monitor, and every click lands in the wrong place;
-- 🔒 **Closed source** — a tool that installs global keyboard hooks and injects synthetic input into my system is exactly the kind of tool I'd like to be able to *read*;
-- 🧾 **Binary `.rec` files** — I wanted to tweak a macro in a text editor, not re-record it;
-- 🌍 **No Russian / Ukrainian / Chinese UI**;
-- 🎨 **A fixed toolbar from 2007** — charming, but I stare at this window for hours.
+- ⏰ **Нет «остановись через N часов»** — я хотел фармить во сне и чтобы ПК потом сам выключился. TinyTask умеет крутить вечно или N раз, но про *время* не знает ничего;
+- 🖥️ **Абсолютные пиксельные координаты без учёта DPI** — поменял масштаб Windows со 100% на 125%, воткнул ноутбук в док или перетащил игру на другой монитор — и все клики мимо;
+- 🔒 **Закрытый исходник** — программу, которая ставит глобальные хуки на клавиатуру и шлёт синтетический ввод в мою систему, хотелось бы иметь возможность *прочитать*;
+- 🧾 **Бинарные `.rec`** — я хотел править макрос в текстовом редакторе, а не перезаписывать;
+- 🌍 **Нет русского / украинского / китайского интерфейса**;
+- 🎨 **Панель из 2007 года** — мило, но я смотрю в это окно часами.
 
-So I built the tool I wanted. And then a second wall showed up: **a blind recording is dumb.** If the wave takes 4 seconds longer than usual, a fixed replay clicks into empty space and the whole run is wasted. What I actually needed was *"wait until the Claim button appears, then click it"*.
+Так появился инструмент, который я хотел. А потом выяснилась вторая стена: **слепая запись — глупая.** Если волна идёт на 4 секунды дольше обычного, фиксированный повтор кликает в пустоту, и весь прогон впустую. Нужно было не «кликни через 12 секунд», а *«дождись, когда появится кнопка Claim, и нажми её»*.
 
-That's what the [script engine](SCRIPTS.md) is for. A macro can now look at the screen — for a picture, a pixel colour, a window, or a word of text — and decide what to do. It's still a recorder first: you record the boring part, and add a few conditions on top only where you need them.
+Ради этого и сделан [движок скриптов](SCRIPTS_RU.md). Теперь макрос умеет смотреть на экран — искать картинку, цвет пикселя, окно или слово текста — и решать, что делать дальше. При этом он остаётся в первую очередь рекордером: скучное вы записываете, а условия навешиваете сверху только там, где без них никак.
 
-That weekend project got slightly out of hand. 🦀
+Проект выходного дня слегка вышел из-под контроля. 🦀
 
 ---
 
-## 🦀 Why Rust?
+## 🦀 Почему Rust?
 
-| Reason | What it means for you |
+| Причина | Что это даёт вам |
 |---|---|
-| **Single .exe** | No installer, no .NET, no Python runtime — one file, double-click, done |
-| **Fearless concurrency** | Five roles run in parallel — low-level hooks, an event collector, a microsecond-accurate replay engine, a scheduler and the GPU-rendered UI — and the compiler guarantees they don't corrupt each other's state |
-| **Memory safety** | A tool that injects input into your system shouldn't scribble over an event buffer mid-raid. Outside the thin `unsafe` Win32 FFI layer, Rust makes whole classes of bugs impossible |
-| **Small & instant** | With `opt-level = "z"` + LTO + `strip`, the whole app is a few MB and starts instantly |
-| **Honest reason** | I wanted a real excuse to learn Rust properly. Best way to learn — build something you actually use |
+| **Один .exe** | Ни установщика, ни .NET, ни Python — один файл, двойной клик, готово |
+| **Бесстрашная многопоточность** | Параллельно работают пять ролей — низкоуровневые хуки, сборщик событий, микросекундный движок повтора, планировщик и GPU-интерфейс — и компилятор гарантирует, что они не портят состояние друг друга |
+| **Безопасность памяти** | Программа, которая шлёт ввод в систему, не должна затирать буфер событий посреди рейда. За пределами тонкого `unsafe`-слоя Win32 FFI Rust делает целые классы багов невозможными |
+| **Маленький и быстрый** | С `opt-level = "z"` + LTO + `strip` приложение весит пару мегабайт и стартует мгновенно |
+| **Честная причина** | Хотелось нормального повода выучить Rust. Лучший способ — сделать то, чем сам пользуешься |
 
 ---
 
 ## 🆚 Macro Recorder vs TinyTask
 
-> **This table is fact-checked** against TinyTask's official website, changelog, FAQ and support pages (see [Sources](#sources-for-the-tinytask-column)). TinyTask is *not* a bad program — it's a deliberately minimal one. Where it wins, this table says so.
+> **Таблица сверена** с официальным сайтом TinyTask, его changelog, FAQ и страницей поддержки (см. [Источники](#источники-по-колонке-tinytask)). TinyTask — *не* плохая программа, а намеренно минималистичная. Где он выигрывает, там так и написано.
 
-### Pick the right tool
+### Что выбрать
 
-| Pick **TinyTask** if… | Pick **Macro Recorder** if… |
+| Берите **TinyTask**, если… | Берите **Macro Recorder**, если… |
 |---|---|
-| You need the smallest possible footprint (36 KB) | You want timed playback, pause/resume and power actions |
-| You need to run on Windows XP / Vista / 7 | You're on Windows 10 / 11 with DPI scaling or multiple monitors |
-| You want a 36 KB tool that also compiles macros to 60 KB executables | You want a macro that reacts to the screen instead of clicking blind |
-| You want a tool that has been battle-tested for over a decade | You want open source you can audit, fork and extend |
-| You just need "record → play", nothing more | You want an editor, conditions, image search, OCR and a scheduler |
+| Нужен минимальный размер (36 КБ) | Нужны таймер, пауза/продолжение и действия с питанием |
+| Нужна работа на Windows XP / Vista / 7 | У вас Windows 10 / 11 с масштабированием или несколькими мониторами |
+| Нужен инструмент на 36 КБ, который ещё и собирает макросы в 60-килобайтные exe | Нужен макрос, который реагирует на экран, а не кликает вслепую |
+| Нужна программа, проверенная больше десятка лет | Нужен открытый код, который можно проверить, форкнуть и доработать |
+| Нужно только «записал → воспроизвёл» | Нужны редактор, условия, поиск по картинке, OCR и расписание |
 
-### Full comparison
+### Полное сравнение
 
 | | **TinyTask 1.77** | **Macro Recorder** |
 |---|---|---|
-| **License** | Freeware, **closed source** (proprietary) | **MIT, fully open source** |
-| **Implementation** | Pure C + raw Win32, self-contained **32-bit** exe | Rust 2024 + `windows-rs`, **64-bit** exe |
-| **Binary size** | **~36 KB** 🏆 | ≈5 MB (GPU UI, 9 themes, 6 translations, vision + OCR) |
-| **Install** | Portable single exe (optional Inno Setup installer) | Portable single exe |
-| **Supported Windows** | **XP → 11** 🏆 | 10 / 11 (Windows 11 for Mica/Acrylic + virtual desktops) |
-| **UI** | Fixed Win32 toolbar, user-swappable toolbar bitmaps | GPU-rendered `egui`, **9 themes**, live theme switching |
-| **Window translucency** | ❌ | ✅ per-pixel alpha + **DWM Mica / Acrylic** |
-| **UI languages** | Separate **localized builds** (FR, DE, IT, PT, ES, SV) since v1.74 — no in-app switch | **6 languages switchable at runtime** (EN, RU, UK, PT, ES, ZH) + auto-detect |
-| **Keyboard capture** | ✅ | ✅ virtual key **+ scancode + extended flag** |
-| **Mouse move & clicks** | ✅ | ✅ (L / R / M) |
-| **Mouse wheel** | ⚠️ documented as unavailable with some mice | ✅ **vertical + horizontal** |
-| **X1 / X2 side buttons** | ❌ | ✅ recorded and replayed |
-| **Ignores its own injected input** | not documented | ✅ `LLKHF_INJECTED` / `LLMHF_INJECTED` filtered |
-| **Hotkeys excluded from recordings** | ✅ by design | ✅ |
-| **Repeat playback** | ✅ continuous **or** N times | ✅ continuous **or** N times (1–9999) |
-| **Delay between loops** | ❌ (bake it into the recording) | ✅ 0–600 000 ms |
-| **Pause / resume** | ❌ | ✅ without losing the position |
-| **Stop after a time limit** | ❌ | ✅ **hours : minutes : seconds** |
-| **Action when the limit is hit** | ❌ | ✅ stop · **shut down · restart · sleep · hibernate · log off** |
-| **Playback speed** | ✅ presets (½×, 1×, 2×, 100×) + custom value | ✅ **0.1× – 3.0×** slider, **changeable mid-run by hotkey** |
-| **Timing jitter** | ❌ | ✅ optional 0–50 % per-event randomisation |
-| **Human-like cursor paths** | ❌ | ✅ Bézier arcs + aim spread in pixels |
-| **Live recording timer** | ❌ (playback shows a countdown since v1.61) | ✅ live timer while recording + final duration |
-| **Live playback counter** | ❌ | ✅ `plays: 7 / 50` in the UI |
-| **Global hotkeys** | `Ctrl+Alt+Shift+R` / `Ctrl+Shift+Alt+P`, a few alternatives in Prefs | ✅ **7 rebindable slots** (any key × Ctrl/Alt/Shift), applied without restart |
-| **Emergency stop key** | ✅ Break / ScrollLock / Pause | ✅ **F9** by default, rebindable |
-| **Always on top** | ✅ (since v1.61) | ✅ toggle at runtime |
-| **Settings persistence** | ✅ portable `.ini` (since v1.50) | ✅ human-readable **`config.json`** + autosave on exit |
-| **Macro format** | Proprietary binary `.rec` | **Plain JSON** with µs timestamps, optional gzip (`.mrz`) |
-| **Edit a recording** | ❌ in the classic build (a "With Editor" build exists on the official site) | ✅ **built-in editor** (3 views + inspector) + any text editor |
-| **Open / Save dialogs, recent files** | ✅ open & save | ✅ + a recent-files list |
-| **Compile macro → standalone .exe** | ✅ ~60 KB output 🏆 | ✅ ~5 MB output (a copy of this exe + the macro **and its script**) |
-| **Export to another tool** | ❌ | ✅ **AutoHotkey v2 script** (events only) |
-| **Tray icon / minimize to tray** | ❌ | ✅ with a record / play / stop menu |
-| **Window anchoring** | ❌ | ✅ follows the target window if it moved **or resized** |
-| **Stop on a screen pixel** | ❌ | ✅ colour + tolerance, with a picker |
-| **Scripting / conditional logic** | ❌ | ✅ **23 step kinds, `If`/`While`/`Break`, variables holding numbers or text** — [SCRIPTS.md](SCRIPTS.md) |
-| **Image recognition** | ❌ | ✅ masked normalised cross-correlation, optional multi-scale |
-| **Text recognition (OCR)** | ❌ | ✅ via `Windows.Media.Ocr` — no models to download |
-| **Scheduler (start at a time)** | ❌ | ✅ time + weekdays, runs from the tray |
-| **Pause while another window is in front** | ❌ | ✅ match by window title |
-| **Settings profiles** | ❌ | ✅ named, unlimited |
-| **User translations without a rebuild** | ❌ | ✅ `lang/xx.json` overrides |
-| **Headless / scriptable run** | ❌ (the compiled .exe covers this) | ✅ `--play … --loops … --no-gui` |
-| **Single-instance guard** | ❌ | ✅ focuses the running window |
-| **Per-monitor DPI awareness** | ❌ raw pixel coordinates; scaling changes shift every click | ✅ **Per-Monitor v2** + coordinates normalized across the whole virtual desktop |
-| **Relative (delta) mouse mode** | ❌ | ✅ toggle — useful for FPS-style camera input |
-| **Virtual Desktop isolation (Win 11)** | ❌ | ✅ recording & playback pause when the app isn't on the active desktop |
-| **Timing model** | Faithful replay of recorded timing | µs timestamps + `timeBeginPeriod(1)` + hybrid sleep / spin-sleep scheduler |
-| **Log file** | ❌ | ✅ rotating daily log |
-| **Antivirus false positives** | ⚠️ a known, long-standing issue | ⚠️ same — any input injector looks suspicious |
-| **Price** | Free | **Free forever** |
+| **Лицензия** | Freeware, **закрытый исходник** | **MIT, полностью открытый** |
+| **Реализация** | Чистый C + голый Win32, самодостаточный **32-битный** exe | Rust 2024 + `windows-rs`, **64-битный** exe |
+| **Размер бинарника** | **~36 КБ** 🏆 | ≈5 МБ (GPU-интерфейс, 9 тем, 6 переводов, зрение + OCR) |
+| **Установка** | Портативный exe (опционально установщик Inno Setup) | Портативный exe |
+| **Поддержка Windows** | **XP → 11** 🏆 | 10 / 11 (Windows 11 для Mica/Acrylic и виртуальных столов) |
+| **Интерфейс** | Фиксированная панель Win32, сменные битмапы | GPU-рендер `egui`, **9 тем**, переключение на лету |
+| **Прозрачность окна** | ❌ | ✅ попиксельная альфа + **DWM Mica / Acrylic** |
+| **Языки интерфейса** | Отдельные **локализованные сборки** (FR, DE, IT, PT, ES, SV) с v1.74 — без переключателя | **6 языков прямо в программе** (EN, RU, UK, PT, ES, ZH) + автоопределение |
+| **Захват клавиатуры** | ✅ | ✅ виртуальная клавиша **+ скан-код + флаг extended** |
+| **Движение и клики мыши** | ✅ | ✅ (ЛКМ / ПКМ / СКМ) |
+| **Колесо мыши** | ⚠️ по документации не работает с частью мышей | ✅ **вертикальное и горизонтальное** |
+| **Боковые кнопки X1 / X2** | ❌ | ✅ пишутся и воспроизводятся |
+| **Игнорирует собственный ввод** | не задокументировано | ✅ фильтрует `LLKHF_INJECTED` / `LLMHF_INJECTED` |
+| **Горячие клавиши не попадают в запись** | ✅ by design | ✅ |
+| **Повтор** | ✅ бесконечно **или** N раз | ✅ бесконечно **или** N раз (1–9999) |
+| **Пауза между циклами** | ❌ (вшивайте в запись) | ✅ 0–600 000 мс |
+| **Пауза / продолжение** | ❌ | ✅ без потери позиции |
+| **Остановка по таймеру** | ❌ | ✅ **часы : минуты : секунды** |
+| **Действие по достижении лимита** | ❌ | ✅ стоп · **выключить · перезагрузить · сон · гибернация · выйти из системы** |
+| **Скорость воспроизведения** | ✅ пресеты (½×, 1×, 2×, 100×) + своё значение | ✅ ползунок **0.1× – 3.0×**, **меняется на лету горячей клавишей** |
+| **Джиттер таймингов** | ❌ | ✅ опционально 0–50 % на событие |
+| **Человеческие траектории курсора** | ❌ | ✅ дуги Безье + разброс прицела в пикселях |
+| **Таймер во время записи** | ❌ (обратный отсчёт при проигрывании с v1.61) | ✅ живой таймер записи + итоговая длительность |
+| **Счётчик проигрываний** | ❌ | ✅ `проигрываний: 7 / 50` в окне |
+| **Глобальные горячие клавиши** | `Ctrl+Alt+Shift+R` / `Ctrl+Shift+Alt+P`, пара альтернатив в настройках | ✅ **7 переназначаемых слотов** (любая клавиша × Ctrl/Alt/Shift), без перезапуска |
+| **Аварийный стоп** | ✅ Break / ScrollLock / Pause | ✅ **F9** по умолчанию, переназначается |
+| **Поверх всех окон** | ✅ (с v1.61) | ✅ переключается на лету |
+| **Сохранение настроек** | ✅ портативный `.ini` (с v1.50) | ✅ читаемый **`config.json`** + автосохранение при выходе |
+| **Формат макроса** | Проприетарный бинарный `.rec` | **Обычный JSON** с микросекундными метками, опционально gzip (`.mrz`) |
+| **Правка записи** | ❌ в классической сборке (на сайте есть отдельная «With Editor») | ✅ **встроенный редактор** (3 вида + инспектор) + любой текстовый редактор |
+| **Диалоги открыть/сохранить, недавние** | ✅ открыть и сохранить | ✅ + список недавних |
+| **Сборка макроса → отдельный .exe** | ✅ на выходе ~60 КБ 🏆 | ✅ на выходе ~5 МБ (копия этого exe + макрос **и его скрипт**) |
+| **Экспорт в другой инструмент** | ❌ | ✅ **скрипт AutoHotkey v2** (только события) |
+| **Значок в трее / сворачивание** | ❌ | ✅ с меню запись / плей / стоп |
+| **Привязка к окну** | ❌ | ✅ следует за окном, если оно переехало **или изменило размер** |
+| **Остановка по пикселю экрана** | ❌ | ✅ цвет + допуск, с пипеткой |
+| **Скрипты / условная логика** | ❌ | ✅ **23 вида шагов, `Если`/`Пока`/`Прервать`, переменные с числами или текстом** — [SCRIPTS_RU.md](SCRIPTS_RU.md) |
+| **Распознавание картинок** | ❌ | ✅ нормализованная кросс-корреляция с маской, опционально несколько масштабов |
+| **Распознавание текста (OCR)** | ❌ | ✅ через `Windows.Media.Ocr` — ничего скачивать не надо |
+| **Планировщик (запуск по времени)** | ❌ | ✅ время + дни недели, работает из трея |
+| **Пауза, пока впереди чужое окно** | ❌ | ✅ по заголовку окна |
+| **Профили настроек** | ❌ | ✅ именованные, без ограничений |
+| **Свои переводы без пересборки** | ❌ | ✅ подмена через `lang/xx.json` |
+| **Запуск без окна / из скриптов** | ❌ (для этого есть собранный exe) | ✅ `--play … --loops … --no-gui` |
+| **Защита от второго экземпляра** | ❌ | ✅ фокусирует уже открытое окно |
+| **Честный per-monitor DPI** | ❌ сырые пиксели; смена масштаба сдвигает все клики | ✅ **Per-Monitor v2** + координаты по всему виртуальному рабочему столу |
+| **Относительный режим мыши** | ❌ | ✅ переключатель — полезно для камеры в шутерах |
+| **Изоляция виртуальных столов (Win 11)** | ❌ | ✅ запись и воспроизведение встают на паузу, если приложение не на активном столе |
+| **Модель таймингов** | Точный повтор записанных задержек | Микросекундные метки + `timeBeginPeriod(1)` + гибридный sleep / spin-sleep |
+| **Файл логов** | ❌ | ✅ ротация по дням |
+| **Ложные срабатывания антивирусов** | ⚠️ давняя известная проблема | ⚠️ то же самое — любой инжектор ввода выглядит подозрительно |
+| **Цена** | Бесплатно | **Бесплатно навсегда** |
 
-### Where TinyTask still wins 🏆
+### В чём TinyTask всё ещё лучше 🏆
 
-Credit where it's due — two things TinyTask does that this project cannot:
+Отдадим должное — две вещи, которые этот проект не может:
 
-1. **Size and reach.** 36 KB, 32-bit, runs on Windows XP. Its compiled macros are ~60 KB;
-   ours are a ~5 MB copy of this executable, because the player *is* the whole app.
-   If you need to email a macro to someone on an old machine, TinyTask wins outright.
-2. **A decade of field testing.** TinyTask has been used by an enormous number of people for
-   many years. Macro Recorder is young — please [file issues](../../issues).
+1. **Размер и охват.** 36 КБ, 32 бита, работает на Windows XP. Его собранные макросы — ~60 КБ;
+   наши — копия этого исполняемого файла на ~5 МБ, потому что плеер *и есть* всё приложение.
+   Если надо отправить макрос человеку на старой машине — TinyTask выигрывает вчистую.
+2. **Десятилетие полевых испытаний.** TinyTask годами используют огромное число людей.
+   Macro Recorder молод — пожалуйста, [пишите issues](../../issues).
 
-### Sources for the TinyTask column
+### Источники по колонке TinyTask
 
-Facts above were taken from the official TinyTask site rather than SEO mirrors (several of which contradict each other and the vendor's own changelog):
+Факты взяты с официального сайта TinyTask, а не с SEO-зеркал (часть из которых противоречит и друг другу, и changelog самого разработчика):
 
-- Official changelog — <https://www.tinytask.net/revision_history.html>
-- Official FAQ — <https://www.tinytask.net/faq.html>
-- Official support page (hotkeys, emergency stop) — <https://www.tinytask.net/support.html>
-- Official downloads (v1.77, "With Editor" builds) — <https://www.tinytask.net/download.html>
-- The Portable Freeware Collection entry — <https://www.portablefreeware.com/index.php?id=1853>
-
----
-
-## ✨ Features
-
-**Capture**
-
-- 🔴 Mouse movement, clicks, wheel (vertical *and* horizontal), **X1/X2 side buttons**, and the full keyboard — including scancodes and extended keys, so layouts and NumPad behave correctly
-- 🎚 Movement sampling is configurable (1–100 ms, default 5 ms), or can be **switched off entirely** for click-only macros
-- 🚫 The recorder ignores its own synthetic events *and* your own hotkeys, so neither ends up inside the macro
-
-**Replay**
-
-- ▶ Microsecond scheduling: a 1 ms system timer plus a hybrid sleep/spin-sleep loop, so long macros don't drift
-- 🔁 Loop forever, **exactly N times** (1–9999), or **until a time limit**, with an optional delay between loops
-- ⏸ **Pause and resume** — the schedule clock stops with you, so nothing fast-forwards afterwards
-- ⚡ Speed **0.1× – 3.0×** (and live `faster` / `slower` hotkeys), plus optional **timing jitter** (0–50 %)
-- 🖱 Absolute or relative mouse mode, optional **human-like curved movement** and per-click aim spread
-- 🛟 Stop always releases whatever the macro was holding down — no stuck Shift, no stuck mouse button
-
-**Decide, don't just replay**
-
-- 🧠 A **[script](SCRIPTS.md)** can wait for things, branch, loop and count — while still replaying slices of your recording
-- 🪟 **UI Automation**: ask Windows for a button by name and let the application press it — no threshold, no coordinates
-- 🔎 **Image search**: find a button anywhere on screen and click it, even if the layout shifted — told *where* to look, with two thresholds, variant folders and outline matching
-- 🔤 **OCR**: react to a word on screen, or read a number (gems, timer, HP) into a variable, with five preparation profiles and a format check
-- 🎯 **Pixel condition**: watch one pixel and stop — or shut the PC down — when it changes
-- 📝 Variables hold **numbers or text**, so what was read, what the window is called and what is on the clipboard can all be kept and compared
-- 👁 A **see-through overlay** shows where the last search looked and what it found
-
-**Automation & safety**
-
-- ⏱ Time limit in `H : M : S`, then: stop · shut down · restart · sleep · hibernate · log off
-- ⏳ Shutdown/restart use a visible countdown (0–600 s, default 60) — `shutdown /a` still aborts it
-- 📅 **Scheduler** — start at `HH:MM` on the weekdays you tick, even from the tray
-- 🪟 **Target window** — automatically pause while your game isn't the window in front
-- 🧭 **Per-monitor DPI aware (v2)** — Windows reports true physical pixels, so 125%/150% scaling doesn't silently offset your clicks
-- 🪟 **Virtual Desktop isolation (Windows 11)** — if the app lives on Desktop 2, it neither records nor replays while you're working on Desktop 1
-- 🔒 **Single instance** — launching it twice just focuses the existing window
-
-**Interface & files**
-
-- ⌨ 7 rebindable global hotkeys, including a dedicated **emergency stop** (default `F6` / `F7` / `F8` / `F9`)
-- 📌 Always on Top toggle
-- 🎨 **9 themes** + a transparent UI switch, with Windows 11 **Mica** and **Acrylic** backdrops (and a blur fallback on Windows 10)
-- 🌍 **6 languages**, auto-detected and switchable at runtime
-- 📦 Macros as plain JSON — or gzipped `.mrz` when size matters — with Open/Save dialogs and a recent-files list
-- 💾 Settings in a readable `config.json`, saved on demand and on exit
-- 📝 A rotating daily log file for when something behaves oddly
-- 🖥 A headless CLI for scripts and scheduled tasks
+- Официальный changelog — <https://www.tinytask.net/revision_history.html>
+- Официальный FAQ — <https://www.tinytask.net/faq.html>
+- Официальная страница поддержки (горячие клавиши, аварийный стоп) — <https://www.tinytask.net/support.html>
+- Официальные загрузки (v1.77, сборки «With Editor») — <https://www.tinytask.net/download.html>
+- Карточка в The Portable Freeware Collection — <https://www.portablefreeware.com/index.php?id=1853>
 
 ---
 
-## 🧠 How it works
+## ✨ Возможности
 
-### Architecture
+**Запись**
+
+- 🔴 Движения мыши, клики, колесо (вертикальное *и* горизонтальное), **боковые X1/X2** и вся клавиатура — со скан-кодами и extended-клавишами, поэтому раскладки и NumPad ведут себя правильно
+- 🎚 Шаг выборки движений настраивается (1–100 мс, по умолчанию 5 мс) или **отключается совсем** для макросов из одних кликов
+- 🚫 Рекордер игнорирует и собственный синтетический ввод, и ваши горячие клавиши — ни то, ни другое в макрос не попадёт
+
+**Воспроизведение**
+
+- ▶ Микросекундное расписание: системный таймер 1 мс плюс гибридный цикл sleep/spin-sleep, поэтому длинные макросы не «уплывают»
+- 🔁 Бесконечно, **ровно N раз** (1–9999) или **до лимита времени**, с паузой между циклами
+- ⏸ **Пауза и продолжение** — часы расписания встают вместе с вами, поэтому после паузы ничего не «отматывается» разом
+- ⚡ Скорость **0.1× – 3.0×** (плюс горячие клавиши «быстрее»/«медленнее» на лету) и опциональный **джиттер** (0–50 %)
+- 🖱 Абсолютная или относительная мышь, опциональное **человеческое движение по дуге** и разброс прицела
+- 🛟 Стоп всегда отпускает всё, что макрос удерживал — никакого залипшего Shift или зажатой кнопки мыши
+
+**Решать, а не просто повторять**
+
+- 🧠 **[Скрипт](SCRIPTS_RU.md)** умеет ждать, ветвиться, крутить циклы и считать — и при этом воспроизводить куски вашей записи
+- 🔎 **Поиск по картинке**: найти кнопку где угодно на экране и кликнуть по ней, даже если вёрстка съехала
+- 🔤 **OCR**: реагировать на слово на экране или считать число (гемы, таймер, HP) в переменную
+- 🎯 **Условие по пикселю**: следить за одной точкой и остановиться — или выключить ПК — когда она изменилась
+
+**Автоматизация и безопасность**
+
+- ⏱ Лимит времени `Ч : М : С`, затем: остановить · выключить · перезагрузить · сон · гибернация · выйти из системы
+- ⏳ Выключение/перезагрузка идут с видимым отсчётом (0–600 с, по умолчанию 60) — `shutdown /a` его отменяет
+- 📅 **Расписание** — старт в `ЧЧ:ММ` по отмеченным дням недели, даже из трея
+- 🪟 **Целевое окно** — автопауза, пока впереди не ваша игра
+- 🧭 **Честный per-monitor DPI (v2)** — Windows отдаёт настоящие физические пиксели, поэтому масштаб 125%/150% не сдвигает клики
+- 🪟 **Изоляция виртуальных столов (Windows 11)** — если приложение живёт на Столе 2, оно не пишет и не проигрывает, пока вы работаете на Столе 1
+- 🔒 **Один экземпляр** — второй запуск просто фокусирует уже открытое окно
+
+**Интерфейс и файлы**
+
+- ⌨ 7 переназначаемых глобальных горячих клавиш, включая отдельный **аварийный стоп** (по умолчанию `F6` / `F7` / `F8` / `F9`)
+- 📌 Переключатель «Поверх всех окон»
+- 🎨 **9 тем** + прозрачный интерфейс, с подложками Windows 11 **Mica** и **Acrylic** (на Windows 10 — обычное размытие)
+- 🌍 **6 языков**, автоопределение и переключение на лету
+- 📦 Макросы как обычный JSON — или сжатый `.mrz`, когда важен размер — с диалогами и списком недавних
+- 💾 Настройки в читаемом `config.json`, сохраняются по кнопке и при выходе
+- 📝 Ротируемый лог на каждый день — на случай, если что-то ведёт себя странно
+- 🖥 Безоконный CLI для скриптов и планировщика задач
+
+---
+
+## 🧠 Как это работает
+
+### Архитектура
 
 ```mermaid
 flowchart LR
     subgraph OS["Windows"]
-        KB["WH_KEYBOARD_LL hook"]
-        MS["WH_MOUSE_LL hook"]
-        HK["RegisterHotKey<br/>record / play / stop / …"]
+        KB["Хук WH_KEYBOARD_LL"]
+        MS["Хук WH_MOUSE_LL"]
+        HK["RegisterHotKey<br/>запись / плей / стоп / …"]
         SI["SendInput"]
-        GDI["BitBlt screen capture"]
+        GDI["Снимок экрана BitBlt"]
         OCRW["Windows.Media.Ocr"]
     end
 
     subgraph APP["macro-recorder.exe"]
-        T1["Hook thread<br/>Win32 message loop"]
-        T2["Collector thread"]
-        T3["Playback / script thread"]
-        T4["UI thread — egui / glow"]
-        T5["Scheduler thread"]
-        ST[("AppState<br/>atomics + parking_lot")]
+        T1["Поток хуков<br/>цикл сообщений Win32"]
+        T2["Поток-сборщик"]
+        T3["Поток воспроизведения / скрипта"]
+        T4["Поток UI — egui / glow"]
+        T5["Поток планировщика"]
+        ST[("AppState<br/>атомики + parking_lot")]
     end
 
-    FS["Data folder<br/>config.json · macros · templates · logs"]
+    FS["Папка данных<br/>config.json · макросы · шаблоны · логи"]
 
     KB --> T1
     MS --> T1
     HK --> T1
-    T1 -->|"crossbeam channel"| T2
-    T2 -->|"push events"| ST
-    T4 <-->|"settings, status"| ST
-    ST -->|"snapshot"| T3
-    T5 -->|"start at HH:MM"| ST
+    T1 -->|"канал crossbeam"| T2
+    T2 -->|"складывает события"| ST
+    T4 <-->|"настройки, статус"| ST
+    ST -->|"снимок"| T3
+    T5 -->|"старт в ЧЧ:ММ"| ST
     T3 --> SI
     GDI --> T3
     OCRW --> T3
     ST <--> FS
 ```
 
-Nothing blocks the UI, and nothing blocks the hook callback — a low-level hook that stalls gets silently dropped by Windows. So the callback does the absolute minimum: two atomic loads, a cached window handle, a cached virtual-desktop answer, then it hands the event off through a lock-free channel.
+Ничто не блокирует интерфейс, и ничто не блокирует колбэк хука — зависший низкоуровневый хук Windows молча отключает. Поэтому колбэк делает абсолютный минимум: две атомарные загрузки, кешированный хэндл окна, кешированный ответ про виртуальный стол — и отдаёт событие в lock-free канал.
 
-### The replay scheduler
+### Планировщик воспроизведения
 
-Naive `sleep()` loops drift badly over a two-hour macro, and a single long `sleep()` makes the Stop key feel broken. The engine schedules every event against one monotonic clock and never sleeps for more than ~15 ms at a time:
+Наивные циклы на `sleep()` за двухчасовой макрос уползают далеко, а один длинный `sleep()` делает клавишу Стоп «сломанной». Движок планирует каждое событие по одним монотонным часам и никогда не спит дольше ~15 мс за раз:
 
 ```mermaid
 flowchart TD
-    A["Next event due in Δt"] --> B{"Δt > 2 ms ?"}
-    B -->|yes| C["sleep at most 15 ms<br/>then re-check Stop / Pause"]
-    B -->|no| D["spin_sleep for Δt<br/>sub-millisecond accuracy"]
+    A["Следующее событие через Δt"] --> B{"Δt > 2 мс ?"}
+    B -->|да| C["спать не больше 15 мс,<br/>потом проверить Стоп / Паузу"]
+    B -->|нет| D["spin_sleep на Δt<br/>субмиллисекундная точность"]
     C --> A
     D --> E["SendInput"]
-    E --> F{"End of macro?"}
-    F -->|no| A
-    F -->|yes| G["count += 1<br/>optional delay, next cycle"]
+    E --> F{"Конец макроса?"}
+    F -->|нет| A
+    F -->|да| G["счётчик += 1<br/>пауза, следующий цикл"]
 ```
 
-`timeBeginPeriod(1)` is requested for the duration of playback only and released afterwards, so the app doesn't keep the whole system on a high-resolution timer while idle.
+`timeBeginPeriod(1)` запрашивается только на время воспроизведения и освобождается после, чтобы приложение не держало всю систему на высокоточном таймере просто так.
 
-### Two playback modes
+### Два режима воспроизведения
 
-A macro with **no script** is replayed flat: event by event, on the recorded timing. A macro **with a script** hands control to the interpreter instead, and the recording becomes a library of slices the script can play (`Play events 0…240`).
+Макрос **без скрипта** проигрывается «плоско»: событие за событием, по записанным таймингам. Макрос **со скриптом** отдаёт управление интерпретатору, а запись превращается в библиотеку кусков, которые скрипт может воспроизводить (`Воспроизвести события 0…240`).
 
 ```mermaid
 flowchart TD
-    P["Play pressed"] --> Q{"Does the macro<br/>have enabled script steps?"}
-    Q -->|no| R["Flat replay<br/>+ jitter, pixel stop, end action"]
-    Q -->|yes| S["Script interpreter<br/>blocks resolved up front"]
-    S --> T["Play events / Wait / Click image /<br/>If / While / Read number / …"]
-    T --> U{"Script finished?"}
-    U -->|"loop / count left"| S
-    U -->|done| V["Stop"]
+    P["Нажали Воспроизвести"] --> Q{"Есть включённые<br/>шаги скрипта?"}
+    Q -->|нет| R["Плоский повтор<br/>+ джиттер, стоп по пикселю, действие в конце"]
+    Q -->|да| S["Интерпретатор скрипта<br/>блоки проверены заранее"]
+    S --> T["Воспроизвести события / Пауза / Клик по картинке /<br/>Если / Пока / Прочитать число / …"]
+    T --> U{"Скрипт дошёл до конца?"}
+    U -->|"остались циклы"| S
+    U -->|готово| V["Стоп"]
 ```
 
-### State machine
+### Диаграмма состояний
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle
-    Idle --> Recording: record hotkey
-    Recording --> Idle: record hotkey / emergency stop
-    Idle --> Playing: play hotkey / schedule
-    Playing --> Idle: play hotkey / emergency stop / count reached
-    Playing --> Paused: Pause button
-    Paused --> Playing: Resume button
-    Playing --> Held: another virtual desktop / target window not in front
-    Held --> Playing: back on the app's desktop, window in front
-    Playing --> PowerAction: time limit + shutdown/sleep/…
-    PowerAction --> [*]
+    [*] --> Ожидание
+    Ожидание --> Запись: клавиша записи
+    Запись --> Ожидание: клавиша записи / аварийный стоп
+    Ожидание --> Воспроизведение: клавиша плея / расписание
+    Воспроизведение --> Ожидание: клавиша плея / аварийный стоп / счётчик исчерпан
+    Воспроизведение --> Пауза: кнопка Пауза
+    Пауза --> Воспроизведение: кнопка Продолжить
+    Воспроизведение --> Удержание: другой виртуальный стол / целевое окно не впереди
+    Удержание --> Воспроизведение: вернулись на стол приложения, окно впереди
+    Воспроизведение --> ДействиеПитания: лимит времени + выключить/сон/…
+    ДействиеПитания --> [*]
 ```
 
-Entering **Paused** or **Held** releases anything the macro was holding down and freezes the schedule clock — so returning after ten minutes resumes exactly where you left off instead of replaying ten minutes of backlog at full speed.
+Вход в **Паузу** или **Удержание** отпускает всё, что макрос удерживал, и замораживает часы расписания — поэтому возврат через десять минут продолжает ровно с того места, а не проигрывает десять минут задолженности на полной скорости.
 
 ---
 
-## ⌨️ Hotkeys
+## ⌨️ Горячие клавиши
 
-| Action | Default | Notes |
+| Действие | По умолчанию | Примечания |
 |---|---|---|
-| Start / stop **recording** | `F6` | Rebindable |
-| Start / stop **playback** | `F7` | Rebindable |
-| **Pause / resume** | `F8` | Rebindable, or use the UI button |
-| **Emergency stop** | `F9` | Stops recording *and* playback |
-| **Faster** | unbound | ×1.25 speed, applied instantly mid-run |
-| **Slower** | unbound | ×0.8 speed, applied instantly mid-run |
-| **Skip step** | unbound | Abandons the current step (or the rest of the current `Play events` range) |
+| Старт / стоп **записи** | `F6` | Переназначается |
+| Старт / стоп **воспроизведения** | `F7` | Переназначается |
+| **Пауза / продолжить** | `F8` | Переназначается, есть и кнопка в окне |
+| **Аварийный стоп** | `F9` | Останавливает и запись, *и* воспроизведение |
+| **Быстрее** | не задана | ×1.25 к скорости, применяется мгновенно |
+| **Медленнее** | не задана | ×0.8 к скорости, применяется мгновенно |
+| **Пропустить шаг** | не задана | Бросает текущий шаг (или остаток текущего `Воспроизвести события`) |
 
-All slots are registered globally with `MOD_NOREPEAT`, so they work while any application has focus, and they are filtered out of the recording. Each can be combined with **Ctrl**, **Alt** and **Shift**, and changes apply immediately — no restart.
+Все слоты регистрируются глобально с `MOD_NOREPEAT`, поэтому работают, когда фокус в любом приложении, и отфильтровываются из записи. К каждой можно добавить **Ctrl**, **Alt** и **Shift**, изменения применяются сразу — без перезапуска.
 
-Click the key button and press anything — letters, digits, function keys. While binding, the global
-hotkeys are released so you can even swap `F6` and `F7` around; Esc or 15 seconds of silence cancels.
-The ▾ list next to it covers keys the window never receives, such as `Pause`, `ScrollLock` and the
-NumPad. **Clear** unbinds a slot entirely.
+Нажмите кнопку **Задать** и нажмите что угодно — буквы, цифры, функциональные клавиши. На время привязки глобальные клавиши отпускаются, так что можно даже поменять местами `F6` и `F7`; Esc или 15 секунд тишины отменяют. Список ▾ рядом покрывает клавиши, которые окно никогда не получает: `Pause`, `ScrollLock` и NumPad. **Сбросить** очищает слот.
 
-> If another application already owns one of your combinations, the app says so under **⌨ Hotkeys** instead of failing silently — pick a different key or add a modifier.
+> Если комбинацию уже занял другой процесс, программа скажет об этом в разделе **⌨ Горячие клавиши**, а не промолчит — выберите другую клавишу или добавьте модификатор.
 
 ---
 
-## 🧠 Scripts
+## 🧠 Скрипты
 
-A recording replays what you did. A **script** decides *whether* and *how many times* to do it.
+Запись повторяет то, что вы сделали. **Скрипт** решает, *нужно ли* это делать и *сколько раз*.
 
 ```
-0  While  gems < 500
-1      Wait for  image: claim_button ≥ 0.85  appears  (10000 ms)
-2      Click image: claim_button ≥ 0.85
-3      Play events 0…240  (241/241)
-4      Read number (1620,40 300x80) → gems
-5  End while
-6  Quit the app
+0  Пока  gems < 500
+1      Ждать  картинка: claim_button ≥ 0.85  появится  (10000 мс)
+2      Клик по картинке: claim_button ≥ 0.85
+3      Воспроизвести события 0…240  (241/241)
+4      Прочитать число (1620,40 300x80) → gems
+5  Конец пока
+6  Закрыть программу
 ```
 
-Steps live inside the macro file, so a scripted macro is still one `.json` you can save, share and export to `.exe`.
+Шаги лежат внутри файла макроса, поэтому макрос со скриптом — это по-прежнему один `.json`, который можно сохранить, передать другу и собрать в `.exe`.
 
-**23 step kinds:** `Play events` · `Wait` · `Wait for` · `Click image` · `Find image` · `Click at` · `Key` · `Set` · `If` · `Else` · `End if` · `While` · `End while` · `Break` · `Run` · `Quit the app` · `Note` · `Read number` · `Read text` · `Get text` · `Put text` · `Find element` · `Press element`
+**23 вида шагов:** `Воспроизвести события` · `Пауза` · `Ждать` · `Клик по картинке` · `Найти картинку` · `Клик в` · `Клавиша` · `Присвоить` · `Если` · `Иначе` · `Конец если` · `Пока` · `Конец пока` · `Прервать` · `Запустить` · `Закрыть программу` · `Заметка` · `Прочитать число` · `Прочитать текст` · `Взять текст` · `Записать текст` · `Найти элемент` · `Нажать элемент`
 
-**8 conditions:** `always` · `variable` · `image` · `pixel` · `window` · `text` · `process running` · `element on screen`
+**8 условий:** `всегда` · `переменная` · `картинка` · `пиксель` · `окно` · `текст` · `процесс запущен` · `элемент на экране`
 
-> 📘 **The complete, click-by-click guide lives in [SCRIPTS.md](SCRIPTS.md)** — including every step kind, every condition, the built-in variables, three worked examples and a troubleshooting table. Start there; this section is only the summary.
+> 📘 **Полное пошаговое руководство — в [SCRIPTS_RU.md](SCRIPTS_RU.md)**: каждый вид шага, каждое условие, встроенные переменные, три разобранных примера и таблица «что делать, если не работает». Начинайте оттуда; этот раздел — только краткая сводка.
 
-Open the editor (**✂ Editor → Open editor**), switch to the **Script** tab, pick a kind from the dropdown and press **Add**. Blocks are checked before anything runs: an unbalanced `If` is reported in the editor and the script is refused rather than half-executed.
+Откройте редактор (**✂ Редактор → Открыть редактор**), перейдите на вкладку **Скрипт**, выберите вид шага в списке и нажмите **Добавить**. Блоки проверяются до запуска: незакрытый `Если` показывается прямо в редакторе, и такой скрипт не запустится вовсе, вместо того чтобы выполниться наполовину.
 
 ---
 
-## 🔎 Image search
+## 🔎 Поиск по картинке
 
-Under **🔎 Image search** in the main window.
+Раздел **🔎 Поиск по картинке** в главном окне.
 
-1. Snip the button you care about with `Win+Shift+S`, then press **📋 Paste**. (Or **📂 Load PNG…**.)
-2. Press **🔍 Find on screen**. The result reads `Found at (x, y) — 0.973` or `Not found (best 0.412)`.
-3. Press **💾 Save PNG…** into the `templates/` folder — scripts refer to templates **by file name**.
+1. Вырежьте нужную кнопку через `Win+Shift+S` и нажмите **📋 Вставить**. (Или **📂 Открыть PNG…**.)
+2. Нажмите **🔍 Найти на экране**. Ответ будет вида `Найдено в (x, y) — 0.973` или `Не найдено (лучшее 0.412)`.
+3. Нажмите **💾 Сохранить PNG…** в папку `templates/` — скрипты ссылаются на шаблоны **по имени файла**.
 
-**Confidence** (0.30–1.00, default 0.85) is a normalised cross-correlation score: `1.00` is pixel-identical, `0.85` tolerates antialiasing and mild colour shifts. Because the score is normalised, a template still matches when the game's brightness or theme changed.
+**Порог совпадения** (0.30–1.00, по умолчанию 0.85) — это нормализованная кросс-корреляция: `1.00` — попиксельно идентично, `0.85` прощает сглаживание и небольшой сдвиг цвета. Оценка нормализована, поэтому шаблон продолжает совпадать, даже если в игре изменилась яркость или тема.
 
-Fully transparent pixels in a PNG are **excluded from the score**, so you can cut a round icon out of its background in any editor and match it on any backdrop.
+Полностью прозрачные пиксели PNG **не участвуют в оценке** — вырежьте круглую иконку из фона в любом редакторе, и она будет находиться на любой подложке.
 
-| Option | Effect |
+| Опция | Что делает |
 |---|---|
-| **Try other scales** | Also tests 0.8×, 0.9×, 1.1×, 1.25× — for when the window is a different size than when you snipped it |
-| **Search area only** | Restricts the sweep to one rectangle |
-| **Show what the script looks at** | Opens the see-through overlay described below |
+| **Пробовать другие масштабы** | Дополнительно проверяет 0.8×, 0.9×, 1.1×, 1.25× — если окно теперь другого размера |
+| **Искать только в области** | Ограничивает поиск прямоугольником |
+| **Показывать, куда смотрит скрипт** | Открывает прозрачный оверлей, описанный ниже |
 
-> ⚠️ **Try other scales applies to the test button only** — a scripted search is always at 1.0×. The answer to a different display is the sidecar below, not a scale sweep.
+> ⚠️ **«Пробовать другие масштабы» работает только для кнопки проверки** — поиск в скрипте всегда идёт в масштабе 1.0×. Ответ на другой экран — файл-спутник ниже, а не перебор масштабов.
 
-The search runs on a worker thread, so the window never freezes; a full-screen sweep takes a moment and shows a spinner.
+Поиск идёт в отдельном потоке, окно не подвисает; полное сканирование экрана занимает мгновение и показывает крутилку.
 
-### Telling a script where to look
+### Сказать скрипту, где искать
 
-Every image step and image condition carries its own **search area**: the whole screen, the window in front, a fixed rectangle, near where the same picture was last seen, or relative to another picture. It is the single most useful field in the release. Measured on a 2560×1440 desktop with `--selftest vision`, one step looking for a 64×64 template:
+У каждого шага и каждого условия с картинкой есть собственная **область поиска**: весь экран, активное окно, заданный прямоугольник, рядом с прошлым совпадением или относительно другой картинки. Это самое полезное поле выпуска. Замерено на столе 2560×1440 через `--selftest vision`, один шаг, ищущий шаблон 64×64:
 
-| Area | Capture | Search | Total | Looks per second |
+| Область | Снимок | Поиск | Итого | Просмотров в секунду |
 |---|---|---|---|---|
-| 2560×1440 | 43.8 ms | 33.8 ms | 77.7 ms | 12.9 |
-| 1280×720 | 16.8 ms | 9.8 ms | 26.7 ms | 37.5 |
-| 400×300 | 6.2 ms | 1.6 ms | 7.8 ms | 128.4 |
+| 2560×1440 | 43.8 мс | 33.8 мс | 77.7 мс | 12.9 |
+| 1280×720 | 16.8 мс | 9.8 мс | 26.7 мс | 37.5 |
+| 400×300 | 6.2 мс | 1.6 мс | 7.8 мс | 128.4 |
 
-**Relative to another picture** is the one no threshold can replace. A row of identical buttons is identical; which one to press is decided by the heading above it, and an anchor is how a script says so.
+**Относительно другой картинки** — то, чего не заменит никакой порог. Ряд одинаковых кнопок одинаков; какую нажать, решает заголовок над ней, и якорь — это способ сказать об этом скрипту.
 
-### Living with a picture that moves, fades or changes theme
+### Когда картинка двигается, бледнеет или меняет тему
 
-| Feature | What it is for |
+| Возможность | Зачем |
 |---|---|
-| **Two thresholds** | A score wobbling around one threshold reads as several state changes a second. A lower one to *lose* the picture turns that into one. |
-| **Stable N of M** | Tells an object (0.82, 0.84, 0.83) from a flicker (0.83, 0.51, 0.74). |
-| **A folder of variants** | `templates/Claim/` holding `normal.png`, `hover.png`, `dark.png` is one step, not three. |
-| **Outlines** | Correlates shapes instead of shades — survives a theme change and a highlighted row, at about 1.6× the cost. |
-| **A scale sidecar** | Saving a template writes `Name.png.json` with the display scale it was cut at, and loading rescales it for the display it will be looked for on. Templates made before 1.4.0 have no sidecar and are left alone. |
+| **Два порога** | Оценка, скачущая около одного порога, читается как несколько смен состояния в секунду. Второй, более низкий порог «считать потерянным» превращает это в одну. |
+| **Стабильно N из M** | Отличает объект (0.82, 0.84, 0.83) от мелькания (0.83, 0.51, 0.74). |
+| **Папка вариантов** | `templates/Claim/` с `normal.png`, `hover.png`, `dark.png` — это один шаг, а не три. |
+| **По контурам** | Сравнивает форму, а не оттенки: переживает смену темы и подсветку строки, примерно за 1.6× цены. |
+| **Файл-спутник с масштабом** | При сохранении шаблона рядом пишется `Имя.png.json` с масштабом экрана, при загрузке шаблон пересчитывается под текущий экран. У шаблонов до 1.4.0 спутника нет, и их не трогают. |
 
-### Seeing what it sees
+### Увидеть, что он видит
 
-**Show what the script looks at** puts a see-through, click-through window over everything. While a script runs it draws the search area in blue, the match and its score in green or red, the rectangle text was read from in amber, and the interface element that was found in violet.
+**«Показывать, куда смотрит скрипт»** кладёт поверх всего прозрачное окно, сквозь которое проходят клики. Пока идёт скрипт, оно рисует область поиска синим, совпадение с оценкой — зелёным или красным, прямоугольник чтения текста — янтарным, найденный элемент интерфейса — фиолетовым.
 
-A failed search gives you `0.41`, and `0.41` cannot say whether it looked in the wrong place, at the wrong size, or at the right thing under a tooltip. A rectangle can. It is a diagnostic and is off by default.
+Неудачный поиск выдаёт `0.41`, и `0.41` не скажет, смотрели ли не туда, не в том масштабе или на нужное место под подсказкой. Прямоугольник скажет. Это средство диагностики, по умолчанию выключено.
 
 ---
 
 ## 🪟 UI Automation
 
-Instead of looking at the pixels, ask Windows what is on screen. Where it works this beats everything else here: an element found by its name is found at any resolution, under any theme, in any window size, with no threshold to tune — and pressing it goes through the application itself, so the cursor never moves and the window need not even be in front.
+Вместо того чтобы разглядывать пиксели, можно спросить у Windows, что на экране. Там, где это работает, оно превосходит всё остальное: элемент, найденный по имени, находится при любом разрешении, в любой теме, при любом размере окна и без подбора порога, а нажатие идёт через само приложение — курсор не двигается, и окну даже не обязательно быть активным.
 
-Steps **Find element** and **Press element**, and the condition **Element on screen**. An element is named by any of: its **Name** (the text a screen reader would read), its **Id** (the identifier the application gives it), and its **Kind** (`Button`, `Edit`, `Text`, `CheckBox`, …). Narrowing by kind is what keeps it fast. Measured against the window in front: 9 to 35 ms for an exact match, depending on how much that window exposes, which is faster than any picture search here — and several times that when the name has to be matched as a substring.
+Шаги **Найти элемент** и **Нажать элемент**, условие **Элемент на экране**. Элемент задаётся любым из: **Имя** (текст, который произнёс бы экранный диктор), **Id** (идентификатор, который даёт приложение) и **Тип** (`Button`, `Edit`, `Text`, `CheckBox`, …). Сужение по типу и держит скорость. Замерено по активному окну: от 9 до 35 мс на точное совпадение — в зависимости от того, сколько это окно выставляет наружу, — что быстрее любого поиска по картинке здесь; и в несколько раз дороже, когда имя приходится искать по вхождению.
 
-> ⚠️ **It only sees what an application chooses to expose.** Unity, DirectX, OpenGL and canvas-drawn interfaces expose nothing at all, and across a privilege boundary it is limited or silent. **In Roblox it will find nothing** — this is a feature for automating ordinary programs.
+> ⚠️ **Он видит только то, что приложение само выставляет наружу.** Unity, DirectX, OpenGL и интерфейсы на canvas не выставляют ничего, а между процессами разных привилегий он ограничен или молчит. **В Roblox он не найдёт ничего** — это возможность автоматизировать обычные программы.
 
-The arrangement that works is a cascade, cheapest and most reliable first:
+Работающая схема — каскад, от самого дешёвого и надёжного:
 
 ```
-element  →  picture  →  text  →  fixed coordinates
+элемент  →  картинка  →  текст  →  фиксированные координаты
 ```
 
 ---
 
-## 🔤 Text on screen (OCR)
+## 🔤 Текст на экране (OCR)
 
-Under **🔤 Text on screen**. It uses `Windows.Media.Ocr` — the recognition engine already installed with Windows — so there are **no models to download**. If your game isn't in English, add that language pack in Windows Settings and the engine picks it up automatically.
+Раздел **🔤 Текст на экране**. Используется `Windows.Media.Ocr` — движок распознавания, уже установленный вместе с Windows, поэтому **скачивать модели не надо**. Если игра не на английском, добавьте нужный язык в параметрах Windows, и движок подхватит его сам.
 
-1. Press **🎯 Pick in 3 s**, hover the **top-left** corner of the region, wait for the countdown, then hover the **bottom-right** corner.
-2. The rectangle is captured and read immediately, so you can see exactly what the engine sees.
-3. In any script step that needs a region, press **⤵ from the panel** to copy those four numbers in.
+1. Нажмите **🎯 Взять через 3 с**, наведите курсор на **левый верхний** угол области, дождитесь отсчёта, затем наведите на **правый нижний** угол.
+2. Прямоугольник запоминается и сразу же читается, чтобы вы увидели ровно то, что видит движок.
+3. В любом шаге скрипта, где нужна область, нажмите **⤵ из панели** — четыре числа подставятся сами.
 
-Small regions are upscaled automatically (Windows OCR returns nothing at all below ~40×40 px). Text matching is deliberately loose: case, extra whitespace and stray punctuation are ignored, because OCR output never matches a human reading character for character.
+Маленькие области автоматически увеличиваются (Windows OCR ниже ~40×40 px не возвращает вообще ничего). Сравнение текста намеренно нестрогое: регистр, лишние пробелы и случайные знаки препинания игнорируются, потому что вывод OCR никогда не совпадает с человеческим чтением символ в символ.
 
-Numbers are parsed generously too — `Gems: 1,250` and `1 250` both read as `1250`, and a clock like `02:34` is converted to **154 seconds**.
+### Обработка пикселей
 
-### Preparing the pixels
+Движок писали для документов — тёмный текст, светлая бумага, крупный кегль — и настроек у него нет вообще. Экранный текст не такой, поэтому всё, что можно сделать, приходится делать с пикселями заранее. Это даёт больше, чем дал бы второй движок, и ничего не добавляет к размеру бинарника.
 
-The engine was built for documents — dark text, light paper, generous size — and it has no settings at all. Screen text is none of those, so everything that can be done has to be done to the pixels first. This is worth more than a second engine would be, and it adds nothing to the binary.
-
-| Profile | What it does |
+| Профиль | Что делает |
 |---|---|
-| **none** | only the enlargement the engine needs — what every earlier version did |
-| **interface** | grey, contrast pulled out to the full range |
-| **small text** | the same, enlarged harder |
-| **game HUD** | grey, stretched, then cut to black and white at Otsu's threshold |
-| **digits** | black and white, enlarged hard |
-| **try each** | walks the list and keeps the reading that best fits the expected format |
+| **без неё** | только увеличение, нужное самому движку, — то, что делали все прошлые версии |
+| **интерфейс** | серый, контраст растянут на весь диапазон |
+| **мелкий текст** | то же, но увеличение сильнее |
+| **игровой HUD** | серый, растяжение, затем чёрно-белое по порогу Оцу |
+| **цифры** | чёрно-белое, сильное увеличение |
+| **перебрать** | проходит по списку и оставляет прочтение, лучше всего подходящее под ожидаемый формат |
 
-Light text on a dark panel is turned the other way round automatically: the engine reads dark-on-light markedly better.
+Светлый текст на тёмной плашке переворачивается автоматически: тёмное на светлом движок читает заметно лучше.
 
-### Saying what a reading should look like
+### Сказать, как должно выглядеть прочитанное
 
-A whole number, a decimal, a clock, or a small pattern — `#` a digit, `@` a letter, `?` one character, `*` any run. `##:##` matches `12:34` and not `1:34`. Deliberately not a regular expression: it has to be typeable by somebody automating a game, and it must not cost a crate.
+Целое число, дробное, время или небольшой шаблон: `#` — цифра, `@` — буква, `?` — один символ, `*` — любой отрезок. `##:##` подходит к `12:34` и не подходит к `1:34`. Намеренно не регулярное выражение: это должно набираться руками человеком, который автоматизирует игру, и не должно стоить лишнего крейта.
 
-**A reading that does not fit is refused, and the variable keeps its old value.** A mis-read clock is not a small error, it is a different number, and quietly writing a zero is worse than doing nothing.
+**Прочтение, не подходящее под формат, отвергается, и переменная сохраняет старое значение.** Неверно прочитанные часы — не маленькая погрешность, а другое число, и тихо записать ноль хуже, чем не делать ничего.
 
-Alongside it comes a **fit score** from 0 to 1 — half whether the format parses, half how much of the reading belongs to the alphabet that format implies. It is not the engine's confidence: that number is on a scale nobody can interpret and is not comparable between engines. The panel shows it next to the reading, so a profile can be chosen by comparing numbers instead of squinting.
+Вместе с этим приходит **оценка соответствия** от 0 до 1: половина — разбирается ли формат, половина — какая доля прочитанного принадлежит алфавиту этого формата. Это не уверенность движка: та измеряется по шкале, которую никто не может истолковать, и несравнима между движками. Панель показывает оценку рядом с прочитанным, чтобы профиль можно было выбирать по числам, а не на глаз.
+
+Числа тоже разбираются щедро — `Gems: 1,250` и `1 250` читаются как `1250`, а часы вида `02:34` превращаются в **154 секунды**.
 
 ---
 
-## ✂ Editor
+## ✂ Редактор
 
-**✂ Editor → Open editor** opens a separate window with three views. Every action is undoable one step back.
+**✂ Редактор → Открыть редактор** открывает отдельное окно с тремя видами. Любое действие можно отменить на один шаг назад.
 
-| View | What it shows |
+| Вид | Что показывает |
 |---|---|
-| **Story** | Plain English: *"Dragged with Left from (120, 340) to (700, 340)"*, *"Typed "hello""*, *"Waited 1.2 s"* |
-| **Raw events** | Every event with its microsecond timestamp — the ground truth |
-| **Script** | The program: add, reorder, enable/disable and edit steps |
+| **Рассказ** | Человеческим языком: *«Протащил ЛКМ из (120, 340) в (700, 340)»*, *«Набрано "привет"»*, *«Пауза 1.2 с»* |
+| **Сырые события** | Каждое событие с микросекундной меткой — истина в последней инстанции |
+| **Скрипт** | Программа: добавить, переставить, включить/выключить и отредактировать шаги |
 
-**Per-action inspector** — click a line and edit its time, key, coordinates, delta, horizontal/extended flags; **Duplicate** or **Delete action**.
+**Инспектор действия** — кликните по строке и правьте её момент, клавишу, координаты, дельту, флаги «горизонтально»/«расширенная»; **Дублировать** или **Удалить действие**.
 
-**Range operations** — pick a range with `from` / `to`, then:
+**Операции над диапазоном** — задайте диапазон полями `с` / `по`, затем:
 
-| Action | What it does |
+| Действие | Что делает |
 |---|---|
-| **Delete** | Removes the range *and pulls the tail back*, so no silent gap is left behind |
-| **Keep only** | Crops to the range and rebases it to t = 0 |
-| **Drop moves** | Strips every mouse-movement event, leaving clicks and keys |
-| **Trim lead-in** | Shifts everything so the first event happens immediately |
-| **Insert pause** | Adds N ms at the selection point and shifts the rest |
-| **Scale time ×** | Multiplies every timestamp — 2.0 makes the macro permanently twice as slow |
-| **Replace in selection** | Swaps one mouse button for another across the range (Left → Right, …) |
-| **Shift coordinates** | Adds `dX` / `dY` to every coordinate in the range |
+| **Удалить** | Убирает диапазон *и подтягивает хвост*, чтобы не осталось молчаливой дырки |
+| **Оставить только** | Обрезает до диапазона и сдвигает его к t = 0 |
+| **Убрать движения** | Вырезает все движения мыши, оставляя клики и клавиши |
+| **Обрезать начало** | Сдвигает всё так, чтобы первое событие произошло сразу |
+| **Вставить паузу** | Добавляет N мс в точке выделения и сдвигает остальное |
+| **Масштаб времени ×** | Умножает все метки времени — 2.0 навсегда делает макрос вдвое медленнее |
+| **Заменить в выделении** | Меняет одну кнопку мыши на другую по всему диапазону (ЛКМ → ПКМ, …) |
+| **Сдвинуть координаты** | Прибавляет `dX` / `dY` ко всем координатам диапазона |
 
-**Insert click at match** — after a successful image search, one button inserts a real click at the found position, right after the selected action.
+**Вставить клик по найденному** — после удачного поиска картинки одна кнопка вставляет настоящий клик по найденной позиции сразу после выбранного действия.
 
-The editor is disabled while recording or playing.
-
----
-
-## 📅 Schedule & target window
-
-**📅 Schedule** — tick *Start at a set time*, choose `HH:MM` and the weekdays. A dedicated thread checks every 5 seconds, so it fires even when the window is minimised to the tray and no longer painting. If a recording or playback is already running at that minute, the launch is skipped and logged rather than stacked.
-
-**🪟 Target window** — type a fragment of the window title (matching is case-insensitive and *contains*, so `roblox` matches `Roblox Player`). With *Pause while it is not in front* enabled, playback holds itself whenever something else takes focus, and resumes on its own when you come back. The status line reads **Waiting for the window…**.
-
-Both are unrelated to **⚓ window anchoring**, which is about *coordinates*: turn on *Remember the target window* while recording, and the app stores the foreground window's title and rectangle inside the macro. On playback, *Follow the anchored window* finds it again and shifts every coordinate by however far it moved — and with *Scale with the window size*, stretches them if it was resized too.
+Во время записи и воспроизведения редактор заблокирован.
 
 ---
 
-## 🧰 Exports & extras
+## 📅 Расписание и целевое окно
 
-### ⚙ Export to a standalone `.exe`
+**📅 Расписание** — отметьте *Запускать в заданное время*, выберите `ЧЧ:ММ` и дни недели. Отдельный поток проверяет время каждые 5 секунд, поэтому запуск срабатывает, даже когда окно свёрнуто в трей и больше не перерисовывается. Если в эту минуту уже идёт запись или воспроизведение, запуск пропускается и пишется в лог, а не встаёт в очередь.
 
-**Files → Export .exe** produces a player that runs on any Windows PC with nothing installed.
-It works by copying this executable and appending the macro to it: a PE image ignores trailing
-bytes, which is the same trick self-extracting archives use — no compiler or linker is involved.
-On startup the player finds its own footer and plays immediately; the emergency-stop hotkey
-still works. The current loop count, speed, mouse mode and inter-loop delay are baked in.
+**🪟 Целевое окно** — введите фрагмент заголовка окна (сравнение без учёта регистра и по вхождению, так что `roblox` совпадёт с `Roblox Player`). С включённой опцией *Пауза, пока оно не впереди* воспроизведение само встаёт, когда фокус уходит, и само продолжается, когда вы возвращаетесь. В строке статуса при этом — **Жду окно…**.
 
-**Scripts are included.** If the script uses image templates, copy the `templates/` folder next to
-the exported `.exe` — the player looks for templates in its own folder, not in the original one.
-
-### 📜 Export to AutoHotkey
-
-**Files → Export .ahk** writes an AutoHotkey v2 script: `MouseMove` / `Click` / `Send` with
-`Sleep` between events, wrapped in a `Loop`, and `Esc` bound to exit. Keys are emitted as
-`{vkXX}` so non-US layouts survive the trip.
-
-> ⚠️ This export covers **recorded events only** — script steps, conditions and variables are not translated.
-
-### 🖥 Tray
-
-Enabled in **Appearance**. Left-click toggles the window, right-click opens a menu with
-record / play / emergency stop / exit. Turn on *"Close button minimizes to tray"* and the ✕
-hides the window instead of quitting — useful for multi-hour unattended runs.
-
-### 🎯 Pixel stop condition
-
-Watch one screen pixel and stop when it matches a colour (or stops matching). Press
-**Pick in 3 s**, hover the target, and both the coordinates and the colour are captured.
-Tolerance is a per-channel ±value. The condition is polled about four times a second and,
-when it fires, runs the same end action as the timer — so *"stop farming when the HP bar
-turns red, then shut down"* is two checkboxes.
-
-> ⚠️ This applies to **flat replay only**. In a scripted macro, use a `pixel` condition inside `Wait for` / `If` / `While` instead.
-
-### 🗂 Profiles
-
-Save the entire configuration under a name into `profiles/<name>.json` and switch between
-setups with one click. Recent files are kept across switches.
-
-### 🌍 Translations without a rebuild
-
-Press **Export language template** to write `lang/xx.template.json` — a flat key/value dump of
-every UI string. Translate the values, rename it to `lang/xx.json` (`en`, `ru`, `uk`, `pt`,
-`es`, `zh`), and restart: your strings replace the built-in ones. Empty values and missing keys
-fall back to the defaults, so a partial translation is fine.
+Это не то же самое, что **⚓ привязка к окну**, которая про *координаты*: включите *Запоминать целевое окно* перед записью, и приложение сохранит заголовок и прямоугольник переднего окна прямо в макрос. При воспроизведении *Следовать за окном привязки* найдёт его снова и сдвинет все координаты ровно настолько, насколько окно переехало — а с опцией *Масштабировать вместе с окном* ещё и растянет их, если окно изменило размер.
 
 ---
 
-## 🎨 Themes
+## 🧰 Экспорт и прочее
 
-| # | Theme | Notes |
+### ⚙ Экспорт в отдельный `.exe`
+
+**Файлы → Экспорт в .exe** делает плеер, который запускается на любом ПК с Windows без установки чего-либо. Работает это так: берётся копия этого исполняемого файла, и макрос дописывается ему в хвост — PE-образ игнорирует лишние байты в конце, тот же трюк используют самораспаковывающиеся архивы. Ни компилятор, ни линкер не нужны. При старте плеер находит собственный «подвал» и сразу играет; аварийная горячая клавиша работает. Текущее число циклов, скорость, режим мыши и пауза между циклами вшиваются внутрь.
+
+**Скрипты тоже попадают внутрь.** Если скрипт использует шаблоны картинок, скопируйте папку `templates/` рядом с экспортированным `.exe` — плеер ищет шаблоны в своей папке, а не в исходной.
+
+### 📜 Экспорт в AutoHotkey
+
+**Файлы → Экспорт в .ahk** пишет скрипт AutoHotkey v2: `MouseMove` / `Click` / `Send` с `Sleep` между событиями, обёрнутые в `Loop`, и `Esc` для выхода. Клавиши выводятся как `{vkXX}`, поэтому не-US раскладки переживают перенос.
+
+> ⚠️ Этот экспорт покрывает **только записанные события** — шаги скрипта, условия и переменные не переносятся.
+
+### 🖥 Трей
+
+Включается в **Оформлении**. Левый клик сворачивает/разворачивает окно, правый открывает меню с записью / плеем / аварийным стопом / выходом. Включите *«Крестик сворачивает в трей»* — и ✕ будет прятать окно, а не закрывать программу. Удобно для многочасовых прогонов.
+
+### 🎯 Условие по пикселю
+
+Следит за одной точкой экрана и останавливает макрос, когда она совпала с цветом (или перестала совпадать). Нажмите **🎯 Взять через 3 с**, наведите курсор — и координаты, и цвет запомнятся сами. Допуск задаётся как ± по каждому каналу. Условие проверяется примерно четыре раза в секунду и при срабатывании выполняет то же действие, что и таймер — так что *«прекратить фарм, когда полоска HP покраснела, и выключить ПК»* — это две галочки.
+
+> ⚠️ Работает **только в плоском повторе**. В макросе со скриптом используйте условие `пиксель` внутри `Ждать` / `Если` / `Пока`.
+
+### 🗂 Профили
+
+Сохраняет всю конфигурацию под именем в `profiles/<имя>.json` и переключает наборы настроек одним кликом. Список недавних файлов при переключении сохраняется.
+
+### 🌍 Переводы без пересборки
+
+Нажмите **🌍 Выгрузить шаблон перевода** — появится `lang/xx.template.json`, плоский дамп «ключ → строка» для всего интерфейса. Переведите значения, переименуйте в `lang/xx.json` (`en`, `ru`, `uk`, `pt`, `es`, `zh`) и перезапустите: ваши строки заменят встроенные. Пустые значения и отсутствующие ключи откатываются к умолчаниям, так что частичный перевод — это нормально.
+
+---
+
+## 🎨 Темы
+
+| # | Тема | Примечания |
 |---|---|---|
-| 0 | **Dark** | The default. Neutral grays, subtle shadows |
-| 1 | **OLED (Pure Black)** | `#000000` panels, zero shadows — true black pixels stay off |
-| 2 | **Material Design 3** | 20 px rounded widgets, and it **reads your Windows accent colour** from the registry |
-| 3 | **Catppuccin Mocha** | The pastel favourite |
-| 4 | **Nord** | Cold arctic blues |
-| 5 | **Dracula** | Purple/pink on deep gray |
-| 6 | **Glassmorphism** | Translucent panels + **DWM Acrylic** system backdrop |
-| 7 | **Neumorphism** | The only light theme — soft shadows on `#E0E5EC` |
-| 8 | **Fluent (Mica)** | Windows 11 **Mica** backdrop + your system accent colour |
+| 0 | **Dark** | По умолчанию. Нейтральные серые, мягкие тени |
+| 1 | **OLED (Pure Black)** | Панели `#000000`, никаких теней — настоящие чёрные пиксели остаются выключенными |
+| 2 | **Material Design 3** | Скругления 20 px, **читает акцентный цвет Windows** из реестра |
+| 3 | **Catppuccin Mocha** | Пастельный любимец |
+| 4 | **Nord** | Холодная арктическая синева |
+| 5 | **Dracula** | Фиолетово-розовое на тёмно-сером |
+| 6 | **Glassmorphism** | Полупрозрачные панели + системная подложка **DWM Acrylic** |
+| 7 | **Neumorphism** | Единственная светлая тема — мягкие тени на `#E0E5EC` |
+| 8 | **Fluent (Mica)** | Подложка **Mica** из Windows 11 + системный акцентный цвет |
 
-The **Transparent UI** checkbox works on top of any theme. Glass requests Acrylic and Fluent requests Mica through `DwmSetWindowAttribute`; if the attribute isn't supported (Windows 10), the app falls back to classic `DwmEnableBlurBehindWindow`.
+Галочка **Прозрачный интерфейс** работает поверх любой темы. Glass запрашивает Acrylic, Fluent — Mica через `DwmSetWindowAttribute`; если атрибут не поддерживается (Windows 10), приложение откатывается к классическому `DwmEnableBlurBehindWindow`.
 
 ---
 
-## 🌍 Languages
+## 🌍 Языки
 
 `English` · `Русский` · `Українська` · `Português` · `Español` · `中文`
 
-The UI language is detected from `GetUserDefaultUILanguage()` on first launch and can be overridden in the dropdown at any time — no restart. CJK glyphs are loaded from the system fonts (`msyh.ttc`, `simhei.ttf`, `meiryo.ttc`) when present.
+Язык интерфейса определяется через `GetUserDefaultUILanguage()` при первом запуске и в любой момент меняется в выпадающем списке — без перезапуска. Иероглифы подгружаются из системных шрифтов (`msyh.ttc`, `simhei.ttf`, `meiryo.ttc`), если они есть.
 
 ---
 
-## 📁 Files & folders
+## 📁 Файлы и папки
 
-### Where things live
+### Где что лежит
 
-The app picks its data folder at startup and shows the result under **📁 Files**:
+Папку данных приложение выбирает при старте и показывает результат в разделе **📁 Файлы**:
 
-1. **Next to the executable** — if that folder is writable (fully portable: USB sticks, `Downloads`, a game folder);
-2. otherwise **`%APPDATA%\MacroRecorder\`** — so it still works from `Program Files` or a read-only location.
+1. **Рядом с исполняемым файлом** — если туда можно писать (полностью портативно: флешки, `Загрузки`, папка игры);
+2. иначе **`%APPDATA%\MacroRecorder\`** — чтобы всё работало и из `Program Files`, и из места только для чтения.
 
 ```
-<data folder>/
-├── config.json                  settings
-├── macro.json                   default macro slot
-├── my-farm.mrz                  gzipped macro (optional)
+<папка данных>/
+├── config.json                  настройки
+├── macro.json                   макрос по умолчанию
+├── my-farm.mrz                  сжатый макрос (опционально)
 ├── templates/
-│   └── claim_button.png         pictures the script searches for
+│   └── claim_button.png         картинки, которые ищет скрипт
 ├── profiles/
-│   └── farming.json             named settings profiles
+│   └── farming.json             именованные профили настроек
 ├── lang/
-│   └── ru.json                  optional translation overrides
+│   └── ru.json                  подмена перевода (опционально)
 └── logs/
-    └── macro-recorder.log.YYYY-MM-DD
+    └── macro-recorder.log.ГГГГ-ММ-ДД
 ```
 
-### `macro.json` — the recording (format v3)
+### `macro.json` — запись (формат v3)
 
-`t_us` is microseconds since the recording started; `kind` is an externally-tagged enum. `duration_us` is the full length of the recording **including trailing idle time**, which is what makes a "do stuff, then wait 5 seconds" macro loop correctly.
+`t_us` — микросекунды с начала записи; `kind` — enum с внешним тегом. `duration_us` — полная длина записи **вместе с тишиной в конце**: именно это заставляет макрос вида «поделать дела, потом подождать 5 секунд» зацикливаться правильно.
 
 ```json
 {
@@ -681,252 +659,252 @@ The app picks its data folder at startup and shows the result under **📁 Files
 }
 ```
 
-| Field | Meaning |
+| Поле | Значение |
 |---|---|
-| `version` | `3` — adds `script` and `vars`; v1 and v2 files still load |
-| `t_us` | Timestamp in microseconds from the start of the recording |
-| `anchor` | Title and rectangle of the window that was in front when recording started (optional) |
-| `Key.vk` / `Key.scan` | Virtual-key code and hardware scancode. **Scancode wins on replay** when non-zero — that's what makes games and non-US layouts behave |
-| `Key.extended` | Extended-key flag (arrows, NumPad Enter, right Ctrl/Alt…) |
-| `MouseMove.x/y` | Absolute screen coordinates (used in absolute mode) |
-| `MouseMove.dx/dy` | Delta since the previous sample (used in relative mode) |
+| `version` | `3` — добавились `script` и `vars`; файлы v1 и v2 по-прежнему открываются |
+| `t_us` | Метка времени в микросекундах от начала записи |
+| `anchor` | Заголовок и прямоугольник окна, которое было впереди в момент старта записи (опционально) |
+| `Key.vk` / `Key.scan` | Код виртуальной клавиши и аппаратный скан-код. **При воспроизведении побеждает скан-код**, если он не нулевой — благодаря этому корректно работают игры и не-US раскладки |
+| `Key.extended` | Флаг расширенной клавиши (стрелки, Enter на NumPad, правые Ctrl/Alt…) |
+| `MouseMove.x/y` | Абсолютные экранные координаты (абсолютный режим) |
+| `MouseMove.dx/dy` | Смещение с прошлой выборки (относительный режим) |
 | `MouseButton.button` | `Left` · `Right` · `Middle` · `X1` · `X2` |
-| `MouseWheel.delta` | 120 per notch, negative = down/left |
-| `MouseWheel.horizontal` | `true` for tilt-wheel / horizontal scroll |
-| `script` | The program. Empty (or all steps disabled) means "just replay the events" |
-| `vars` | Starting values for the script's variables. Anything unset starts at `0` |
+| `MouseWheel.delta` | 120 на щелчок, отрицательное — вниз/влево |
+| `MouseWheel.horizontal` | `true` для горизонтальной прокрутки |
+| `script` | Программа. Пусто (или все шаги выключены) — значит «просто повторяй события» |
+| `vars` | Стартовые значения переменных скрипта. Всё, что не задано, начинается с `0` |
 
-**Compatibility:** version 1 files (a bare `[ … ]` array) and version 2 files still load. **Compression:** saving with a `.mrz` (or `.gz`) extension writes gzipped compact JSON, typically 20–40× smaller; both extensions load transparently.
+**Совместимость:** файлы версии 1 (голый массив `[ … ]`) и версии 2 по-прежнему загружаются. **Сжатие:** сохранение с расширением `.mrz` (или `.gz`) пишет gzip-сжатый компактный JSON, обычно в 20–40 раз меньше; оба расширения открываются прозрачно.
 
-**Validation on load:** unbalanced script blocks, an empty file, or more than 4 000 000 events are rejected with a message. Out-of-order timestamps are sorted rather than rejected.
+**Проверки при загрузке:** незакрытые блоки скрипта, пустой файл или больше 4 000 000 событий отклоняются с сообщением. Метки времени не по порядку сортируются, а не отвергаются.
 
-### `config.json` — the settings
+### `config.json` — настройки
 
-Written by **💾 Save settings** and automatically on exit. Unknown or out-of-range values are clamped instead of crashing, and missing keys fall back to their defaults — so a config from an older version keeps working.
+Пишется кнопкой **💾 Сохранить настройки** и автоматически при выходе. Неизвестные или выходящие за диапазон значения обрезаются, а не роняют программу; отсутствующие ключи берут значения по умолчанию — поэтому конфиг от старой версии продолжает работать.
 
-**Appearance**
+**Оформление**
 
-| Key | Type | Default | Meaning |
+| Ключ | Тип | По умолчанию | Значение |
 |---|---|---|---|
-| `default_lang` | 0–6 | `0` | `0` = auto, `1` EN, `2` RU, `3` UK, `4` PT, `5` ES, `6` ZH |
-| `default_theme` | 0–8 | `0` | Index into the theme table above |
-| `transparent_ui` | bool | `true` | Translucent window |
-| `always_on_top` | bool | `true` | Keep the window above others |
-| `tray_enabled` / `close_to_tray` | bool | `true` / `true` | Tray icon; ✕ minimizes instead of quitting |
+| `default_lang` | 0–6 | `0` | `0` = авто, `1` EN, `2` RU, `3` UK, `4` PT, `5` ES, `6` ZH |
+| `default_theme` | 0–8 | `0` | Индекс в таблице тем выше |
+| `transparent_ui` | bool | `true` | Полупрозрачное окно |
+| `always_on_top` | bool | `true` | Держать окно поверх остальных |
+| `tray_enabled` / `close_to_tray` | bool | `true` / `true` | Значок в трее; ✕ сворачивает вместо выхода |
 
-**Playback**
+**Воспроизведение**
 
-| Key | Type | Default | Meaning |
+| Ключ | Тип | По умолчанию | Значение |
 |---|---|---|---|
-| `loop_play` | bool | `true` | Infinite looping |
-| `play_count_limit` | 1–9999 | `1` | Used when `loop_play` is `false` |
-| `speed` | 0.05–10.0 | `1.0` | Playback speed multiplier |
-| `absolute_mouse` | bool | `true` | Absolute vs relative mouse replay |
-| `repeat_delay_ms` | 0–600000 | `0` | Pause between loops |
-| `jitter_pct` | 0–50 | `0` | Per-event timing randomisation (flat replay only) |
-| `human_mouse` | bool | `false` | Curved cursor paths instead of teleporting |
-| `human_curve` | 0–100 | `35` | How far the arc bows away from the straight line |
-| `mouse_jitter_px` | 0–60 | `0` | Random spread applied to every target point |
-| `use_window_anchor` | bool | `false` | Shift coordinates if the anchored window moved |
-| `anchor_scale` | bool | `true` | Also stretch them if it was resized |
+| `loop_play` | bool | `true` | Бесконечный цикл |
+| `play_count_limit` | 1–9999 | `1` | Используется, когда `loop_play` = `false` |
+| `speed` | 0.05–10.0 | `1.0` | Множитель скорости |
+| `absolute_mouse` | bool | `true` | Абсолютная или относительная мышь |
+| `repeat_delay_ms` | 0–600000 | `0` | Пауза между циклами |
+| `jitter_pct` | 0–50 | `0` | Случайный разброс таймингов (только плоский повтор) |
+| `human_mouse` | bool | `false` | Курсор едет по дуге, а не телепортируется |
+| `human_curve` | 0–100 | `35` | Насколько дуга отходит от прямой |
+| `mouse_jitter_px` | 0–60 | `0` | Случайный разброс каждой целевой точки |
+| `use_window_anchor` | bool | `false` | Сдвигать координаты, если окно привязки переехало |
+| `anchor_scale` | bool | `true` | И растягивать, если оно изменило размер |
 
-**Recording**
+**Запись**
 
-| Key | Type | Default | Meaning |
+| Ключ | Тип | По умолчанию | Значение |
 |---|---|---|---|
-| `capture_mouse_moves` | bool | `true` | Record movement, not just clicks |
-| `mouse_sample_ms` | 1–100 | `5` | Movement sampling interval |
-| `record_window_anchor` | bool | `false` | Remember the foreground window when recording starts |
+| `capture_mouse_moves` | bool | `true` | Писать движения, а не только клики |
+| `mouse_sample_ms` | 1–100 | `5` | Шаг выборки движений |
+| `record_window_anchor` | bool | `false` | Запоминать переднее окно в момент старта записи |
 
-**Time limit & power**
+**Лимит времени и питание**
 
-| Key | Type | Default | Meaning |
+| Ключ | Тип | По умолчанию | Значение |
 |---|---|---|---|
-| `time_limit_enabled` | bool | `false` | Enable the playback time limit |
-| `time_limit_h` / `_m` / `_s` | 0–240 / 0–59 / 0–59 | `0` | Hours / minutes / seconds |
-| `action_on_completion` | 0–5 | `0` | `0` stop · `1` shut down · `2` restart · `3` sleep · `4` hibernate · `5` log off |
-| `shutdown_delay_s` | 0–600 | `60` | Countdown before shutdown/restart |
+| `time_limit_enabled` | bool | `false` | Включить лимит времени |
+| `time_limit_h` / `_m` / `_s` | 0–240 / 0–59 / 0–59 | `0` | Часы / минуты / секунды |
+| `action_on_completion` | 0–5 | `0` | `0` стоп · `1` выключить · `2` перезагрузить · `3` сон · `4` гибернация · `5` выйти из системы |
+| `shutdown_delay_s` | 0–600 | `60` | Отсчёт перед выключением/перезагрузкой |
 
-**Pixel condition**
+**Условие по пикселю**
 
-| Key | Type | Default | Meaning |
+| Ключ | Тип | По умолчанию | Значение |
 |---|---|---|---|
-| `pixel_enabled` | bool | `false` | Stop playback on a screen pixel |
-| `pixel_x` / `pixel_y` | i32 | `0` | Watched screen coordinate |
-| `pixel_r` / `_g` / `_b` | u8 | `255,0,0` | Target colour |
-| `pixel_tolerance` | 0–255 | `20` | Per-channel tolerance |
-| `pixel_mode` | 0/1 | `0` | `0` stop when it matches · `1` stop when it differs |
+| `pixel_enabled` | bool | `false` | Останавливаться по пикселю экрана |
+| `pixel_x` / `pixel_y` | i32 | `0` | Отслеживаемая точка |
+| `pixel_r` / `_g` / `_b` | u8 | `255,0,0` | Целевой цвет |
+| `pixel_tolerance` | 0–255 | `20` | Допуск по каждому каналу |
+| `pixel_mode` | 0/1 | `0` | `0` стоп при совпадении · `1` стоп при отличии |
 
-**Hotkeys, schedule, target window**
+**Горячие клавиши, расписание, целевое окно**
 
-| Key | Type | Default | Meaning |
+| Ключ | Тип | По умолчанию | Значение |
 |---|---|---|---|
-| `hotkey_record` / `_play` / `_pause` / `_stop` | object | F6 / F7 / F8 / F9 | `{ "vk": 117, "ctrl": false, "alt": false, "shift": false }`; `vk: 0` means unbound |
-| `hotkey_faster` / `_slower` / `_skip` | object | unbound | Live speed control and step skipping |
-| `schedule_enabled` | bool | `false` | Start the macro at a set time |
-| `schedule_h` / `schedule_m` | 0–23 / 0–59 | `9` / `0` | When |
-| `schedule_days` | bitmask | `127` | Bit 0 = Monday … bit 6 = Sunday |
-| `target_title` | string | `""` | Window title fragment (max 120 chars) |
-| `target_pause_unfocused` | bool | `false` | Pause while that window isn't in front |
+| `hotkey_record` / `_play` / `_pause` / `_stop` | объект | F6 / F7 / F8 / F9 | `{ "vk": 117, "ctrl": false, "alt": false, "shift": false }`; `vk: 0` — не задано |
+| `hotkey_faster` / `_slower` / `_skip` | объект | не заданы | Скорость на лету и пропуск шага |
+| `schedule_enabled` | bool | `false` | Запускать макрос в заданное время |
+| `schedule_h` / `schedule_m` | 0–23 / 0–59 | `9` / `0` | Когда |
+| `schedule_days` | битовая маска | `127` | Бит 0 = понедельник … бит 6 = воскресенье |
+| `target_title` | строка | `""` | Фрагмент заголовка окна (до 120 символов) |
+| `target_pause_unfocused` | bool | `false` | Пауза, пока это окно не впереди |
 
-**Files & image search**
+**Файлы и поиск по картинке**
 
-| Key | Type | Default | Meaning |
+| Ключ | Тип | По умолчанию | Значение |
 |---|---|---|---|
-| `recent_files` | array | `[]` | Up to 8 recent macro paths |
-| `compress_on_save` | bool | `false` | Default to `.mrz` when saving |
-| `img_threshold` | 0.3–1.0 | `0.85` | Confidence for the test search in the panel |
-| `img_multiscale` | bool | `false` | Also try 0.8×–1.25× in the panel |
-| `debug_overlay` | bool | `false` | The see-through window showing what the script looks at |
-| `img_region_enabled` | bool | `false` | Restrict the panel search to a rectangle |
-| `img_rx` / `_ry` / `_rw` / `_rh` | i32 | `0,0,800,600` | That rectangle |
+| `recent_files` | массив | `[]` | До 8 недавних путей к макросам |
+| `compress_on_save` | bool | `false` | По умолчанию сохранять в `.mrz` |
+| `img_threshold` | 0.3–1.0 | `0.85` | Порог для проверочного поиска в панели |
+| `img_multiscale` | bool | `false` | Пробовать 0.8×–1.25× в панели |
+| `debug_overlay` | bool | `false` | Прозрачное окно, показывающее, куда смотрит скрипт |
+| `img_region_enabled` | bool | `false` | Ограничить поиск в панели прямоугольником |
+| `img_rx` / `_ry` / `_rw` / `_rh` | i32 | `0,0,800,600` | Этот прямоугольник |
 
 ---
 
-## 💻 Command line
+## 💻 Командная строка
 
 ```
 macro-recorder [OPTIONS]
 
-  -p, --play <FILE>    Load a macro (.json / .mrz) on start
-  -n, --loops <N>      Repeat count (0 = infinite)
-  -s, --speed <X>      Playback speed multiplier (0.05 - 10.0)
-      --no-gui         Play the macro headless and exit
-  -h, --help           Show this help
-  -V, --version        Show the version
+  -p, --play <FILE>    Загрузить макрос (.json / .mrz) при старте
+  -n, --loops <N>      Число повторов (0 = бесконечно)
+  -s, --speed <X>      Множитель скорости (0.05 - 10.0)
+      --no-gui         Проиграть макрос без окна и выйти
+  -h, --help           Показать справку
+  -V, --version        Показать версию
 ```
 
-Without `--no-gui` the options simply pre-load the GUI, which is handy for shortcuts:
+Без `--no-gui` параметры просто предзагружают интерфейс — удобно для ярлыков:
 
 ```powershell
-# Preload a macro and start the UI with it
+# Предзагрузить макрос и открыть окно
 macro-recorder.exe --play "D:\macros\farm.mrz"
 
-# Run it 20 times without a window (Task Scheduler, .bat files, …)
+# Прогнать 20 раз без окна (планировщик задач, .bat-файлы, …)
 macro-recorder.exe --play "D:\macros\farm.mrz" --loops 20 --speed 1.5 --no-gui
 ```
 
-Scripts run in headless mode too. The emergency-stop hotkey still works.
+Скрипты в безоконном режиме тоже работают. Аварийная горячая клавиша по-прежнему действует.
 
 ---
 
-## 📥 Download
+## 📥 Скачать
 
-Grab the latest `.exe` from the **[Releases](../../releases)** page. No installation needed.
+Свежий `.exe` — на странице **[Releases](../../releases)**. Установка не нужна.
 
-| File | Requires | Notes |
+| Файл | Требует | Примечания |
 |---|---|---|
-| `MacroRecorder.exe` | Any x86-64 CPU | Universal — runs everywhere |
-| `MacroRecorder.v3.exe` | AVX2-capable CPU (Intel Haswell 2013+ / AMD Zen+) | Slightly faster on modern CPUs |
+| `MacroRecorder.exe` | Любой x86-64 | Универсальная сборка — работает везде |
+| `MacroRecorder.v3.exe` | Процессор с AVX2 (Intel Haswell 2013+ / AMD Zen+) | Немного быстрее на современных CPU |
 
-> ⚠️ **Antivirus note:** macro tools install global input hooks and inject synthetic input, so unsigned builds get flagged as suspicious. This is a false positive that affects every tool in this category — TinyTask's own changelog has entries about fighting it too. That's exactly why the source is open: [build it yourself](#️-build-from-source) and trust your own binary.
+> ⚠️ **Про антивирусы:** макро-инструменты ставят глобальные хуки ввода и шлют синтетический ввод, поэтому неподписанные сборки помечаются как подозрительные. Это ложное срабатывание, которое затрагивает вообще все программы этого класса — в changelog самого TinyTask есть записи о борьбе с тем же самым. Именно поэтому исходники открыты: [соберите сами](#️-сборка-из-исходников) и доверяйте своему бинарнику.
 
 ---
 
-## 🛠️ Build from source
+## 🛠️ Сборка из исходников
 
 ```bash
-# 1. Install Rust (1.97.1+, edition 2024): https://rustup.rs
-# 2. Clone & build
+# 1. Установите Rust (1.97.1+, edition 2024): https://rustup.rs
+# 2. Клонируйте и соберите
 git clone https://github.com/blackixxce12/Macro-Recorder.git
 cd Macro-Recorder
 
-# Universal build
+# Универсальная сборка
 cargo build --release
 
-# Optimized build (AVX2, a few % faster on modern CPUs)
+# Оптимизированная сборка (AVX2, на несколько % быстрее на современных CPU)
 # CMD:
 set RUSTFLAGS=-C target-cpu=x86-64-v3 && cargo build --release
 # PowerShell:
 $env:RUSTFLAGS="-C target-cpu=x86-64-v3"; cargo build --release
 
-# Without the OCR backend (if WinRT bindings ever fail to build)
+# Без OCR-движка (если сборка WinRT-биндингов вдруг ломается)
 cargo build --release --no-default-features
 
-# Tests (format round-trips, block balancing, config clamping, scheduler math)
+# Тесты (round-trip форматов, баланс блоков, обрезка конфига, математика планировщика)
 cargo test
 ```
 
-The binary lands in `target/release/`. Release profile: `opt-level = "z"`, fat LTO, one codegen unit, symbols stripped, `panic = "abort"` — which is why the hook callbacks are written to be panic-free rather than relying on `catch_unwind`.
+Бинарник появится в `target/release/`. Профиль release: `opt-level = "z"`, fat LTO, один codegen unit, символы вырезаны, `panic = "abort"` — именно поэтому колбэки хуков написаны так, чтобы не паниковать, а не полагаться на `catch_unwind`.
 
-**Features:** `winocr` is on by default and provides text recognition through `Windows.Media.Ocr`. It ships no models — it uses the language packs already installed in Windows. `--no-default-features` disables it; everything else keeps working, and OCR steps report *"This build has no OCR backend"*.
+**Фичи:** `winocr` включена по умолчанию и даёт распознавание текста через `Windows.Media.Ocr`. Она не тащит с собой моделей — использует языковые пакеты, уже установленные в Windows. `--no-default-features` её отключает; всё остальное продолжает работать, а OCR-шаги сообщают *«В этой сборке нет движка OCR»*.
 
-**Icon:** `build.rs` embeds `assets/icon.ico` into the executable using [`winresource`](https://github.com/BenjaminRi/winresource), which needs a resource compiler — `rc.exe` (Windows SDK, comes with the MSVC toolchain) or `windres.exe` (MinGW). If it isn't found the build still succeeds; you just get a `cargo:warning` and no Explorer icon. The window icon comes from `assets/icon.rgba` and always works.
+**Иконка:** `build.rs` вшивает `assets/icon.ico` в исполняемый файл через [`winresource`](https://github.com/BenjaminRi/winresource), которому нужен компилятор ресурсов — `rc.exe` (Windows SDK, идёт с MSVC) или `windres.exe` (MinGW). Если его нет, сборка всё равно проходит: вы получите `cargo:warning` и exe без иконки в Проводнике. Иконка окна берётся из `assets/icon.rgba` и работает всегда.
 
-To watch what the app is doing, either read `logs/macro-recorder.log.*` or build in debug mode (which keeps a console attached) and set `RUST_LOG=debug`.
+Чтобы посмотреть, что делает приложение, читайте `logs/macro-recorder.log.*` или соберите debug-сборку (в ней остаётся консоль) и задайте `RUST_LOG=debug`.
 
 ---
 
-## ⚠️ Known limitations
+## ⚠️ Известные ограничения
 
-Honest list — please read before filing a bug:
+Честный список — прочитайте перед тем, как заводить баг:
 
-| Limitation | Detail |
+| Ограничение | Подробности |
 |---|---|
-| **Windows only** | Every capture/replay path goes through Win32. Non-Windows targets compile, but do nothing |
-| **Pausing drops a drag in progress** | Held keys and buttons are released when you pause, so a macro paused mid-drag resumes without the drag |
-| **One macro at a time** | Open/Save, recent files and profiles, but no tabs or queue |
-| **Exported `.exe` is ~5 MB** | The player is a copy of the whole app. TinyTask's ~60 KB output is smaller by design |
-| **Templates aren't embedded** | An exported `.exe` that searches for images needs the `templates/` folder beside it |
-| **AHK export ignores scripts** | Only recorded events are translated — conditions, loops and variables are not |
-| **Scripted playback skips some flat-replay features** | Timing jitter, the global pixel stop condition and the end-of-run power action apply to flat replay only. Inside a script use a `pixel` condition and the `Quit the app` step instead |
-| **No TinyTask `.rec` import** | The format is undocumented; a guessed parser would corrupt macros silently rather than fail loudly |
-| **Coordinates are screen-absolute** | DPI awareness stops Windows from lying about pixels, but a macro still assumes the same window layout as when it was recorded. Maximize your target window before recording, or use anchoring |
-| **Scripted image search is at 1.0×** | The "other scales" option applies to the test panel only. A template cut on a different display is handled by its scale sidecar, not by a scale sweep |
-| **UI Automation sees nothing in games** | It only reports what an application chooses to expose. Unity, DirectX, OpenGL and canvas interfaces expose nothing, and across a privilege boundary it is limited or silent. In Roblox it will find nothing |
-| **The overlay is a layered window, not a compositor effect** | It draws with GDI in physical pixels, so it is correct on a mixed-DPI desktop — but it is a plain always-on-top window, and a game running exclusive full-screen will cover it. Use borderless windowed while diagnosing |
-| **Variables are numbers or text, and nothing else** | No lists, no tables, no functions. Those would turn the step list into a programming language, and a programming language cannot be edited with a mouse. Call an external script with the `Run` step instead |
-| **OCR depends on Windows** | Accuracy and available languages come from the language packs installed on your PC. Stylised game fonts read poorly |
-| **Elevated windows** | Windows blocks synthetic input into higher-privilege windows. If your target runs as admin, run this as admin too |
-| **Anti-cheat** | `SendInput` is standard synthetic input. Many games accept it; kernel-level anti-cheat may detect or block it |
-| **Sleep/hibernate depend on the system** | If hibernation is disabled in Windows, that action fails and is logged rather than silently doing something else |
+| **Только Windows** | Весь захват и воспроизведение идут через Win32. Не-Windows цели компилируются, но ничего не делают |
+| **Пауза роняет незавершённое перетаскивание** | При паузе зажатые клавиши и кнопки отпускаются, поэтому макрос, поставленный на паузу посреди drag'а, продолжит уже без него |
+| **Один макрос за раз** | Есть открытие/сохранение, недавние и профили, но нет вкладок и очереди |
+| **Экспортированный `.exe` весит ~5 МБ** | Плеер — это копия всего приложения. ~60 КБ у TinyTask меньше by design |
+| **Шаблоны не вшиваются** | Экспортированному `.exe`, который ищет картинки, нужна папка `templates/` рядом с ним |
+| **Экспорт в AHK игнорирует скрипты** | Переносятся только записанные события — условия, циклы и переменные нет |
+| **Скриптовое воспроизведение обходит часть возможностей плоского** | Джиттер таймингов, глобальный стоп по пикселю и действие питания в конце работают только в плоском повторе. Внутри скрипта используйте условие `пиксель` и шаг `Закрыть программу` |
+| **Нет импорта `.rec` из TinyTask** | Формат не документирован; парсер «на глазок» портил бы макросы молча, а не падал бы честно |
+| **Координаты абсолютные экранные** | Учёт DPI не даёт Windows врать про пиксели, но макрос всё равно рассчитывает на ту же раскладку окон, что при записи. Разворачивайте целевое окно перед записью или используйте привязку |
+| **Скриптовый поиск идёт в масштабе 1.0×** | Опция «другие масштабы» относится только к панели проверки. Шаблон, вырезанный на другом экране, разбирается файлом-спутником с масштабом, а не перебором |
+| **UI Automation ничего не видит в играх** | Он сообщает только то, что приложение само выставляет наружу. Unity, DirectX, OpenGL и интерфейсы на canvas не выставляют ничего, а между процессами разных привилегий он ограничен или молчит. В Roblox он не найдёт ничего |
+| **Оверлей — слоёное окно, а не эффект композитора** | Он рисует через GDI в физических пикселях, поэтому корректен и при разных DPI на мониторах, — но это обычное окно поверх остальных, и игра в эксклюзивном полноэкранном режиме его закроет. На время диагностики переключитесь в оконный без рамки |
+| **Переменные — числа или текст, и ничего больше** | Ни списков, ни таблиц, ни функций. Они превратили бы список шагов в язык программирования, а язык программирования нельзя редактировать мышью. Для такой мощности вызывайте внешний скрипт шагом `Запустить` |
+| **OCR зависит от Windows** | Точность и набор языков определяются языковыми пакетами на вашем ПК. Стилизованные игровые шрифты читаются плохо |
+| **Окна с повышенными правами** | Windows блокирует синтетический ввод в окна с более высокими привилегиями. Если цель запущена от админа, запускайте и эту программу от админа |
+| **Античиты** | `SendInput` — стандартный синтетический ввод. Многие игры его принимают; античиты уровня ядра могут его видеть и блокировать |
+| **Сон/гибернация зависят от системы** | Если гибернация отключена в Windows, действие завершится ошибкой и попадёт в лог, а не сделает молча что-то другое |
 
 ---
 
 ## ❓ FAQ
 
-**Is this an auto-clicker / cheat?**
-It's a macro recorder: it replays exactly what *you* did. What you automate is your responsibility — many games and services prohibit automation in their terms of service, and some ban for it. Read the rules of whatever you're automating.
+**Это автокликер / чит?**
+Это макро-рекордер: он воспроизводит ровно то, что сделали *вы*. Что именно вы автоматизируете — ваша ответственность: многие игры и сервисы запрещают автоматизацию в правилах, а кое-где за неё банят. Читайте правила того, что автоматизируете.
 
-**Do I have to learn scripting to use it?**
-No. Record → Play works with no script at all, exactly like TinyTask. Scripts are opt-in for when a blind replay isn't enough — see [SCRIPTS.md](SCRIPTS.md).
+**Обязательно ли учить скрипты?**
+Нет. «Записал → воспроизвёл» работает вообще без скрипта, ровно как в TinyTask. Скрипты — опция для случаев, когда слепого повтора мало, см. [SCRIPTS_RU.md](SCRIPTS_RU.md).
 
-**My script clicks the wrong place / never finds the image.**
-Lower the confidence a little (0.85 → 0.75), re-snip the template *without* the shadow or the animated part around it, and check that the game is at the same resolution as when you snipped. The [troubleshooting table in SCRIPTS.md](SCRIPTS.md) covers this in detail.
+**Скрипт кликает не туда / не находит картинку.**
+Немного снизьте порог (0.85 → 0.75), перевырежьте шаблон *без* тени и анимированных частей вокруг и проверьте, что разрешение игры такое же, как при вырезании. Подробности — в [таблице проблем в SCRIPTS_RU.md](SCRIPTS_RU.md).
 
-**Why is it 5 MB when TinyTask is 36 KB?**
-Because it ships a GPU-accelerated UI toolkit, 9 themes, 6 translations, a template matcher and a power/DPI/virtual-desktop layer. Different trade-off, on purpose. If size is your priority, TinyTask is genuinely the better answer.
+**Почему 5 МБ, если TinyTask — 36 КБ?**
+Потому что здесь GPU-ускоренный UI-тулкит, 9 тем, 6 переводов, сопоставление шаблонов и слой питания/DPI/виртуальных столов. Другой компромисс, и это осознанно. Если приоритет — размер, TinyTask действительно лучше.
 
-**Where did my `config.json` go?**
-Next to the exe if that folder is writable, otherwise `%APPDATA%\MacroRecorder\`. The app prints the exact path under **📁 Files**.
+**Куда делся мой `config.json`?**
+Рядом с exe, если туда можно писать, иначе `%APPDATA%\MacroRecorder\`. Точный путь показан в разделе **📁 Файлы**.
 
-**Will my macro survive changing the resolution?**
-Coordinates are absolute, so no — re-record after a resolution or monitor-layout change. Changing *DPI scaling* is handled, because the process is Per-Monitor v2 aware. A script built on image search survives far more than one built on fixed coordinates.
+**Переживёт ли макрос смену разрешения?**
+Координаты абсолютные, так что нет — после смены разрешения или раскладки мониторов запишите заново. Смена *масштаба DPI* обрабатывается, потому что процесс объявлен Per-Monitor v2. Скрипт на поиске картинок переживает куда больше, чем макрос на фиксированных координатах.
 
-**Can I stop the auto-shutdown?**
-Yes. It uses a system countdown (60 s by default, configurable) with a visible warning. Run `shutdown /a` in a terminal to abort it.
+**Можно отменить автовыключение?**
+Да. Используется системный отсчёт (по умолчанию 60 с, настраивается) с видимым предупреждением. Команда `shutdown /a` в терминале его отменяет.
 
-**Does playback record itself into an infinite loop?**
-No. Injected events carry the `LLKHF_INJECTED` / `LLMHF_INJECTED` flag and are discarded by the hooks — as are your own hotkeys.
+**Не запишет ли воспроизведение само себя в бесконечный цикл?**
+Нет. Инжектированные события несут флаг `LLKHF_INJECTED` / `LLMHF_INJECTED` и отбрасываются хуками — как и ваши горячие клавиши.
 
-**Does it work in fullscreen games?**
-Borderless/windowed-fullscreen works best. Exclusive fullscreen and raw-input games can be inconsistent, as with any `SendInput`-based tool. Screen capture (for image search and OCR) is also more reliable in borderless mode.
+**Работает ли в полноэкранных играх?**
+Лучше всего — в оконном без рамки. Эксклюзивный полный экран и игры на raw input могут вести себя непредсказуемо, как и с любым инструментом на `SendInput`. Снимок экрана (для поиска картинок и OCR) в безрамочном режиме тоже надёжнее.
 
-**Should I use `.json` or `.mrz`?**
-`.json` while you're iterating — you can read and edit it. `.mrz` for long recordings you just want to keep: same data, roughly 20–40× smaller.
+**`.json` или `.mrz`?**
+`.json` — пока экспериментируете: его можно прочитать и поправить. `.mrz` — для длинных записей, которые надо просто хранить: те же данные, примерно в 20–40 раз меньше.
 
-**Which language does OCR read?**
-Whatever language packs Windows has installed. Add one in *Settings → Time & language* and restart the app.
-
----
-
-## 🤝 Contributing
-
-Issues and PRs are welcome. If you're reporting a playback bug, please attach the macro file (or a trimmed version of it), the relevant part of `logs/macro-recorder.log.*`, and your Windows version, display scaling and monitor layout. For a script bug, the `Note` step writes straight into the log — sprinkle a few in and attach the result.
+**На каком языке читает OCR?**
+На тех, чьи языковые пакеты установлены в Windows. Добавьте нужный в *Параметры → Время и язык* и перезапустите приложение.
 
 ---
 
-# 🛡️ Security & VirusTotal Verification
+## 🤝 Участие в проекте
+
+Issues и PR приветствуются. Если сообщаете о баге воспроизведения, приложите файл макроса (или его обрезанную версию), нужный кусок `logs/macro-recorder.log.*`, а также версию Windows, масштабирование и раскладку мониторов. Для бага в скрипте: шаг `Заметка` пишет прямо в лог — расставьте несколько и приложите результат.
+
+---
+
+# 🛡️ Безопасность и проверка VirusTotal
 
 <p align="center">
   <a href="https://www.virustotal.com/gui/file/21cab5702a58699c1b2f14ac4dec322ea591cfed52cde2bb9e361e22496413a7/">
@@ -935,7 +913,7 @@ Issues and PRs are welcome. If you're reporting a playback bug, please attach th
   <a href="https://www.virustotal.com/gui/file/f345b6cf338ec6cf070a60e1cc594ae08fb41510f472e29c931553888e9c29a4/">
     <img src="https://img.shields.io/badge/VirusTotal-3%2F71%20Safe-brightgreen?style=for-the-badge&logo=virustotal&logoColor=white&color=2e7d32" alt="VirusTotal Build 2">
   </a>
-  <a href="#-why-do-false-positives-occur">
+  <a href="#-почему-возникают-ложные-срабатывания-false-positives">
     <img src="https://img.shields.io/badge/Status-False%20Positives%20Verified-blue?style=for-the-badge&logo=shield&logoColor=white" alt="False Positives Verified">
   </a>
 </p>
@@ -943,60 +921,61 @@ Issues and PRs are welcome. If you're reporting a playback bug, please attach th
 ---
 
 > [!NOTE]
-> **Safety Notice:** All release binaries automatically undergo VirusTotal verification prior to every release. Out of **71 antivirus vendors**, 69 confirm the files are completely clean. The 2/71 detections are **100% False Positives**, caused by heuristic analysis of low-level Win32 input APIs and the lack of a paid code-signing certificate.
+> **Уведомление о безопасности:** все релизные бинарники автоматически проходят проверку VirusTotal перед каждым релизом. Из **71 антивирусного движка** 69 подтверждают, что файлы полностью чистые. Детекты 2/71 — **на 100 % ложные срабатывания**, вызванные эвристическим анализом низкоуровневых Win32 API ввода и отсутствием платного сертификата подписи кода.
 
 ---
 
-## 📊 VirusTotal Scan Results
+## 📊 Результаты сканирования VirusTotal
 
-| File / Build | SHA-256 Hash | VT Detection | VirusTotal Report |
+| Файл / сборка | SHA-256 | Детект VT | Отчёт VirusTotal |
 | :--- | :--- | :---: | :---: |
 | **MacroRecorder.exe** | `60b39eff30746a6f7e00fc6ec8f91bbdc377b4e38d319001e7292b156b02a818` | <mark>**2 / 71**</mark> | [🔍 View Report](https://www.virustotal.com/gui/file/60b39eff30746a6f7e00fc6ec8f91bbdc377b4e38d319001e7292b156b02a818?nocache=1) |
 | **MacroRecorder.v3.exe** | `ce43ff5b81bab37f5b95fb6c9433eefbf33d357696bef1cf7933883789a8e48c` | <mark>**3 / 71**</mark> | [🔍 View Report](https://www.virustotal.com/gui/file/ce43ff5b81bab37f5b95fb6c9433eefbf33d357696bef1cf7933883789a8e48c?nocache=1) |
 
----
-
-## ❓ Why Do False Positives Occur?
-
-System-level input automation and simulation utilities frequently trigger heuristic warnings from lesser-known antivirus engines due to the following reasons:
-
-1. **Low-Level Win32 APIs (`SendInput`, `SetWindowsHookEx`)**
-   * Standard Windows API functions are used to intercept hotkeys and execute macros or emulate mouse and keyboard actions. Some heuristic scanners mistakenly flag global input hooks as potential keyloggers or autoclickers.
-2. **Lack of a Commercial Digital Certificate (Code Signing)**
-   * Signing `.exe` files with EV code-signing certificates is expensive. Unsigned binaries from open-source projects receive lower reputation scores from Windows SmartScreen and AI-driven antivirus engines.
-3. **Rust Compiler Optimizations**
-   * Compiling with target optimization flags (such as LTO and `x86-64-v3` instruction sets) produces machine code patterns that automated scanners sometimes misinterpret as generic unknown threats (`Heur.BKG`, `Trojan.Generic`).
 
 ---
 
-## 🔒 Transparency & Verification
+## ❓ Почему возникают ложные срабатывания (False Positives)?
 
-This project is fully **Open Source**, giving you full control over what runs on your system:
+Утилиты системной автоматизации и эмуляции ввода регулярно вызывают эвристические предупреждения у менее известных антивирусов по следующим причинам:
+
+1. **Низкоуровневые Win32 API (`SendInput`, `SetWindowsHookEx`)**
+   * Это стандартные функции Windows, используемые для перехвата горячих клавиш и эмуляции мыши и клавиатуры. Часть эвристических сканеров ошибочно считает глобальные хуки ввода потенциальными кейлоггерами или автокликерами.
+2. **Отсутствие коммерческого сертификата подписи кода**
+   * Подпись `.exe` EV-сертификатом стоит дорого. Неподписанные бинарники опенсорсных проектов получают низкий рейтинг репутации у Windows SmartScreen и антивирусов с ИИ-эвристикой.
+3. **Оптимизации компилятора Rust**
+   * Сборка с флагами оптимизации (LTO, набор инструкций `x86-64-v3`) даёт машинный код, который автоматические сканеры иногда принимают за обобщённую неизвестную угрозу (`Heur.BKG`, `Trojan.Generic`).
+
+---
+
+## 🔒 Прозрачность и самостоятельная проверка
+
+Проект полностью **открыт**, поэтому вы контролируете, что именно запускается на вашей системе:
 
 <details>
-<summary><b>🛠️ SHA-256 Checksum Verification</b></summary>
+<summary><b>🛠️ Проверка контрольной суммы SHA-256</b></summary>
 
 <br>
 
-To verify that your downloaded `.exe` file matches the audited VirusTotal build, run the following command in PowerShell:
+Чтобы убедиться, что скачанный `.exe` совпадает с проверенной на VirusTotal сборкой, выполните в PowerShell:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\your_file_name.exe
+Get-FileHash -Algorithm SHA256 .\ваш_файл.exe
 ```
 
 </details>
 
 ---
 
-## 📄 License & credits
+## 📄 Лицензия и благодарности
 
-MIT — see [LICENSE](LICENSE).
+MIT — см. [LICENSE](LICENSE).
 
-Built with [egui / eframe](https://github.com/emilk/egui), [windows-rs](https://github.com/microsoft/windows-rs),
+Собрано на [egui / eframe](https://github.com/emilk/egui), [windows-rs](https://github.com/microsoft/windows-rs),
 [serde](https://serde.rs), [crossbeam](https://github.com/crossbeam-rs/crossbeam),
 [parking_lot](https://github.com/Amanieu/parking_lot), [spin_sleep](https://github.com/alexheretic/spin-sleep),
-[image](https://github.com/image-rs/image), [rfd](https://github.com/PolyMeilex/rfd) and
+[image](https://github.com/image-rs/image), [rfd](https://github.com/PolyMeilex/rfd) и
 [tracing](https://github.com/tokio-rs/tracing).
 
-Inspired by **TinyTask** — thanks for a decade of quietly saving people's hands.
+Вдохновлено **TinyTask** — спасибо за десять лет тихо сбережённых рук.
 
