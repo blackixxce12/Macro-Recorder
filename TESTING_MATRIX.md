@@ -17,11 +17,17 @@ behaves; when it does not, record **the row ID, what you saw, and the matching l
 from `logs/macro-recorder.log.*`**. A row ID is enough for me to find the code.
 
 Rows marked 🔥 are new in 1.1.0–1.3.0 or were deliberately excluded from the automated
-stages. **If you only have an hour, do those.** They are collected in
+stages. Rows marked 🆕 are new in **1.4.0** and have never been touched by a human at
+all. **If you only have an hour, do the 🆕 ones.** They are collected in
 [Short pass](#short-pass) at the end.
 
 Rows marked ⚠️ can change system state (shut down, log off, run as administrator).
 Read them before running them.
+
+Sections **P**, **Q** and **R** are entirely new. P is the text expander, which arrived
+in 1.3.5 and was missed when this document was written — it is the one component that
+sees every key you press, so it earns its rows. Q and R are 1.4.0's two additions that
+cannot be tested any other way.
 
 ---
 
@@ -172,11 +178,42 @@ Build one script that uses each kind at least once, or several small ones.
 | ID | Condition | Expect |
 |---|---|---|
 | G-26 | always | Always true |
-| G-27 | variable, all six comparisons | Correct each way |
+| G-27 | 🆕 variable, all **seven** comparisons including `has` | Correct each way; `has` is containment, forgiving about case and spacing |
 | G-28 | image | Found / not found; sets `match_score` |
 | G-29 | pixel | Matches a colour within tolerance |
 | G-30 | window | Matches a partial title |
 | G-31 | text | Loose match: case, spacing and punctuation ignored |
+
+### Steps new in 1.4.0 🆕
+
+Six new kinds and two new conditions. None of these has ever run outside the test
+suite.
+
+| ID | Do | Expect |
+|---|---|---|
+| G-32 | **Find image** → `target`, picture present | `target.found` is 1; `target.x/.y` are the centre; `target.w/.h` the size |
+| G-33 | The same with the picture absent | `target.found` is 0, and `target.score` still carries the best score it saw |
+| G-34 | **Read text** → `line` over a label | The whole reading lands in the variable as text, not a number |
+| G-35 | **Get text** ← clipboard, after copying something | Variable holds what you copied |
+| G-36 | **Get text** ← title of the window in front | Matches the real title |
+| G-37 | **Get text** ← program in front | Reads like `notepad.exe` — the name only, no path |
+| G-38 | **Get text** ← file, pointing at a text file | Contents land in the variable |
+| G-39 | The same pointing at a file that is not there | Empty variable, warning in the log, script continues |
+| G-40 | **Put text** → clipboard, then paste it somewhere | Exactly what the step said |
+| G-41 | **Put text** → file, *add to the end* off, run twice | File holds one copy, not two |
+| G-42 | The same with *add to the end* on | Two copies |
+| G-43 | `{name}` inside a **Note**, a **Run** argument and a **Put text** | Replaced by the variable's value |
+| G-44 | `{{` in the same places | Comes out as one literal brace |
+| G-45 | `{typo}` — a name nothing ever set | Left as written; **not** silently dropped |
+| G-46 | **Set** a *text* value, then `+=` another text | Joined end to end |
+| G-47 | **Set** `count` = text `"3"`, then `+= 1` | **4**, not `"31"` — two numbers written as text are still numbers |
+| G-48 | Compare a variable holding `"10"` against the number `10` | Equal |
+| G-49 | Compare a variable holding `"Roblox"` against text `"roblox"` | Equal — text comparison ignores case and surrounding space |
+| G-50 | Condition **process running**, part of a name (`roblox`) | True while it runs, false after it closes |
+| G-51 | The same for a program that is not running | False, promptly — no long wait |
+| G-52 | Condition **element on screen** against Notepad or File Explorer | True |
+| G-53 | Save and reload a macro using every step above | All fields survive intact |
+| G-54 | 🆕 Load a macro written by **1.3.5** | Loads unchanged: area is the whole screen, prep is none, format is anything, numbers in `vars` are still numbers |
 
 ---
 
@@ -197,6 +234,51 @@ Build one script that uses each kind at least once, or several small ones.
 | H-11 | Threshold 0.60 | Matches something wrong — confirms it is doing work |
 | H-12 | **Try other scales** with a resized window | Finds it; noticeably slower |
 
+### Where to look — new in 1.4.0 🆕
+
+| ID | Do | Expect |
+|---|---|---|
+| H-13 | Area **whole screen** on a `While` loop, watch the log timing | The baseline: roughly ten looks a second on a 1440p desktop |
+| H-14 | The same with area **a rectangle** around the button | Visibly faster; compare against `--selftest vision`, which prints both |
+| H-15 | Area **active window** | Finds it while the window is in front |
+| H-16 | The same with a different window in front | Does not find it — confirms the area is real |
+| H-17 | Area **near the last match**, picture that stays put | Found each time; the log shows a small capture |
+| H-18 | The same after moving the window | Still found — it widens to the whole screen when the guess fails |
+| H-19 | Area **relative to another picture**, anchor present | Target found in the offset rectangle |
+| H-20 | The same with the anchor hidden or removed | Reported as not found. It must **not** quietly search the whole screen |
+| H-21 | An anchored search where the anchor is found but the target is not | `match_x/y` belong to the target, not the anchor |
+| H-22 | Two identical buttons, anchored to different headings | The right one is pressed each time |
+
+### Staying found — new in 1.4.0 🆕
+
+| ID | Do | Expect |
+|---|---|---|
+| H-23 | A picture whose score hovers near the threshold, **lost below** at 0 | Flaps: several state changes a second |
+| H-24 | The same with **lost below** set well under the threshold | Settles: one state change |
+| H-25 | **stable 2 / 3** on a picture that flickers | Ignores the flicker |
+| H-26 | The same on a picture that really appears | Reacts after two or three looks, not instantly |
+| H-27 | Two steps watching the same template with different settings | They agree about whether it is there — the state is per template |
+
+### One object, several pictures — new in 1.4.0 🆕
+
+| ID | Do | Expect |
+|---|---|---|
+| H-28 | Make `templates/Claim/` with `normal.png`, `hover.png`, `dark.png`; step names `Claim` | Matches in all three states |
+| H-29 | Drop a `.txt` into that folder | Ignored, not treated as a picture |
+| H-30 | An empty folder of that name | Step does nothing; log says the folder holds no PNGs |
+| H-31 | Check `target.w/.h` when a differently sized variant wins | Reports the winning variant's size, not the first one's |
+
+### Scale and theme — new in 1.4.0 🆕
+
+| ID | Do | Expect |
+|---|---|---|
+| H-32 | **💾 Save PNG…** a template | `Name.png.json` appears beside it holding the display scale |
+| H-33 | Cut a template at 100 %, switch Windows to 150 %, run the step | Still found — the sidecar rescales it |
+| H-34 | A template made before 1.4.0, with no sidecar | Used exactly as it is; nothing is guessed |
+| H-35 | Delete the sidecar by hand and rerun | Same as H-34, no error |
+| H-36 | Tick **outlines** on a template that stopped matching after a theme change | Found again |
+| H-37 | **outlines** on an ordinary template | Still found, at the same place, with a slightly lower score — expected |
+
 ---
 
 ## I. Text on screen
@@ -210,6 +292,31 @@ Build one script that uses each kind at least once, or several small ones.
 | I-5 | A region under 40×40 | Fails gracefully; variable keeps its old value |
 | I-6 | A non-English game with the language pack installed | Reads it |
 | I-7 | A stylised game font | Note what it does — expected to be poor |
+
+### Preparing the pixels — new in 1.4.0 🆕
+
+Use the **🔤 Text on screen** panel for all of these: it shows the reading and the fit
+score side by side, which is the whole point of the feature.
+
+| ID | Do | Expect |
+|---|---|---|
+| I-8 | Read the same region under each of the five profiles | Different readings; the fit score moves with them |
+| I-9 | **game HUD** on pale text over moving artwork | Reads better than **none** — this is the case it exists for |
+| I-10 | **digits** on a counter | Reads better than **none** on that, worse on a sentence |
+| I-11 | **try each** on the same region | Picks a profile at least as good as your best manual choice; the panel names which |
+| I-12 | **try each** on text that already reads perfectly | Stops early — no slower than **none** |
+| I-13 | Compare each profile's time in `--selftest vision` | A profile costing three times as much for the same text is not worth using |
+
+### Saying what a reading should look like — new in 1.4.0 🆕
+
+| ID | Do | Expect |
+|---|---|---|
+| I-14 | **Read number**, expect **clock**, region showing `02:34` | Variable is 154 |
+| I-15 | The same expecting **whole number** | Variable is 2 — the format decides the meaning |
+| I-16 | Expect **clock** over a region holding `1250` | **Refused**: the variable keeps its old value, and the log says it did not fit |
+| I-17 | Expect **pattern** `##:##` over `12:34`, then over `1:34` | Passes, then refused |
+| I-18 | Read a region with the engine erroring (under 40×40) | Variable keeps its old value, as before |
+| I-19 | Check `<name>.quality` after each of the above | Between 0 and 1, and lower for the readings you can see are wrong |
 
 ---
 
@@ -306,16 +413,121 @@ Build one script that uses each kind at least once, or several small ones.
 | O-6 | Fill `templates/` with 200 PNGs, open the dropdown | Still usable |
 | O-7 | A recording of 100 000+ events | Loads, edits, replays |
 | O-8 | Free disk space exhausted while saving | Reports the failure |
+| O-9 | 🆕 **Get text** ← file, pointing at a 500 MB file | Reads the first megabyte and says so; memory does not climb |
+| O-10 | 🆕 **Put text** → file in a folder that does not exist | Warning in the log, script continues |
+| O-11 | 🆕 An anchored search naming a template that does not exist | Not found, warning in the log, no full-screen fallback |
+| O-12 | 🆕 A pattern of nothing but `*` against a long reading | Answers immediately — must not hang |
+| O-13 | 🆕 **Press element** straight from the menu, nothing filled in | Does nothing and says so in the log. It must **not** click the middle of the window |
+
+---
+
+## P. Text expander 🆕
+
+Arrived in 1.3.5 and was missed when this document was written. It deserves the most
+careful reading here for one reason: **it is the only part of the program that watches
+every character you type.** Rows P-9 to P-12 are about that and nothing else.
+
+Entries live in `expansions.json`. The global switch is off until you turn it on.
+
+| ID | Do | Expect |
+|---|---|---|
+| P-1 | Turn the expander on, type `;sig` in Notepad | Replaced by the saved text |
+| P-2 | The same in **delimiter** mode: `addr` then a space | Fires on the space, and the space survives |
+| P-3 | **behind a marker** mode with `;` | Fires only when the marker is there |
+| P-4 | **immediately** mode | Fires the moment the abbreviation is complete |
+| P-5 | An entry using `{date}`, `{time}`, `{datetime}`, `{clipboard}` | All filled in |
+| P-6 | An entry ending `{cursor}` | Caret lands where the marker was, not at the end |
+| P-7 | `{key:Tab}` and `{random:a\|b\|c}` | A real Tab; a different pick across runs |
+| P-8 | The same entry set to **paste** rather than **type** | Text appears at once, and the clipboard is put back afterwards |
+| P-9 | Add your terminal and password manager to **Never in windows**, type an abbreviation there | Nothing fires |
+| P-10 | Type an abbreviation, then click elsewhere / press a modifier / change window, and finish typing it | Does **not** fire — the buffer is emptied on all three |
+| P-11 | Type several abbreviations, then `grep` every file under `logs/` for them | **Nothing found.** The typed buffer must never reach the log at any level |
+| P-12 | With an IME or a dead-key layout, type something that commits differently from the keystrokes | Refuses rather than guessing; nothing is mangled |
+| P-13 | Start recording a macro, type an abbreviation | Nothing fires, and nothing about it lands in the recording |
+| P-14 | 🆕 Play a macro, then type a **text** abbreviation | Silent — it would fight with the macro |
+| P-15 | 🆕 Play a macro, then type a `;stop` entry set to **stops everything** | **Playback stops.** This is the whole point of the split |
+| P-16 | 🆕 A `;farm` entry set to **plays a macro** with a file path in its text | That file is loaded and started |
+| P-17 | 🆕 The same with a path that does not exist | Warning in the log; nothing starts; the app stays up |
+| P-18 | 🆕 An entry set to **runs a program** | Opens it, exactly like the `Run` step |
+| P-19 | 🆕 A command entry while **recording** | Still silent — recording swallows the expander whole |
+| P-20 | Turn the global switch off, type everything above again | Nothing fires at all |
+
+---
+
+## Q. UI Automation 🆕
+
+Windows only tells you about applications that choose to expose themselves. Q-10 is not
+a bug report — it is the expected answer, and the reason the picture search still exists.
+
+| ID | Do | Expect |
+|---|---|---|
+| Q-1 | **Find element** by **Name**, Notepad or File Explorer in front | Found; `elem.x/.y/.w/.h` point at the real control |
+| Q-2 | The same with only part of the name | Found — exact first, then substring |
+| Q-3 | Narrow by **Kind** = `Button` | Still found, and noticeably faster |
+| Q-4 | A name that matches nothing | `elem.found` is 0, variable empty, no crash |
+| Q-5 | **Id** filled in from an application that sets one | Found, and it is the most reliable of the three |
+| Q-6 | *in the window in front* ticked, then unticked | Both find it; the whole desktop takes longer |
+| Q-7 | **Press element** with *ask the app* on | The control is pressed and **the cursor does not move** |
+| Q-8 | The same with the window **behind** another one | Still pressed |
+| Q-9 | *ask the app* off | A real click at the control's centre |
+| Q-10 | Either of those on a control with nothing to invoke | Falls back to a real click rather than doing nothing |
+| Q-11 | **timeout** 3000 ms against a dialog that takes a second to draw | Waits for it, then presses |
+| Q-12 | timeout 0 against the same | Misses it — confirms the wait is real |
+| Q-13 | An element scrolled out of view | Counts as not found. It must **not** report a centre of (0, 0) |
+| Q-14 | ⚠️ A window running as administrator, app not elevated | Limited or silent — expected, note what happens |
+| Q-15 | **In Roblox, or any Unity / DirectX game** | **Finds nothing.** Expected: the game draws its own interface |
+| Q-16 | Time Q-1 and Q-3 against `--selftest vision` | If they are slower than the picture search, the cascade is in the wrong order |
+
+---
+
+## R. Debug overlay 🆕
+
+A layered window, not an eframe viewport. Under **🔎 Image search → Show what the script
+looks at**. R-2 is the one that would be unforgivable to get wrong.
+
+| ID | Do | Expect |
+|---|---|---|
+| R-1 | Tick the box | A window appears over everything — and you cannot see it, because nothing has been searched for yet |
+| R-2 | With it on, click your desktop, another app, its own main window | **Every click goes through.** Nothing is blocked anywhere on screen |
+| R-3 | Run a script with an image step | Blue rectangle where it looked; green or red rectangle with a score where it found something |
+| R-4 | A step whose score is under 0.85 | Rectangle is red; the number under it says why |
+| R-5 | A **Read text** step | Amber rectangle over the region it read |
+| R-6 | A **Find element** step | Violet rectangle around the control |
+| R-7 | Watch it while a `While` loop polls | Redraws when the answer changes, and stays still when it does not — no flicker |
+| R-8 | Untick the box | Gone at once, nothing left drawn on the desktop |
+| R-9 | Untick and retick it quickly, several times | Comes back every time. It must not end up ticked with no window |
+| R-10 | Close the application with it on | The window goes with it — check nothing is left over the desktop |
+| R-11 | A second monitor, especially at a different scale | Rectangles land in the right places on both |
+| R-12 | A game in **exclusive full screen** | Covered by the game — expected; borderless windowed shows it |
+| R-13 | Alt-Tab while it is on | It never appears in the switcher and never takes focus |
 
 ---
 
 ## Short pass
 
 If time is short, these are the rows that cover code that is either brand new or has
-never had real input behind it:
+never had real input behind it. **1.4.0 first**, because none of it has been touched by
+a human:
+
+**G-32, G-47, G-54** · **H-14, H-20, H-24, H-28, H-33** · **I-9, I-11, I-16** ·
+**P-11, P-15** · **Q-7, Q-15** · **R-2, R-8**
+
+Seventeen rows, roughly an hour. Three of them matter more than the rest:
+
+- **P-11** — grep the logs for what you typed. If anything comes back, stop and tell me
+  before doing anything else.
+- **R-2** — a full-screen window that swallows clicks would be the worst bug this
+  release could ship.
+- **G-54** — a 1.3.5 macro that no longer loads, or loads and behaves differently,
+  breaks every user who upgrades.
+
+### Still outstanding from earlier releases
+
+Never done, and not superseded by anything above:
 
 **A-1, A-6** · **B-10** · **C-1, C-2, C-7, C-9** · **all of D** · **E-1, E-10** ·
 **F-15** · **G-6, G-18** · **H-4, H-5, H-8** · **K-2** · **L-2**
 
-Twenty-three rows, roughly an hour. Section D matters most: the frame guard is the
-largest thing added since 1.0.0 and not one of its keystrokes has yet reached Windows.
+Section D still matters most of these: the frame guard is the largest thing added since
+1.0.0, and not one of its keystrokes has yet reached Windows.
+
