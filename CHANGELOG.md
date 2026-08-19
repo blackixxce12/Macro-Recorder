@@ -7,6 +7,132 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [1.4.0] — unreleased
+
+The release about looking at the screen. Four ways to find something, in the order
+they should be tried, and a way to see which one is failing.
+
+### Added
+
+- **The expander is a command line.** An entry can now do something instead of typing
+  something: play a macro (naming a file makes the abbreviation a launcher), stop
+  everything, or run a program. `;farm` starts the night's macro and `;stop` ends it,
+  in any window, without a hotkey.
+- **Where to look.** Every image step and image condition takes a search area: the
+  whole screen, the window in front, a fixed rectangle, near where the same picture
+  was last seen, or **relative to another picture**. The last of those is the one a
+  threshold cannot do — a row of identical buttons is identical, and which one to
+  press is decided by the heading above it.
+
+  This is the one that pays. Measured on a 2560×1440 desktop with `--selftest
+  vision`, one script step looking for a 64×64 template:
+
+  | Area | Capture | Search | Total | Looks per second |
+  |---|---|---|---|---|
+  | 2560×1440 | 43.8 ms | 33.8 ms | 77.7 ms | 12.9 |
+  | 1280×720 | 16.8 ms | 9.8 ms | 26.7 ms | 37.5 |
+  | 400×300 | 6.2 ms | 1.6 ms | 7.8 ms | 128.4 |
+
+  Ten times the poll rate, from one field.
+- **Two thresholds instead of one.** A score wobbling around a single threshold —
+  0.79, 0.81, 0.79, 0.82 — reads as four state changes and a script that acts on
+  each. A second, lower threshold to *lose* a picture turns that into one. Optionally
+  with "found in N of the last M looks" on top.
+- **One object, several pictures.** A folder under `templates/` is a set: a button's
+  resting state, its hovered state and its dark-theme self are one step, not three.
+- **Templates remember what they were cut at.** A picture snipped on a 150 % display
+  is half again the size of the same button on a 100 % one, and no threshold bridges
+  that. Saving a template now writes a small `Name.png.json` beside it, and loading
+  one rescales it for the display it is about to be looked for on. Templates made
+  before this release have no sidecar and are left exactly alone.
+- **Find image** — a step that looks and reports without clicking, writing
+  `target.found`, `.x`, `.y`, `.w`, `.h`, `.score` under a name you choose.
+- **Outline matching.** Correlating gradients instead of grey levels, which survives
+  a theme change and a highlighted row. One checkbox, and the thing to reach for when
+  a template that used to work stops. About 1.6× the cost of an ordinary search over
+  the whole screen, and much less than that over an area.
+- **Preparing the pixels before reading them.** Windows OCR was built for documents:
+  dark text, light paper, generous size, and it has no knobs. Screen text is none of
+  those. Five profiles — none, interface, small text, game HUD, digits — do the grey,
+  the contrast stretch, Otsu's threshold and the inversion that a light HUD over
+  moving artwork needs. A sixth, *try each*, walks them and keeps the best reading.
+- **Saying what a reading should look like.** A whole number, a decimal, a clock, or
+  a small pattern (`#` a digit, `@` a letter, `?` one character, `*` any run). A
+  reading that does not fit is refused and the variable is left alone, rather than
+  quietly becoming a zero. This is also what *try each* judges profiles by.
+- **A fit score.** Not the engine's confidence — that number is on a scale nobody can
+  interpret and is not comparable between engines. This one is computed from the text:
+  half whether the format parses, half how much of the reading belongs to the alphabet
+  that format implies. Shown in the panel so a profile can be chosen by comparing
+  numbers.
+- **Variables can hold text.** What the recognition read, what the window is called,
+  what is on the clipboard — none of these could be kept before. `{name}` in any step's
+  text is replaced by what that variable holds. Comparisons stay numeric when both
+  sides read as numbers, so a count read off the screen still compares against 10;
+  otherwise they compare as text, and a new `has` asks about containment.
+- **Read text**, **Get text** and **Put text** — recognition into a variable, and the
+  clipboard, the title of the window in front, the program in front, or a file, in
+  either direction.
+- **Process running** as a condition, matched on part of the name.
+- **UI Automation.** Asking Windows what is on screen instead of looking at it: an
+  element found by its name is found at any resolution, under any theme, with no
+  threshold to tune. Measured at 9 to 35 ms against the window in front, depending
+  on how much that window exposes — faster than any picture search here, which is
+  what puts it at the front of the cascade. Matching a name as a *substring* rather
+  than exactly costs several times that, which is why naming a control type matters. New steps *Find element* and *Press element* and a new condition
+  *Element on screen*. *Press element* asks the application to press it, so nothing
+  moves on screen and the window need not even be in front; it falls back to a real
+  click when the control offers nothing to press.
+- **A window that shows what the script is looking at.** See-through, over everything,
+  and impossible to click. It draws the search area, the match with its score, the
+  rectangle text was read from, and the element that was found. A failed search tells
+  you a number; a number cannot say whether it looked in the wrong place, at the wrong
+  size, or at the right thing under a tooltip. A rectangle can.
+
+### Changed
+
+- **The correlation was doing twice the work.** For every position the window could
+  land in, it worked out the template's own sum and variance again — a second full
+  pass over the template for every pixel of the screen, and the answer was the same
+  every time. The template is now prepared once, and the correlation takes one pass
+  instead of two.
+- **The inner loop uses the vector unit** where the processor has one: AVX2 and FMA,
+  detected at runtime, so the plain x86-64 build gets it too. Worth 1.1× to 1.6×
+  depending on template size — less than the one-pass change above, and the reason
+  the two are listed separately. `--selftest vision` prints both numbers and checks
+  that they agree about where the picture is.
+
+  The accumulators are kept across the whole window rather than folded down at the
+  end of each row. Per row it was three horizontal sums for every eight floats, and
+  on the coarse pass — where a 32-pixel template shrinks to eight wide — that cost
+  more than the multiply-adds it replaced: measured at 0.93×, a real regression,
+  before it was moved.
+- **The search is spread across cores.** Horizontal stripes, merged in row order with
+  a strict comparison, so a tie resolves exactly where the single-threaded sweep would
+  have put it.
+- Brightness is now carried as 0…1 rather than 0…255. The correlation is invariant to
+  both, but the one-pass form subtracts a sum of squares from a square of sums, and at
+  255 that subtraction throws away most of an f32's precision on a large template.
+- The clipboard helpers moved out of the expander into the platform layer, where the
+  script steps can reach them too.
+
+### Notes
+
+- **UI Automation only sees what an application chooses to expose.** Unity, DirectX,
+  OpenGL and canvas-drawn interfaces expose nothing at all, and across a privilege
+  boundary it is limited or silent. In Roblox — the game this program was written for
+  — it will find nothing. It is a feature for automating ordinary programs, and the
+  right arrangement is a cascade: element, then picture, then text, then coordinates.
+- Every macro written up to 1.3.5 loads unchanged. The search area defaults to the
+  whole screen, the preparation profile to none, the expected format to anything, a
+  bare number in `vars` is still a number, and a template with no sidecar is not
+  rescaled.
+- *Try each* costs one recognition per rung it climbs, and stops at the first perfect
+  fit. It belongs in a step that runs occasionally, not in a tight polling loop.
+- The overlay is a diagnostic and is off by default.
+
+---
+
 ## [1.3.5] — pre-release
 
 The text expander, and the desktop fix that 1.3.0 went out without.
@@ -14,23 +140,14 @@ The text expander, and the desktop fix that 1.3.0 went out without.
 ### Added
 
 - **Text expander.** Type a short abbreviation and it becomes the longer text saved for
-  it, in any application. Three trigger modes — after a delimiter, behind a prefix
-  marker, or the moment the abbreviation appears — set globally and overridable on every
-  entry. Replacements carry `{date}` and `{time}` with optional patterns, `{datetime}`,
-  `{clipboard}`, `{cursor}`, `{key:Tab}` and `{random:a|b|c}`, with a backslash to
-  escape a literal placeholder. Multi-line text is supported, and each entry chooses
-  whether it is typed a character at a time or pasted through the clipboard. There is a
-  full guide in **[EXPANDER.md](EXPANDER.md)** ([по-русски](EXPANDER_RU.md)).
-- **An editor for the list** in the ⌨ section: add, remove and enable entries, and set
-  each one's trigger, marker and insert mode. Entries are stored in `expansions.json`,
-  which can still be edited by hand and reloaded.
-- Per-entry enable, a master switch that is **off until asked for**, a configurable
-  delimiter set, and a list of window titles where the expander stays quiet — a password
-  manager and a terminal belong there.
-- Two log lines that exist for one reason: `hotkey N delivered` on every `WM_HOTKEY`,
-  and the full slot list with failure bits whenever hotkeys are rebuilt. A hotkey that
-  quietly stops working leaves no trace otherwise, and whether Windows delivered the
-  message at all is the one fact that decides where to look next.
+  it. Three trigger modes — after a delimiter, behind a prefix marker, or the moment the
+  abbreviation appears — set globally and overridable per entry. Replacements carry
+  `{date}` and `{time}` with optional patterns, `{datetime}`, `{clipboard}`, `{cursor}`,
+  `{key:Tab}` and `{random:a|b|c}`, with a backslash to escape a literal placeholder.
+  Multi-line text is supported, and each entry chooses whether it is typed a character
+  at a time or pasted through the clipboard. Entries live in `expansions.json`.
+- Per-entry enable, a global switch that is **off until asked for**, and a list of window
+  titles where the expander stays quiet — a password manager and a terminal belong there.
 
 ### Fixed
 
@@ -43,15 +160,6 @@ The text expander, and the desktop fix that 1.3.0 went out without.
   switcher classes are matched; the Start menu shares a class with ordinary packaged
   apps, and a macro that silently refused to run against one of those would be a worse
   bug than the one being fixed.
-- Keystrokes sent by the expander carry a scan code and, where it applies, the extended
-  flag. Virtual key alone is not enough — this project already learned that once, which
-  is why the replay path has always sent scan codes.
-- Changing keyboard layout no longer counts as the end of a word. The rule was "a
-  modifier is held, so this is a command", but Alt+Shift is how half the world switches
-  layout: a Cyrillic word followed by an English one had the buffer cleared in between,
-  and the second word looked like the start of a line. A modifier pressed by itself, and
-  any Win combination, now leave the word alone; Ctrl and Alt with an ordinary key still
-  end it, because those really do edit and move the caret.
 
 ### Notes
 
@@ -64,12 +172,9 @@ The text expander, and the desktop fix that 1.3.0 went out without.
   the buffer is emptied and nothing fires.
 - The buffer of recently typed characters is capped at 64, never written to the log at
   any level, never written to disk, and emptied whenever the foreground window changes,
-  a mouse button is pressed, or a modifier combination is used. Worth stating plainly:
-  this is a privacy surface, and a tool that already draws antivirus heuristics should
-  be explicit about what it keeps.
-- Independently implemented. CrossMacro was the reference for *what* a text expander
-  does, from its README and its interface — not for how one is written. Its code is
-  GPL-3.0 and this project is MIT.
+  a mouse button is pressed, or a modifier is held. Worth stating plainly: this is a
+  privacy surface, and a tool that already draws antivirus heuristics should be explicit
+  about what it keeps.
 
 ---
 
