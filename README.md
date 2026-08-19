@@ -23,30 +23,14 @@
 
 ---
 
-> [!IMPORTANT]
-> **This page describes version 1.0.0**, and the project has moved on since. Everything
-> added, changed and fixed after it — the frame-rate guard, the window section, the text
-> expander, a crash in the editor and a template search that was seven times slower than
-> it needed to be — is recorded in **[CHANGELOG.md](CHANGELOG.md)**
-> ([по-русски](CHANGELOG_RU.md)). Read it before deciding what this program can do.
->
-> Two features are large enough to have their own guides, both written for someone who
-> has never done any of this before:
->
-> - **[SCRIPTS.md](SCRIPTS.md)** — making a macro wait, decide and repeat, instead of
->   replaying blindly.
-> - **[EXPANDER.md](EXPANDER.md)** — turning a short abbreviation into a long piece of
->   text as you type.
-
----
-
 ## 🆕 Highlights
 
 | | |
 |---|---|
-| 🧠 **Script engine** | 17 step kinds with `If` / `While` / `Break`, variables, and conditions that look at the screen. **[Full guide → SCRIPTS.md](SCRIPTS.md)** |
-| 🔎 **Image search** | Paste a snippet with `Win+Shift+S` and the macro can wait for it, or click it wherever it appears |
-| 🔤 **Text on screen (OCR)** | Uses the recognition already built into Windows — react to words, or read a number into a variable |
+| 🧠 **Script engine** | 23 step kinds with `If` / `While` / `Break`, variables that hold numbers **or text**, and eight conditions that look at the screen. **[Full guide → SCRIPTS.md](SCRIPTS.md)** |
+| 🔎 **Image search** | Paste a snippet with `Win+Shift+S` and the macro can wait for it, or click it wherever it appears — told **where** to look, so a step costs 8 ms instead of 78 |
+| 🪟 **UI Automation** | Ask Windows for a button by name: no threshold, no resolution, no theme. 9.5 ms, and silent in anything that draws its own interface |
+| 🔤 **Text on screen (OCR)** | Uses the recognition already built into Windows — five preparation profiles, an expected format, and a fit score |
 | 📅 **Scheduler** | Start the macro at a set time on chosen weekdays, even while minimised to the tray |
 | 🪟 **Target window** | Pause automatically whenever your game or app isn't the one in front |
 | 🖱 **Human-like movement** | Curved cursor paths with a random arc, plus an aim-spread in pixels |
@@ -54,6 +38,7 @@
 | ⚙ **Compile to a standalone .exe** | Export a self-running player — scripts included. No compiler involved |
 | ⚓ **Window anchoring** | Follows the target window if it moved *or was resized* |
 | ⌨ **Live speed control** | Hotkeys for faster / slower / skip-this-step, usable mid-run |
+| 👁 **See what it looks at** | A see-through window over everything, drawing the search area, the match and its score |
 
 <details>
 <summary>Under the hood</summary>
@@ -77,6 +62,7 @@ rotating log file · virtual-desktop isolation · per-monitor DPI awareness.
 - [Hotkeys](#️-hotkeys)
 - [Scripts](#-scripts)
 - [Image search](#-image-search)
+- [UI Automation](#-ui-automation)
 - [Text on screen (OCR)](#-text-on-screen-ocr)
 - [Editor](#-editor)
 - [Schedule & target window](#-schedule--target-window)
@@ -187,7 +173,7 @@ That weekend project got slightly out of hand. 🦀
 | **Tray icon / minimize to tray** | ❌ | ✅ with a record / play / stop menu |
 | **Window anchoring** | ❌ | ✅ follows the target window if it moved **or resized** |
 | **Stop on a screen pixel** | ❌ | ✅ colour + tolerance, with a picker |
-| **Scripting / conditional logic** | ❌ | ✅ **17 step kinds, `If`/`While`/`Break`, variables** — [SCRIPTS.md](SCRIPTS.md) |
+| **Scripting / conditional logic** | ❌ | ✅ **23 step kinds, `If`/`While`/`Break`, variables holding numbers or text** — [SCRIPTS.md](SCRIPTS.md) |
 | **Image recognition** | ❌ | ✅ masked normalised cross-correlation, optional multi-scale |
 | **Text recognition (OCR)** | ❌ | ✅ via `Windows.Media.Ocr` — no models to download |
 | **Scheduler (start at a time)** | ❌ | ✅ time + weekdays, runs from the tray |
@@ -246,9 +232,12 @@ Facts above were taken from the official TinyTask site rather than SEO mirrors (
 **Decide, don't just replay**
 
 - 🧠 A **[script](SCRIPTS.md)** can wait for things, branch, loop and count — while still replaying slices of your recording
-- 🔎 **Image search**: find a button anywhere on screen and click it, even if the layout shifted
-- 🔤 **OCR**: react to a word on screen, or read a number (gems, timer, HP) into a variable
+- 🪟 **UI Automation**: ask Windows for a button by name and let the application press it — no threshold, no coordinates
+- 🔎 **Image search**: find a button anywhere on screen and click it, even if the layout shifted — told *where* to look, with two thresholds, variant folders and outline matching
+- 🔤 **OCR**: react to a word on screen, or read a number (gems, timer, HP) into a variable, with five preparation profiles and a format check
 - 🎯 **Pixel condition**: watch one pixel and stop — or shut the PC down — when it changes
+- 📝 Variables hold **numbers or text**, so what was read, what the window is called and what is on the clipboard can all be kept and compared
+- 👁 A **see-through overlay** shows where the last search looked and what it found
 
 **Automation & safety**
 
@@ -408,9 +397,9 @@ A recording replays what you did. A **script** decides *whether* and *how many t
 
 Steps live inside the macro file, so a scripted macro is still one `.json` you can save, share and export to `.exe`.
 
-**17 step kinds:** `Play events` · `Wait` · `Wait for` · `Click image` · `Click at` · `Key` · `Set` · `If` · `Else` · `End if` · `While` · `End while` · `Break` · `Run` · `Quit the app` · `Note` · `Read number`
+**23 step kinds:** `Play events` · `Wait` · `Wait for` · `Click image` · `Find image` · `Click at` · `Key` · `Set` · `If` · `Else` · `End if` · `While` · `End while` · `Break` · `Run` · `Quit the app` · `Note` · `Read number` · `Read text` · `Get text` · `Put text` · `Find element` · `Press element`
 
-**6 conditions:** `always` · `variable` · `image` · `pixel` · `window` · `text`
+**8 conditions:** `always` · `variable` · `image` · `pixel` · `window` · `text` · `process running` · `element on screen`
 
 > 📘 **The complete, click-by-click guide lives in [SCRIPTS.md](SCRIPTS.md)** — including every step kind, every condition, the built-in variables, three worked examples and a troubleshooting table. Start there; this section is only the summary.
 
@@ -433,11 +422,56 @@ Fully transparent pixels in a PNG are **excluded from the score**, so you can cu
 | Option | Effect |
 |---|---|
 | **Try other scales** | Also tests 0.8×, 0.9×, 1.1×, 1.25× — for when the window is a different size than when you snipped it |
-| **Search area only** | Restricts the sweep to one rectangle, which is much faster on a 4K screen |
+| **Search area only** | Restricts the sweep to one rectangle |
+| **Show what the script looks at** | Opens the see-through overlay described below |
 
-> ⚠️ **Both options apply to the test button only.** Inside a script, image steps always sweep the **whole virtual desktop at 1.0× scale**. If you need a scripted search to be fast, use a smaller template.
+> ⚠️ **Try other scales applies to the test button only** — a scripted search is always at 1.0×. The answer to a different display is the sidecar below, not a scale sweep.
 
 The search runs on a worker thread, so the window never freezes; a full-screen sweep takes a moment and shows a spinner.
+
+### Telling a script where to look
+
+Every image step and image condition carries its own **search area**: the whole screen, the window in front, a fixed rectangle, near where the same picture was last seen, or relative to another picture. It is the single most useful field in the release. Measured on a 2560×1440 desktop with `--selftest vision`, one step looking for a 64×64 template:
+
+| Area | Capture | Search | Total | Looks per second |
+|---|---|---|---|---|
+| 2560×1440 | 43.8 ms | 33.8 ms | 77.7 ms | 12.9 |
+| 1280×720 | 16.8 ms | 9.8 ms | 26.7 ms | 37.5 |
+| 400×300 | 6.2 ms | 1.6 ms | 7.8 ms | 128.4 |
+
+**Relative to another picture** is the one no threshold can replace. A row of identical buttons is identical; which one to press is decided by the heading above it, and an anchor is how a script says so.
+
+### Living with a picture that moves, fades or changes theme
+
+| Feature | What it is for |
+|---|---|
+| **Two thresholds** | A score wobbling around one threshold reads as several state changes a second. A lower one to *lose* the picture turns that into one. |
+| **Stable N of M** | Tells an object (0.82, 0.84, 0.83) from a flicker (0.83, 0.51, 0.74). |
+| **A folder of variants** | `templates/Claim/` holding `normal.png`, `hover.png`, `dark.png` is one step, not three. |
+| **Outlines** | Correlates shapes instead of shades — survives a theme change and a highlighted row, at about 1.6× the cost. |
+| **A scale sidecar** | Saving a template writes `Name.png.json` with the display scale it was cut at, and loading rescales it for the display it will be looked for on. Templates made before 1.4.0 have no sidecar and are left alone. |
+
+### Seeing what it sees
+
+**Show what the script looks at** puts a see-through, click-through window over everything. While a script runs it draws the search area in blue, the match and its score in green or red, the rectangle text was read from in amber, and the interface element that was found in violet.
+
+A failed search gives you `0.41`, and `0.41` cannot say whether it looked in the wrong place, at the wrong size, or at the right thing under a tooltip. A rectangle can. It is a diagnostic and is off by default.
+
+---
+
+## 🪟 UI Automation
+
+Instead of looking at the pixels, ask Windows what is on screen. Where it works this beats everything else here: an element found by its name is found at any resolution, under any theme, in any window size, with no threshold to tune — and pressing it goes through the application itself, so the cursor never moves and the window need not even be in front.
+
+Steps **Find element** and **Press element**, and the condition **Element on screen**. An element is named by any of: its **Name** (the text a screen reader would read), its **Id** (the identifier the application gives it), and its **Kind** (`Button`, `Edit`, `Text`, `CheckBox`, …). Narrowing by kind is what keeps it fast. Measured against the window in front: 9 to 35 ms for an exact match, depending on how much that window exposes, which is faster than any picture search here — and several times that when the name has to be matched as a substring.
+
+> ⚠️ **It only sees what an application chooses to expose.** Unity, DirectX, OpenGL and canvas-drawn interfaces expose nothing at all, and across a privilege boundary it is limited or silent. **In Roblox it will find nothing** — this is a feature for automating ordinary programs.
+
+The arrangement that works is a cascade, cheapest and most reliable first:
+
+```
+element  →  picture  →  text  →  fixed coordinates
+```
 
 ---
 
@@ -452,6 +486,29 @@ Under **🔤 Text on screen**. It uses `Windows.Media.Ocr` — the recognition e
 Small regions are upscaled automatically (Windows OCR returns nothing at all below ~40×40 px). Text matching is deliberately loose: case, extra whitespace and stray punctuation are ignored, because OCR output never matches a human reading character for character.
 
 Numbers are parsed generously too — `Gems: 1,250` and `1 250` both read as `1250`, and a clock like `02:34` is converted to **154 seconds**.
+
+### Preparing the pixels
+
+The engine was built for documents — dark text, light paper, generous size — and it has no settings at all. Screen text is none of those, so everything that can be done has to be done to the pixels first. This is worth more than a second engine would be, and it adds nothing to the binary.
+
+| Profile | What it does |
+|---|---|
+| **none** | only the enlargement the engine needs — what every earlier version did |
+| **interface** | grey, contrast pulled out to the full range |
+| **small text** | the same, enlarged harder |
+| **game HUD** | grey, stretched, then cut to black and white at Otsu's threshold |
+| **digits** | black and white, enlarged hard |
+| **try each** | walks the list and keeps the reading that best fits the expected format |
+
+Light text on a dark panel is turned the other way round automatically: the engine reads dark-on-light markedly better.
+
+### Saying what a reading should look like
+
+A whole number, a decimal, a clock, or a small pattern — `#` a digit, `@` a letter, `?` one character, `*` any run. `##:##` matches `12:34` and not `1:34`. Deliberately not a regular expression: it has to be typeable by somebody automating a game, and it must not cost a crate.
+
+**A reading that does not fit is refused, and the variable keeps its old value.** A mis-read clock is not a small error, it is a different number, and quietly writing a zero is worse than doing nothing.
+
+Alongside it comes a **fit score** from 0 to 1 — half whether the format parses, half how much of the reading belongs to the alphabet that format implies. It is not the engine's confidence: that number is on a scale nobody can interpret and is not comparable between engines. The panel shows it next to the reading, so a profile can be chosen by comparing numbers instead of squinting.
 
 ---
 
@@ -720,6 +777,7 @@ Written by **💾 Save settings** and automatically on exit. Unknown or out-of-r
 | `compress_on_save` | bool | `false` | Default to `.mrz` when saving |
 | `img_threshold` | 0.3–1.0 | `0.85` | Confidence for the test search in the panel |
 | `img_multiscale` | bool | `false` | Also try 0.8×–1.25× in the panel |
+| `debug_overlay` | bool | `false` | The see-through window showing what the script looks at |
 | `img_region_enabled` | bool | `false` | Restrict the panel search to a rectangle |
 | `img_rx` / `_ry` / `_rw` / `_rh` | i32 | `0,0,800,600` | That rectangle |
 
@@ -814,7 +872,10 @@ Honest list — please read before filing a bug:
 | **Scripted playback skips some flat-replay features** | Timing jitter, the global pixel stop condition and the end-of-run power action apply to flat replay only. Inside a script use a `pixel` condition and the `Quit the app` step instead |
 | **No TinyTask `.rec` import** | The format is undocumented; a guessed parser would corrupt macros silently rather than fail loudly |
 | **Coordinates are screen-absolute** | DPI awareness stops Windows from lying about pixels, but a macro still assumes the same window layout as when it was recorded. Maximize your target window before recording, or use anchoring |
-| **Scripted image search is full-screen** | The "search area" and "other scales" options apply to the test panel only; script steps always sweep the whole desktop at 1.0× |
+| **Scripted image search is at 1.0×** | The "other scales" option applies to the test panel only. A template cut on a different display is handled by its scale sidecar, not by a scale sweep |
+| **UI Automation sees nothing in games** | It only reports what an application chooses to expose. Unity, DirectX, OpenGL and canvas interfaces expose nothing, and across a privilege boundary it is limited or silent. In Roblox it will find nothing |
+| **The overlay is a layered window, not a compositor effect** | It draws with GDI in physical pixels, so it is correct on a mixed-DPI desktop — but it is a plain always-on-top window, and a game running exclusive full-screen will cover it. Use borderless windowed while diagnosing |
+| **Variables are numbers or text, and nothing else** | No lists, no tables, no functions. Those would turn the step list into a programming language, and a programming language cannot be edited with a mouse. Call an external script with the `Run` step instead |
 | **OCR depends on Windows** | Accuracy and available languages come from the language packs installed on your PC. Stylised game fonts read poorly |
 | **Elevated windows** | Windows blocks synthetic input into higher-privilege windows. If your target runs as admin, run this as admin too |
 | **Anti-cheat** | `SendInput` is standard synthetic input. Many games accept it; kernel-level anti-cheat may detect or block it |
