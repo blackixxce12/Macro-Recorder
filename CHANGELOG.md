@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [1.4.0]
+## [1.4.0] — unreleased
 
 The release about looking at the screen. Four ways to find something, in the order
 they should be tried, and a way to see which one is failing.
@@ -115,6 +115,15 @@ they should be tried, and a way to see which one is failing.
   255 that subtraction throws away most of an f32's precision on a large template.
 - The clipboard helpers moved out of the expander into the platform layer, where the
   script steps can reach them too.
+
+### Fixed
+
+- **An element query with nothing filled in matched everything.** The three fields
+  become search conditions, and three empty ones collapse to "true" — a subtree
+  search for "true" returns the root, so an unfilled query reported the whole window
+  as found and *Press element* fell through to clicking the middle of it. A step
+  freshly added from the menu is exactly that query. It now matches nothing and says
+  so in the log. Found while writing the manual test matrix, not by the test suite.
 
 ### Notes
 
