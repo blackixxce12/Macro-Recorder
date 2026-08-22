@@ -7,6 +7,160 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [1.5.0]
+
+The release about the two things that were still done by hand. Recording produced
+coordinates and somebody turned them into pictures afterwards; a step that found
+nothing said nothing and the script walked on. Both are now the program's job.
+
+Plus the capture path, which turned out to be the floor under everything that looks
+at the screen — and not for the reason anybody assumed.
+
+### Added
+
+- **Recording straight into picture steps.** Switch on *Snip a picture at every
+  click* and a recording keeps a small square of the screen from around each click.
+  When you stop, it offers to turn those clicks into `Click image` steps, writes the
+  squares into `templates/` with their DPI sidecars, and rewrites the macro.
+
+  Nothing is thrown away. Everything between one converted click and the next stays
+  a `Play events` step over exactly that range, so the keystrokes, the scrolling and
+  the recorded timing all survive — only the clicks become pictures. A drag is left
+  alone: press, move, release is not a click that a picture can stand in for, and
+  turning one into a `Click image` would drop the drag without saying so.
+
+  This is the feature the image search was always for. It has been possible to build
+  a macro out of pictures since 1.2, and it required snipping each button separately,
+  naming the files, and remembering which click each one was for.
+
+- **What a step does when it finds nothing.** Every step that looks for
+  something — `Click image`, `Find image`, `Wait for`, `Find element`, `Press
+  element`, and the new `Call macro` — now carries one field with four answers: carry
+  on, stop the script, leave the loop, or try again *N* times and then stop.
+
+  Until now there was only the first, and it was not a choice anybody had made. A
+  `Click image` whose picture was not on screen did nothing at all and the script
+  walked on, which is right for a poll inside a `While` and wrong for everything
+  else. It is the difference between a night macro that stops when the game logs you
+  out and one that clicks at an empty desktop until morning.
+
+  `Carry on` stays the default, so every macro written before this release behaves
+  exactly as it did — there is a test that says so.
+
+- **Call macro.** A step that runs another macro file's script and then carries on.
+  The reuse people ask for when they ask for functions, without becoming a language:
+  a subroutine is an ordinary macro, edited in the same editor, played on its own to
+  test it, and shared between projects as a file.
+
+  The variables are the same ones, so a caller sets `target` before the call and
+  reads `result` after it — which is what a list of steps can express without growing
+  a grammar. Nesting is capped at 8; a macro that names itself stops at the cap
+  rather than taking the process down with it, and `--selftest script` proves it.
+
+- **A window that shows the variables while the script runs.** The other half of the
+  debug overlay. The overlay says where the script is looking; this says what it has
+  found out — every variable, its value, which step is about to run, and how many
+  `Call` steps deep that step is.
+
+  With it, **pause before each step**: the run stops before every step and waits for
+  *Next step*, which turns debugging from reading a log afterwards into watching it
+  happen. Stop still works while parked — a run that only one button could free, in a
+  program whose whole point is a global stop key, would be a trap.
+
+- **Desktop Duplication for screen capture.** About five times faster on a whole
+  screen and twenty times on the small region a script should be using. Falls back to
+  the old path on its own where the machine will not run it — an older display stack,
+  a remote session, a rotated monitor, or a rectangle spanning two screens.
+
+### Changed
+
+- **Screen capture no longer copies the frame three times.** `CreateDIBSection` means
+  `BitBlt` writes straight into memory this process can read, which removes the
+  `GetDIBits` that used to copy and reformat the whole frame a second time. The
+  device context, the bitmap and the buffer are kept between captures instead of
+  being created and destroyed each time. And the red/blue swap is gone: a `Frame` now
+  says which order its bytes are in, and the two consumers that care read that.
+
+  That last one was undoing itself. `capture` swapped BGRA into RGBA and then
+  `upscale_to_bgra` swapped it back on the way to the OCR engine — two full passes
+  over a fourteen-megabyte buffer that cancelled out.
+
+### Fixed
+
+- **The self-running `.exe` footer trusted a length it read out of the file.** The
+  last outstanding item from stage 1 of [TESTING.md](TESTING.md), and the only place
+  in the program that takes a number out of bytes it did not write and then acts on
+  it.
+
+  `16 + len` was an unchecked addition. In a release build, where overflow checks are
+  off, a claimed length near `u64::MAX` wraps it to zero — and the `checked_sub`
+  underneath then succeeds, and a `vec![0u8; len]` asks for sixteen exabytes. With
+  `panic = "abort"` a failed allocation is not an error anybody handles; it is the
+  process gone. The addition is now checked, the length is capped at 64 MB before
+  anything is allocated, the decompressor stops at 512 MB so a compression bomb
+  cannot expand into memory, and the payload goes through `normalize` — which caps
+  the event count and rejects unbalanced blocks — exactly like a file opened through
+  the Open dialog. Until now the one input nobody chose was the one input nobody
+  checked.
+
+### Measured
+
+`--selftest vision`, 2560×1440, with a game running:
+
+| | 1.4.0 | 1.5.0 |
+|---|---|---|
+| One 400×300 capture, repeated 200 times | 6.06 ms | **0.12 ms** |
+| Whole 2560×1440 screen | 30.2 ms | **4.0 ms** |
+| One script step, 400×300 area | 7.0 ms | **1.7 ms** |
+| One script step, whole screen | 52.2 ms | **32.4 ms** |
+
+The interesting part is why, because the plan going in was wrong. Removing the GDI
+object churn and the extra copy changed the number by nothing at all: `BitBlt` out of
+the composited desktop costs about six milliseconds *before it has copied a useful
+pixel*, and the same blit between two memory contexts costs 0.10 ms. The destination
+was never the expensive part — the table prices a DIB section against the device
+bitmap it replaced and they come out equal. The readback was. That is what Desktop
+Duplication does not pay, and it is also why a script polling a settled screen now
+costs almost nothing: a frame the compositor never sent is a frame nobody has to
+read.
+
+The benchmark checks the answer as well as the clock, and that took three goes.
+Comparing two captures for equality fails on any screen with something live on it —
+the first version reported that 97 % of the frame had changed, and it had, because
+there was a game running. Sampling only the pixels that two consecutive captures
+agreed about was better and still not enough. What works is not a pixel count at all:
+cut a template out of a frame taken the old way and look for it in one taken the new
+way. Channels swapped and the correlation collapses; a row pitch ignored and the hit
+lands somewhere else; the wrong monitor and it is out by a screen's width. It reports
+**0 px off, score 1.000**.
+
+`--selftest script` is new: twelve checks over the four miss policies, the retry
+timing, calls passing variables down and back, the recursion cap firing eight frames
+deep, and the step gate parking a run and Stop releasing it. Then three thousand
+rounds of every policy with calls nested under them — no press left held, every round
+ending the way the interpreter says it did.
+
+`--selftest churn=120`: 10 516 lifecycle transitions, nothing left held, no
+generation escaped cancellation.
+
+### Notes
+
+- The squares are cut on the collector thread, not in the input hook. A low-level
+  hook holds up every keystroke and click on the machine until it returns, and a
+  screen grab is milliseconds; taking one in there would make the mouse stutter for
+  everybody.
+- Generated `Click image` steps default to **stop the script** rather than carry on.
+  A step this program wrote, that cannot find the button it was cut from, has nothing
+  useful to do next. The offer has a combo box on it if you disagree.
+- A `Call` step names a file, and an exported self-running `.exe` carries only its own
+  macro. Export a macro that calls another and the callee has to be beside it.
+- Desktop Duplication is per thread and gives up per thread. A search thread that
+  cannot get a duplication is saying something about itself, not about the machine; a
+  process-wide count would let one unlucky thread put every future playback back on
+  the slow path for the rest of the session.
+
+---
+
 ## [1.4.0] — unreleased
 
 The release about looking at the screen. Four ways to find something, in the order
