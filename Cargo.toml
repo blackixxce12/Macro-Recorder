@@ -1,9 +1,9 @@
 [package]
 name = "macro-recorder"
-version = "1.3.0"
+version = "1.5.0"
 edition = "2024"
 rust-version = "1.97.1"
-description = "A modern, DPI-aware macro recorder with native Windows 11 Mica/Acrylic, Virtual Desktop isolation, and secure shutdown"
+description = "A modern, DPI-aware macro recorder that records straight into image-matched steps, with Desktop Duplication capture, native Windows 11 Mica/Acrylic, Virtual Desktop isolation, and secure shutdown"
 license = "MIT"
 build = "build.rs"
 
@@ -70,6 +70,14 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    # Desktop Duplication. GDI's BitBlt out of the composited desktop is a fixed
+    # ~6 ms readback whatever the region size (measured: --selftest vision, "Where a
+    # capture goes"), and no arrangement of DCs or bitmaps moves it. These are the
+    # bindings for the path that does.
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Globalization",
     "Win32_System_Shutdown",
     "Win32_Security",
@@ -86,6 +94,10 @@ windows = { version = "0.62", features = [
     "Storage_Streams",
     "Win32_Storage_FileSystem",
     "Win32_System_SystemServices",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Accessibility",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
 ] }
 
 [profile.release]
