@@ -27,8 +27,11 @@
 
 | | |
 |---|---|
-| 🧠 **Script engine** | 23 step kinds with `If` / `While` / `Break`, variables that hold numbers **or text**, and eight conditions that look at the screen. **[Full guide → SCRIPTS.md](SCRIPTS.md)** |
-| 🔎 **Image search** | Paste a snippet with `Win+Shift+S` and the macro can wait for it, or click it wherever it appears — told **where** to look, so a step costs 8 ms instead of 78 |
+| 📸 **Record straight into pictures** | Tick one box and every click keeps a small square of the screen. Stop recording and it offers to turn those clicks into steps that find the button **wherever it has moved to** — the keystrokes and timing between them untouched |
+| ⚠️ **A step that finds nothing can say so** | Carry on, stop the script, leave the loop, or try again *N* times. Before 1.5.0 there was only the first, which is how a night macro ends up clicking at an empty desktop until morning |
+| 🧠 **Script engine** | 24 step kinds with `If` / `While` / `Break`, variables that hold numbers **or text**, eight conditions that look at the screen, and **`Call macro`** for reuse. **[Full guide → SCRIPTS.md](SCRIPTS.md)** |
+| 🔎 **Image search** | Paste a snippet with `Win+Shift+S` and the macro can wait for it, or click it wherever it appears — told **where** to look, and now on a capture path that costs **0.12 ms instead of 6** |
+| 🔬 **Watch it think** | A window listing every variable as the script runs, plus **pause before each step** |
 | 🪟 **UI Automation** | Ask Windows for a button by name: no threshold, no resolution, no theme. 9.5 ms, and silent in anything that draws its own interface |
 | 🔤 **Text on screen (OCR)** | Uses the recognition already built into Windows — five preparation profiles, an expected format, and a fit score |
 | 📅 **Scheduler** | Start the macro at a set time on chosen weekdays, even while minimised to the tray |
@@ -173,7 +176,7 @@ That weekend project got slightly out of hand. 🦀
 | **Tray icon / minimize to tray** | ❌ | ✅ with a record / play / stop menu |
 | **Window anchoring** | ❌ | ✅ follows the target window if it moved **or resized** |
 | **Stop on a screen pixel** | ❌ | ✅ colour + tolerance, with a picker |
-| **Scripting / conditional logic** | ❌ | ✅ **23 step kinds, `If`/`While`/`Break`, variables holding numbers or text** — [SCRIPTS.md](SCRIPTS.md) |
+| **Scripting / conditional logic** | ❌ | ✅ **24 step kinds, `If`/`While`/`Break`, variables holding numbers or text, and `Call macro`** — [SCRIPTS.md](SCRIPTS.md) |
 | **Image recognition** | ❌ | ✅ masked normalised cross-correlation, optional multi-scale |
 | **Text recognition (OCR)** | ❌ | ✅ via `Windows.Media.Ocr` — no models to download |
 | **Scheduler (start at a time)** | ❌ | ✅ time + weekdays, runs from the tray |
@@ -219,6 +222,7 @@ Facts above were taken from the official TinyTask site rather than SEO mirrors (
 - 🔴 Mouse movement, clicks, wheel (vertical *and* horizontal), **X1/X2 side buttons**, and the full keyboard — including scancodes and extended keys, so layouts and NumPad behave correctly
 - 🎚 Movement sampling is configurable (1–100 ms, default 5 ms), or can be **switched off entirely** for click-only macros
 - 🚫 The recorder ignores its own synthetic events *and* your own hotkeys, so neither ends up inside the macro
+- 📸 **Snip a picture at every click** — keeps a square of the screen around each click so the recording can become a macro that finds its buttons instead of trusting coordinates
 
 **Replay**
 
@@ -238,6 +242,9 @@ Facts above were taken from the official TinyTask site rather than SEO mirrors (
 - 🎯 **Pixel condition**: watch one pixel and stop — or shut the PC down — when it changes
 - 📝 Variables hold **numbers or text**, so what was read, what the window is called and what is on the clipboard can all be kept and compared
 - 👁 A **see-through overlay** shows where the last search looked and what it found
+- 🔬 A **variables window** shows what it has worked out, with an optional pause before every step
+- ⚠️ Every step that looks for something says **what to do when it is not there** — carry on, stop, leave the loop, or retry
+- 📞 **`Call macro`** runs another macro file's script as a subroutine, sharing the variables
 
 **Automation & safety**
 
@@ -246,6 +253,7 @@ Facts above were taken from the official TinyTask site rather than SEO mirrors (
 - 📅 **Scheduler** — start at `HH:MM` on the weekdays you tick, even from the tray
 - 🪟 **Target window** — automatically pause while your game isn't the window in front
 - 🧭 **Per-monitor DPI aware (v2)** — Windows reports true physical pixels, so 125%/150% scaling doesn't silently offset your clicks
+- 🚀 **Desktop Duplication capture** — the compositor hands over the frame it already has instead of GDI fetching it back; ~5× on a whole screen, ~20× on a region, and it falls back to the old path by itself where a machine will not run it
 - 🪟 **Virtual Desktop isolation (Windows 11)** — if the app lives on Desktop 2, it neither records nor replays while you're working on Desktop 1
 - 🔒 **Single instance** — launching it twice just focuses the existing window
 
@@ -397,7 +405,7 @@ A recording replays what you did. A **script** decides *whether* and *how many t
 
 Steps live inside the macro file, so a scripted macro is still one `.json` you can save, share and export to `.exe`.
 
-**23 step kinds:** `Play events` · `Wait` · `Wait for` · `Click image` · `Find image` · `Click at` · `Key` · `Set` · `If` · `Else` · `End if` · `While` · `End while` · `Break` · `Run` · `Quit the app` · `Note` · `Read number` · `Read text` · `Get text` · `Put text` · `Find element` · `Press element`
+**24 step kinds:** `Play events` · `Wait` · `Wait for` · `Click image` · `Find image` · `Click at` · `Key` · `Set` · `If` · `Else` · `End if` · `While` · `End while` · `Break` · `Run` · `Quit the app` · `Note` · `Read number` · `Read text` · `Get text` · `Put text` · `Find element` · `Press element` · **`Call macro`**
 
 **8 conditions:** `always` · `variable` · `image` · `pixel` · `window` · `text` · `process running` · `element on screen`
 
@@ -435,11 +443,53 @@ Every image step and image condition carries its own **search area**: the whole 
 
 | Area | Capture | Search | Total | Looks per second |
 |---|---|---|---|---|
-| 2560×1440 | 43.8 ms | 33.8 ms | 77.7 ms | 12.9 |
-| 1280×720 | 16.8 ms | 9.8 ms | 26.7 ms | 37.5 |
-| 400×300 | 6.2 ms | 1.6 ms | 7.8 ms | 128.4 |
+| 2560×1440 | 10.4 ms | 22.0 ms | 32.4 ms | 31 |
+| 1280×720 | 3.3 ms | 6.6 ms | 9.9 ms | 101 |
+| 400×300 | 0.6 ms | 1.2 ms | 1.7 ms | 584 |
+| 200×150 | 0.1 ms | 0.5 ms | 0.6 ms | 1582 |
 
 **Relative to another picture** is the one no threshold can replace. A row of identical buttons is identical; which one to press is decided by the heading above it, and an anchor is how a script says so.
+
+The capture column is what 1.5.0 changed, and the change is larger than the search itself now. See [How a capture got twenty times cheaper](#how-a-capture-got-twenty-times-cheaper).
+
+### What happens when it is not there
+
+Every step that looks for something carries one more field: **if not found**.
+
+| Answer | For |
+|---|---|
+| **Carry on** | A poll inside a `While`. What every version before 1.5.0 did, always — and still the default, so nothing you already wrote has changed. |
+| **Stop the script** | Everything else. A macro that has lost its footing should stop, not keep going. |
+| **Leave the loop** | A loop watching for one of several things. |
+| **Try again *N* times** | An interface that is still drawing itself. Waits between tries, and stops the run if it is still not there — a retry that gives up quietly is the trap this field exists to close. |
+
+A step with anything other than *carry on* shows it in the script list, so the places a run can end are visible without opening each step.
+
+### Recording straight into picture steps
+
+Under **🎬 Recording**, tick **Snip a picture at every click**. From then on a
+recording keeps a square of the screen (64 px by default, 16–512) from around every
+click. When you press stop, the program offers to turn those clicks into `Click
+image` steps.
+
+Accept and it writes each square into `templates/` as `rec_<date>_<nn>.png` with its
+DPI sidecar, then rewrites the macro as a script. Everything between one converted
+click and the next stays a `Play events` step over exactly that range, so the
+keystrokes, the scrolling and the recorded timing all survive — only the clicks
+become pictures.
+
+Two things it deliberately does not do:
+
+- **A drag is left alone.** Press, move, release is not a click that a picture can
+  stand in for, so it stays inside its `Play events` range where it still works.
+- **The generated steps stop the script when the picture is not found**, rather than
+  carrying on. A step this program wrote, that cannot find the button it was cut
+  from, has nothing useful to do next. The offer has a combo box on it if you
+  disagree.
+
+The pictures are ordinary PNGs with machine-made names. Renaming them to something
+meaningful — and editing the steps to match — is expected, and cropping them tighter
+in any image editor usually helps.
 
 ### Living with a picture that moves, fades or changes theme
 
@@ -451,11 +501,77 @@ Every image step and image condition carries its own **search area**: the whole 
 | **Outlines** | Correlates shapes instead of shades — survives a theme change and a highlighted row, at about 1.6× the cost. |
 | **A scale sidecar** | Saving a template writes `Name.png.json` with the display scale it was cut at, and loading rescales it for the display it will be looked for on. Templates made before 1.4.0 have no sidecar and are left alone. |
 
+### How a capture got twenty times cheaper
+
+The interesting part is that the obvious explanation was wrong, and measuring said so.
+
+Every look at the screen used to create a device context and a bitmap and destroy
+them again, allocate and zero a fresh buffer, `BitBlt` into the bitmap, `GetDIBits`
+the whole thing back out a second time, and then walk every pixel swapping red with
+blue. All of that is real work and all of it is gone: a DIB section means `BitBlt`
+writes straight into memory this process can read, the context and bitmap are kept
+between captures, and a `Frame` now carries which order its bytes are in rather than
+being rewritten to hide it. (That last one was undoing itself — `capture` swapped
+BGRA into RGBA and `upscale_to_bgra` swapped it back on the way to the OCR engine.)
+
+Removing all of that changed the number by nothing at all.
+
+`--selftest vision` prints the split under **Where a capture goes**:
+
+| Region | `GetDC` | `BitBlt` from screen | The same blit, memory to memory |
+|---|---|---|---|
+| 320×240 | 0.01 ms | 6.07 ms | 0.10 ms |
+| 640×480 | 0.01 ms | 6.08 ms | 0.22 ms |
+| 2560×1440 | 0.01 ms | 23.9 ms | 3.18 ms |
+
+`BitBlt` out of the composited desktop costs about six milliseconds *before it has
+copied a useful pixel*. The destination was never the expensive part — the table
+prices the new DIB section against the device bitmap it replaced and they come out
+equal. The readback was.
+
+So 1.5.0 stops asking GDI. **Desktop Duplication** is the interface the compositor
+offers for exactly this: it hands over the surface it already has, only the requested
+rectangle crosses to the CPU, and a frame that has not changed is not sent at all —
+so a script polling a settled screen costs one sub-rectangle copy out of a texture
+that is already there.
+
+| | GDI | Desktop Duplication |
+|---|---|---|
+| 400×300, polled 200 times | 6.06 ms each | **0.12 ms each** |
+| Whole 2560×1440 screen | 30.2 ms | **4.0 ms** |
+| Of those 200 polls, frames the compositor never had to send | — | **196** |
+
+It falls back to the old path by itself, per thread, whenever it cannot run: an older
+display stack, a remote session, a rotated monitor, a rectangle spanning two screens,
+or a driver that simply says no. The switch under **🔎 Image search** turns it off for
+a machine where it runs badly rather than not at all.
+
+**Is it the same picture?** That question took three attempts to ask properly.
+Comparing two captures for equality fails on any screen with something live on it —
+the first version of the check reported that 97 % of the frame had changed, and it
+had, because there was a game running. What works is not a pixel count: cut a
+template out of a frame taken the old way and look for it in one taken the new way.
+Channels swapped and the correlation collapses; a row pitch ignored and the hit lands
+somewhere else; the wrong monitor and it is out by a screen's width. `--selftest
+vision` runs it every time and reports **0 px off, score 1.000**.
+
 ### Seeing what it sees
 
 **Show what the script looks at** puts a see-through, click-through window over everything. While a script runs it draws the search area in blue, the match and its score in green or red, the rectangle text was read from in amber, and the interface element that was found in violet.
 
 A failed search gives you `0.41`, and `0.41` cannot say whether it looked in the wrong place, at the wrong size, or at the right thing under a tooltip. A rectangle can. It is a diagnostic and is off by default.
+
+### Watching what it knows
+
+**Watch the run** opens a second window listing every variable and its value,
+refreshed on every step, along with the step about to run and how many `Call` steps
+deep it is. The overlay says where the script is looking; this says what it has found
+out, and between them a failing macro usually explains itself.
+
+**Pause before each step** turns the run into something you step through: it stops
+before every step and waits for **▶ Next step**. Stop works while it is parked, and
+so does closing the window — a run that only one button could free, in a program
+whose whole point is a global stop key, would be a trap.
 
 ---
 
@@ -808,6 +924,25 @@ macro-recorder.exe --play "D:\macros\farm.mrz" --loops 20 --speed 1.5 --no-gui
 
 Scripts run in headless mode too. The emergency-stop hotkey still works.
 
+### Self-tests
+
+Not documented as a feature so much as a way to check a machine before trusting a
+macro to it overnight. Each writes a table and a plain-English note on how to read it.
+
+```powershell
+macro-recorder.exe --selftest vision          # capture, search and OCR, with numbers
+macro-recorder.exe --selftest script          # the interpreter: miss policies, calls, step mode
+macro-recorder.exe --selftest timing          # the replay scheduler under load
+macro-recorder.exe --selftest churn=120       # the playback lifecycle, hammered
+macro-recorder.exe --selftest soak=2          # hours of captures, watching handles and memory
+```
+
+`--selftest vision` is the one to run after changing monitors: it prices a capture on
+*this* machine and says whether Desktop Duplication is available here. `--selftest
+script` takes a few seconds and exercises the 1.5.0 interpreter paths. Nothing any of
+them do reaches the operating system — every `SendInput` call site is silenced for the
+duration.
+
 ---
 
 ## 📥 Download
@@ -874,8 +1009,12 @@ Honest list — please read before filing a bug:
 | **Coordinates are screen-absolute** | DPI awareness stops Windows from lying about pixels, but a macro still assumes the same window layout as when it was recorded. Maximize your target window before recording, or use anchoring |
 | **Scripted image search is at 1.0×** | The "other scales" option applies to the test panel only. A template cut on a different display is handled by its scale sidecar, not by a scale sweep |
 | **UI Automation sees nothing in games** | It only reports what an application chooses to expose. Unity, DirectX, OpenGL and canvas interfaces expose nothing, and across a privilege boundary it is limited or silent. In Roblox it will find nothing |
-| **The overlay is a layered window, not a compositor effect** | It draws with GDI in physical pixels, so it is correct on a mixed-DPI desktop — but it is a plain always-on-top window, and a game running exclusive full-screen will cover it. Use borderless windowed while diagnosing |
-| **Variables are numbers or text, and nothing else** | No lists, no tables, no functions. Those would turn the step list into a programming language, and a programming language cannot be edited with a mouse. Call an external script with the `Run` step instead |
+| **The overlay is a layered window, not a compositor effect** | It draws with GDI in physical pixels, which should keep it correct on a mixed-DPI desktop — that part has been reasoned about rather than measured. It is also a plain always-on-top window, so a game running exclusive full-screen will cover it; use borderless windowed while diagnosing |
+| **Variables are numbers or text, and nothing else** | No lists, no tables. `Call macro` gives reuse, but it is a subroutine sharing one set of variables, not a function with parameters and a return value — those would turn the step list into a programming language, and a programming language cannot be edited with a mouse |
+| **A called macro is a separate file** | `Call macro` names a file on disk. An exported standalone `.exe` carries only its own macro, so a called file has to be beside it |
+| **Fast capture holds a GPU texture** | Desktop Duplication keeps a Direct3D device and a full-screen texture per thread so an unchanged frame can be reused; the process sits around 80 MB rather than 12. Untick **Fast screen capture** to trade that back for ~5× slower screen grabs |
+| **Fast capture is one monitor at a time** | A search area spanning two screens, a rotated display, a remote session or an older display stack all fall back to the GDI path automatically — correct, just slower |
+| **Snipped click pictures are 64 px of whatever was there** | Recording into picture steps cuts a fixed square around the cursor, background included. Crop them tighter in any editor if a step matches the wrong thing |
 | **OCR depends on Windows** | Accuracy and available languages come from the language packs installed on your PC. Stylised game fonts read poorly |
 | **Elevated windows** | Windows blocks synthetic input into higher-privilege windows. If your target runs as admin, run this as admin too |
 | **Anti-cheat** | `SendInput` is standard synthetic input. Many games accept it; kernel-level anti-cheat may detect or block it |
