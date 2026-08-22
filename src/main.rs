@@ -37,9 +37,12 @@ mod win32 {
     // Explicit imports instead of a glob: several Gdi names collide with
     // WindowsAndMessaging and would become ambiguous at the use site.
     pub use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
-        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, GetPixel,
-        HGDIOBJ, HRGN, ReleaseDC, SRCCOPY, SelectObject,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CreateCompatibleBitmap,
+        CreateCompatibleDC, CreateDIBSection, CreatePen, CreateSolidBrush, DIB_RGB_COLORS,
+        DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, GetPixel,
+        GetStockObject, HBITMAP, HDC, HGDIOBJ, HRGN, InvalidateRect, NULL_BRUSH,
+        PAINTSTRUCT, PS_SOLID, Rectangle, ReleaseDC, SRCCOPY, SelectObject, SetBkMode,
+        SetTextColor, TRANSPARENT, TextOutW, UpdateWindow,
     };
     pub use windows::Win32::System::DataExchange::*;
     pub use windows::Win32::System::Memory::*;
@@ -57,7 +60,8 @@ mod win32 {
     pub use windows::Win32::UI::WindowsAndMessaging::*;
     // BOOL moved out of Win32::Foundation into windows-core in the 0.62 family;
     // the EnumWindows callback has to return exactly that type.
-    pub use windows::core::{BOOL, PCSTR, PCWSTR, w};
+    pub use windows::Win32::System::Diagnostics::ToolHelp::*;
+    pub use windows::core::{BOOL, PCSTR, PCWSTR, PWSTR, w};
 }
 
 // ============================================================================
@@ -260,6 +264,357 @@ mod paths {
     }
 }
 
+/// Editor for what a step does when it does not find what it was looking for.
+///
+/// One row, everywhere it applies, so the answer to "what happens if this is not
+/// there" is in the same place on every step that can ask it.
+fn miss_ui(ui: &mut egui::Ui, s: &Strings, salt: &str, miss: &mut OnMiss) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(s.m_onmiss).on_hover_text(s.tip_onmiss);
+        let cur = miss.index();
+        egui::ComboBox::from_id_salt(format!("{salt}_miss"))
+            .selected_text(miss.name(s))
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                for i in 0..OnMiss::COUNT {
+                    let opt = OnMiss::from_index(i);
+                    if ui.selectable_label(cur == i, opt.name(s)).clicked() && cur != i {
+                        *miss = opt;
+                        changed = true;
+                    }
+                }
+            });
+        if let OnMiss::Retry { times, delay_ms } = miss {
+            changed |= ui.add(egui::DragValue::new(times).range(1..=100)).changed();
+            ui.label(s.m_times);
+            changed |= ui
+                .add(egui::DragValue::new(delay_ms).range(0..=600_000).speed(50.0))
+                .changed();
+            ui.label(s.m_delay);
+        }
+    });
+    changed
+}
+
+/// Editor for a search area. The same four choices wherever an image is looked for.
+fn area_ui(ui: &mut egui::Ui, s: &Strings, salt: &str, area: &mut SearchArea) -> bool {
+    let mut changed = false;
+    let names = [s.a_full, s.a_window, s.a_rect, s.a_near, s.a_anchor];
+    let mut idx = match area {
+        SearchArea::FullScreen => 0,
+        SearchArea::ActiveWindow => 1,
+        SearchArea::Rect { .. } => 2,
+        SearchArea::NearLast { .. } => 3,
+        SearchArea::NearAnchor { .. } => 4,
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(s.f_area);
+        egui::ComboBox::from_id_salt(format!("{salt}_area"))
+            .selected_text(names[idx])
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                for (i, n) in names.iter().enumerate() {
+                    if ui.selectable_label(idx == i, *n).clicked() {
+                        idx = i;
+                    }
+                }
+            });
+        // Switching kind keeps the numbers the old kind had, so flicking between them
+        // while setting one up does not throw the work away.
+        let want = match idx {
+            1 => SearchArea::ActiveWindow,
+            2 => match area {
+                SearchArea::Rect { .. } => area.clone(),
+                _ => SearchArea::Rect { x: 0, y: 0, w: 600, h: 400 },
+            },
+            3 => match area {
+                SearchArea::NearLast { .. } => area.clone(),
+                _ => SearchArea::NearLast { margin: 100 },
+            },
+            4 => match area {
+                SearchArea::NearAnchor { .. } => area.clone(),
+                _ => SearchArea::NearAnchor {
+                    anchor: String::new(),
+                    dx: -150,
+                    dy: 0,
+                    w: 300,
+                    h: 120,
+                },
+            },
+            _ => SearchArea::FullScreen,
+        };
+        if want != *area {
+            *area = want;
+            changed = true;
+        }
+        match area {
+            SearchArea::Rect { x, y, w, h } => {
+                for (label, v) in [("X", x), ("Y", y)] {
+                    ui.label(label);
+                    changed |=
+                        ui.add(egui::DragValue::new(v).range(-32000..=32000)).changed();
+                }
+                for (label, v) in [("W", w), ("H", h)] {
+                    ui.label(label);
+                    changed |= ui.add(egui::DragValue::new(v).range(1..=32000)).changed();
+                }
+            }
+            SearchArea::NearLast { margin } => {
+                ui.label(s.f_margin);
+                changed |= ui.add(egui::DragValue::new(margin).range(8..=2000)).changed();
+            }
+            _ => {}
+        }
+    });
+    // The anchor gets its own row: a name, a picker and four numbers do not fit
+    // beside the kind chooser on any sensible window width.
+    if let SearchArea::NearAnchor { anchor, dx, dy, w, h } = area {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(s.f_anchor);
+            changed |= ui
+                .add(egui::TextEdit::singleline(anchor).desired_width(120.0))
+                .changed();
+            changed |= template_picker(ui, &format!("{salt}_anchor"), anchor);
+            for (label, v) in [("dX", dx), ("dY", dy)] {
+                ui.label(label);
+                changed |= ui.add(egui::DragValue::new(v).range(-32000..=32000)).changed();
+            }
+            for (label, v) in [("W", w), ("H", h)] {
+                ui.label(label);
+                changed |= ui.add(egui::DragValue::new(v).range(1..=32000)).changed();
+            }
+        });
+    }
+    changed
+}
+
+/// One line describing what an element query is looking for.
+fn describe_query(q: &uia::Query) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !q.control.is_empty() {
+        parts.push(q.control.clone());
+    }
+    if !q.name.is_empty() {
+        parts.push(format!("\"{}\"", q.name));
+    }
+    if !q.automation_id.is_empty() {
+        parts.push(format!("#{}", q.automation_id));
+    }
+    if parts.is_empty() {
+        parts.push("?".into());
+    }
+    parts.join(" ")
+}
+
+/// Editor for an element query.
+fn query_ui(ui: &mut egui::Ui, s: &Strings, salt: &str, q: &mut uia::Query) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(s.f_name);
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut q.name).desired_width(150.0))
+            .on_hover_text(s.tip_uia)
+            .changed();
+        let names: Vec<&str> =
+            uia::CONTROLS.iter().map(|(n, _)| if n.is_empty() { s.f_any } else { *n }).collect();
+        let mut idx = uia::CONTROLS
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(&q.control))
+            .unwrap_or(0);
+        ui.label(s.f_control);
+        egui::ComboBox::from_id_salt(format!("{salt}_ctl"))
+            .selected_text(names[idx])
+            .width(96.0)
+            .show_ui(ui, |ui| {
+                for (i, n) in names.iter().enumerate() {
+                    if ui.selectable_label(idx == i, *n).clicked() {
+                        idx = i;
+                    }
+                }
+            });
+        let want = uia::CONTROLS[idx].0.to_string();
+        if want != q.control {
+            q.control = want;
+            changed = true;
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label(s.f_autoid);
+        changed |= ui
+            .add(egui::TextEdit::singleline(&mut q.automation_id).desired_width(130.0))
+            .changed();
+        changed |= ui.checkbox(&mut q.in_front, s.f_in_front).changed();
+    });
+    changed
+}
+
+/// Picker for where a piece of text is read from.
+fn source_picker(
+    ui: &mut egui::Ui,
+    s: &Strings,
+    salt: &str,
+    src: &mut TextSource,
+) -> bool {
+    let names = [s.t_clipboard, s.t_wintitle, s.t_process, s.t_file];
+    let mut idx = src.index();
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(format!("{salt}_src"))
+        .selected_text(names[idx])
+        .width(140.0)
+        .show_ui(ui, |ui| {
+            for (i, n) in names.iter().enumerate() {
+                if ui.selectable_label(idx == i, *n).clicked() {
+                    idx = i;
+                }
+            }
+        });
+    if idx != src.index() {
+        *src = TextSource::from_index(idx);
+        changed = true;
+    }
+    if let TextSource::File(path) = src {
+        changed |= ui
+            .add(egui::TextEdit::singleline(path).desired_width(160.0))
+            .changed();
+    }
+    changed
+}
+
+/// Picker for where a piece of text is sent.
+fn sink_picker(ui: &mut egui::Ui, s: &Strings, salt: &str, sink: &mut TextSink) -> bool {
+    let names = [s.t_clipboard, s.t_file];
+    let mut idx = sink.index();
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(format!("{salt}_sink"))
+        .selected_text(names[idx])
+        .width(120.0)
+        .show_ui(ui, |ui| {
+            for (i, n) in names.iter().enumerate() {
+                if ui.selectable_label(idx == i, *n).clicked() {
+                    idx = i;
+                }
+            }
+        });
+    if idx != sink.index() {
+        *sink = TextSink::from_index(idx);
+        changed = true;
+    }
+    if let TextSink::File { path, append } = sink {
+        changed |= ui
+            .add(egui::TextEdit::singleline(path).desired_width(150.0))
+            .changed();
+        changed |= ui.checkbox(append, s.f_append).changed();
+    }
+    changed
+}
+
+/// Editor for a script value: a number, or a piece of text.
+///
+/// The kind is a visible choice rather than something guessed from what was typed.
+/// Guessing would make `007` and `7` the same value on some days and not others.
+fn value_ui(ui: &mut egui::Ui, s: &Strings, salt: &str, v: &mut Value) -> bool {
+    let mut changed = false;
+    let names = [s.v_number, s.v_text];
+    let mut idx = usize::from(v.is_text());
+    egui::ComboBox::from_id_salt(format!("{salt}_kind"))
+        .selected_text(names[idx])
+        .width(78.0)
+        .show_ui(ui, |ui| {
+            for (i, n) in names.iter().enumerate() {
+                if ui.selectable_label(idx == i, *n).clicked() {
+                    idx = i;
+                }
+            }
+        });
+    if (idx == 1) != v.is_text() {
+        // Carried across rather than reset: flicking between the two while setting
+        // one up should not throw away what was typed.
+        *v = if idx == 1 { Value::Str(v.as_text()) } else { Value::Num(v.as_num()) };
+        changed = true;
+    }
+    match v {
+        Value::Num(n) => changed |= ui.add(egui::DragValue::new(n).speed(0.5)).changed(),
+        Value::Str(t) => {
+            changed |= ui
+                .add(egui::TextEdit::singleline(t).desired_width(150.0))
+                .on_hover_text(s.tip_value_text)
+                .changed()
+        }
+    }
+    changed
+}
+
+/// Picker for what is done to a region's pixels before it is read.
+fn prep_picker(ui: &mut egui::Ui, s: &Strings, salt: &str, prep: &mut ocr::Prep) -> bool {
+    let names = [s.p_none, s.p_ui, s.p_small, s.p_game, s.p_digits, s.p_auto];
+    let mut idx = prep.index().min(names.len() - 1);
+    ui.label(s.f_prep);
+    egui::ComboBox::from_id_salt(format!("{salt}_prep"))
+        .selected_text(names[idx])
+        .width(118.0)
+        .show_ui(ui, |ui| {
+            for (i, n) in names.iter().enumerate() {
+                if ui.selectable_label(idx == i, *n).clicked() {
+                    idx = i;
+                }
+            }
+        });
+    let want = ocr::Prep::from_index(idx);
+    if want != *prep {
+        *prep = want;
+        return true;
+    }
+    false
+}
+
+/// Picker for the expected format, with a box for the pattern when one is wanted.
+fn expect_picker(ui: &mut egui::Ui, s: &Strings, salt: &str, e: &mut ocr::Expect) -> bool {
+    let names = [s.x_any, s.x_int, s.x_dec, s.x_time, s.x_pattern];
+    let mut idx = e.index().min(names.len() - 1);
+    let mut changed = false;
+    ui.label(s.f_expect);
+    egui::ComboBox::from_id_salt(format!("{salt}_expect"))
+        .selected_text(names[idx])
+        .width(104.0)
+        .show_ui(ui, |ui| {
+            for (i, n) in names.iter().enumerate() {
+                if ui.selectable_label(idx == i, *n).clicked() {
+                    idx = i;
+                }
+            }
+        });
+    if idx != e.index() {
+        *e = ocr::Expect::from_index(idx);
+        changed = true;
+    }
+    if let ocr::Expect::Pattern(p) = e {
+        changed |= ui
+            .add(egui::TextEdit::singleline(p).desired_width(90.0))
+            .on_hover_text(s.tip_pattern)
+            .changed();
+    }
+    changed
+}
+
+fn action_index(a: &expander::Action) -> usize {
+    match a {
+        expander::Action::Text => 0,
+        expander::Action::PlayMacro => 1,
+        expander::Action::StopAll => 2,
+        expander::Action::RunProgram => 3,
+    }
+}
+
+fn action_from_index(i: usize) -> expander::Action {
+    match i {
+        1 => expander::Action::PlayMacro,
+        2 => expander::Action::StopAll,
+        3 => expander::Action::RunProgram,
+        _ => expander::Action::Text,
+    }
+}
+
 fn trigger_index(t: &expander::Trigger) -> usize {
     match t {
         expander::Trigger::Inherit => 0,
@@ -376,6 +731,24 @@ pub mod expander {
         Paste,
     }
 
+    /// What an entry does when it fires.
+    ///
+    /// A text expander that can also start and stop the thing this application is for
+    /// stops being a bolted-on extra: `;farm` starts the macro, `;stop` ends it, and
+    /// the abbreviation becomes a command line that works in any window.
+    #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+    pub enum Action {
+        /// Replace the abbreviation with the text. What every entry did until now.
+        #[default]
+        Text,
+        /// Play the macro. If the text names a file, load that one first.
+        PlayMacro,
+        /// Stop whatever is running - recording, playback, everything.
+        StopAll,
+        /// Hand the text to the shell, the way the `Run` script step does.
+        RunProgram,
+    }
+
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct Entry {
         #[serde(default = "yes")]
@@ -386,6 +759,8 @@ pub mod expander {
         pub trigger: Trigger,
         #[serde(default = "typing")]
         pub insert: Insert,
+        #[serde(default)]
+        pub action: Action,
     }
 
     fn yes() -> bool {
@@ -439,6 +814,7 @@ pub mod expander {
                         text: "221B Baker Street\nLondon".into(),
                         trigger: Trigger::Inherit,
                         insert: Insert::Type,
+                        action: Action::Text,
                     },
                     Entry {
                         enabled: true,
@@ -446,6 +822,7 @@ pub mod expander {
                         text: "{date}".into(),
                         trigger: Trigger::Inherit,
                         insert: Insert::Type,
+                        action: Action::Text,
                     },
                     Entry {
                         enabled: true,
@@ -453,6 +830,15 @@ pub mod expander {
                         text: "Kind regards,\n{cursor}".into(),
                         trigger: Trigger::Instant,
                         insert: Insert::Type,
+                        action: Action::Text,
+                    },
+                    Entry {
+                        enabled: true,
+                        abbr: ";stop".into(),
+                        text: String::new(),
+                        trigger: Trigger::Instant,
+                        insert: Insert::Type,
+                        action: Action::StopAll,
                     },
                 ],
             }
@@ -478,6 +864,9 @@ pub mod expander {
         pub backspaces: usize,
         pub segments: Vec<Segment>,
         pub insert: Insert,
+        pub action: Action,
+        /// The entry's raw text, for the actions that read it as a path.
+        pub payload: String,
     }
 
     pub fn is_delimiter(book: &Book, c: char) -> bool {
@@ -510,16 +899,27 @@ pub mod expander {
         }
     }
 
-    /// Decides whether the character just typed completes an abbreviation.
+    /// Decides whether the character just typed completed an abbreviation.
     ///
-    /// Pure, and separate from everything Windows-shaped, so the rules can be tested
-    /// without a keyboard.
-    pub fn match_at(book: &Book, buf: &[char], typed: char) -> Option<Fire> {
+    /// `allow_text` is false while a macro is replaying: an entry that types would
+    /// fight with the macro, but one that only starts or stops something is exactly
+    /// what somebody reaching for `;stop` wants.
+    pub fn match_at(
+        book: &Book,
+        buf: &[char],
+        typed: char,
+        allow_text: bool,
+    ) -> Option<Fire> {
         if !book.enabled || buf.is_empty() {
             return None;
         }
         let mut best: Option<(usize, &Entry)> = None;
-        for e in book.entries.iter().filter(|e| e.enabled && !e.abbr.is_empty()) {
+        for e in book
+            .entries
+            .iter()
+            .filter(|e| e.enabled && !e.abbr.is_empty())
+            .filter(|e| allow_text || e.action != Action::Text)
+        {
             let hit = match resolve(book, &e.trigger) {
                 Trigger::Instant => ends_on_boundary(book, buf, &e.abbr)
                     .then(|| e.abbr.chars().count()),
@@ -547,6 +947,17 @@ pub mod expander {
             }
         }
         let (backspaces, entry) = best?;
+        // A command reads its text as a path, so expanding placeholders in it and
+        // splitting it into keystrokes would be nonsense.
+        if entry.action != Action::Text {
+            return Some(Fire {
+                backspaces,
+                segments: Vec::new(),
+                insert: entry.insert,
+                action: entry.action,
+                payload: entry.text.clone(),
+            });
+        }
         let mut segments = render(&entry.text);
         // In delimiter mode the delimiter was eaten with the abbreviation, so it has
         // to come back or the next word runs into the replacement.
@@ -556,7 +967,13 @@ pub mod expander {
                 _ => segments.push(Segment::Text(typed.to_string())),
             }
         }
-        Some(Fire { backspaces, segments, insert: entry.insert })
+        Some(Fire {
+            backspaces,
+            segments,
+            insert: entry.insert,
+            action: Action::Text,
+            payload: String::new(),
+        })
     }
 
     /// Splits a replacement into segments, expanding the placeholders.
@@ -697,30 +1114,7 @@ pub mod expander {
 
     #[cfg(windows)]
     fn clipboard_text() -> String {
-        use super::win32::*;
-        unsafe {
-            if OpenClipboard(None).is_err() {
-                return String::new();
-            }
-            let out = (|| {
-                const CF_UNICODETEXT: u32 = 13;
-                let handle = GetClipboardData(CF_UNICODETEXT).ok()?;
-                let hglobal = HGLOBAL(handle.0);
-                let ptr = GlobalLock(hglobal) as *const u16;
-                if ptr.is_null() {
-                    return None;
-                }
-                let mut len = 0usize;
-                while *ptr.add(len) != 0 && len < 100_000 {
-                    len += 1;
-                }
-                let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
-                let _ = GlobalUnlock(hglobal);
-                Some(text)
-            })();
-            let _ = CloseClipboard();
-            out.unwrap_or_default()
-        }
+        super::platform::clipboard_text()
     }
 
     #[cfg(not(windows))]
@@ -813,13 +1207,16 @@ pub mod expander {
         // Never while the application is doing its own thing: expanding into a
         // recording writes the expansion into the macro, and expanding during
         // playback fights with it.
+        // Recording swallows the expander whole: the keystrokes would go into the
+        // macro and the expansion with them. Playback only rules out the entries that
+        // type, which is what leaves `;stop` able to stop it.
+        let mut allow_text = true;
         if let Some(st) = super::GLOBAL_STATE.get() {
-            if st.recording.load(Ordering::Relaxed)
-                || st.playing.load(Ordering::Relaxed)
-            {
+            if st.recording.load(Ordering::Relaxed) {
                 reset();
                 return;
             }
+            allow_text = !st.playing.load(Ordering::Relaxed);
         }
         let book = BOOK.lock().clone();
         if !book.enabled || book.entries.is_empty() {
@@ -896,7 +1293,7 @@ pub mod expander {
             }
             let text = String::from_utf16_lossy(&out[..n as usize]);
             for c in text.chars() {
-                feed(&book, c);
+                feed(&book, c, allow_text);
             }
         }
     }
@@ -905,7 +1302,7 @@ pub mod expander {
     pub fn on_key(_vk: u16, _scan: u16, _down: bool) {}
 
     /// Adds one character and fires if it completed an abbreviation.
-    fn feed(book: &Book, raw: char) {
+    fn feed(book: &Book, raw: char, allow_text: bool) {
         let c = match raw {
             '\r' => '\n',
             '\u{8}' => {
@@ -925,7 +1322,7 @@ pub mod expander {
                 let cut = buf.len() - BUF_MAX;
                 buf.drain(..cut);
             }
-            match match_at(book, &buf, c) {
+            match match_at(book, &buf, c, allow_text) {
                 Some(f) => {
                     buf.clear();
                     Some(f)
@@ -982,6 +1379,10 @@ pub mod expander {
         for _ in 0..f.backspaces {
             tap(0x08);
         }
+        if f.action != Action::Text {
+            run_action(f);
+            return;
+        }
         // Everything after the cursor marker has to be walked back over at the end.
         let mut after_cursor: Option<usize> = None;
         let plain: Option<&str> = match f.segments.as_slice() {
@@ -1026,6 +1427,33 @@ pub mod expander {
 
     #[cfg(not(windows))]
     fn deliver(_f: &Fire) {}
+
+    /// Carries out a command entry. On the worker thread, never in the hook.
+    fn run_action(f: &Fire) {
+        let Some(state) = super::GLOBAL_STATE.get() else {
+            return;
+        };
+        match f.action {
+            Action::StopAll => super::stop_everything(state),
+            Action::RunProgram => super::run_program(f.payload.trim(), ""),
+            Action::PlayMacro => {
+                let path = f.payload.trim();
+                if !path.is_empty() {
+                    // A named file makes the abbreviation a launcher rather than a
+                    // second Play button.
+                    match super::load_macro(std::path::Path::new(path)) {
+                        Ok(data) => *state.macro_data.lock() = data,
+                        Err(e) => {
+                            tracing::warn!("expander could not load {path}: {e}");
+                            return;
+                        }
+                    }
+                }
+                super::start_playback(state);
+            }
+            Action::Text => {}
+        }
+    }
 
     #[cfg(windows)]
     fn tap(vk: u16) {
@@ -1115,30 +1543,8 @@ pub mod expander {
     }
 
     #[cfg(windows)]
-    unsafe fn set_clipboard_text(text: &str) -> bool {
-        use super::win32::*;
-        unsafe {
-            let mut wide: Vec<u16> = text.encode_utf16().collect();
-            wide.push(0);
-            let bytes = wide.len() * 2;
-            let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
-                return false;
-            };
-            let ptr = GlobalLock(h) as *mut u16;
-            if ptr.is_null() {
-                return false;
-            }
-            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
-            let _ = GlobalUnlock(h);
-            if OpenClipboard(None).is_err() {
-                return false;
-            }
-            let _ = EmptyClipboard();
-            const CF_UNICODETEXT: u32 = 13;
-            let ok = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))).is_ok();
-            let _ = CloseClipboard();
-            ok
-        }
+    fn set_clipboard_text(text: &str) -> bool {
+        super::platform::set_clipboard_text(text)
     }
 }
 
@@ -1569,6 +1975,23 @@ pub struct AppConfig {
 
     // recording
     pub capture_mouse_moves: bool,
+    /// Desktop Duplication rather than GDI for every screen grab. On by default;
+    /// it falls back on its own where it cannot run, so the switch is here for the
+    /// machine where it runs badly rather than not at all.
+    #[serde(default = "yes")]
+    pub fast_capture: bool,
+    /// Keep a small square of the screen around every click while recording, so the
+    /// recording can be turned into steps that look for the button.
+    #[serde(default)]
+    pub record_click_shots: bool,
+    /// The side of that square, in pixels.
+    #[serde(default = "shot_size_default")]
+    pub click_shot_size: u32,
+    /// What the generated `Click image` steps do when the picture is not there.
+    /// Not `Continue`: a step this program wrote, that cannot find the button it
+    /// was cut from, has nothing useful to do next.
+    #[serde(default = "shot_miss_default")]
+    pub click_shot_miss: OnMiss,
     pub mouse_sample_ms: u64,
     pub record_window_anchor: bool,
 
@@ -1623,6 +2046,10 @@ pub struct AppConfig {
     pub img_ry: i32,
     pub img_rw: i32,
     pub img_rh: i32,
+    /// Draw a see-through window over everything showing what the script just
+    /// looked at. Off by default: it is a diagnostic, not a feature to leave on.
+    #[serde(default)]
+    pub debug_overlay: bool,
 }
 
 impl Default for AppConfig {
@@ -1654,6 +2081,10 @@ impl Default for AppConfig {
             perf_enabled: false,
 
             capture_mouse_moves: true,
+            fast_capture: true,
+            record_click_shots: false,
+            click_shot_size: 64,
+            click_shot_miss: OnMiss::Stop,
             mouse_sample_ms: 5,
             record_window_anchor: false,
 
@@ -1699,6 +2130,7 @@ impl Default for AppConfig {
             img_ry: 0,
             img_rw: 800,
             img_rh: 600,
+            debug_overlay: false,
         }
     }
 }
@@ -1834,6 +2266,40 @@ pub struct MacroEvent {
     pub kind: InputEventKind,
 }
 
+/// A square of screen kept from around one recorded click.
+///
+/// The missing half of recording. A recording is a list of coordinates, and
+/// coordinates are the brittle part: the window moves, the resolution changes, the
+/// list opens one row lower, and every click lands somewhere it should not. The
+/// cure has been in the program since 1.2 - a `Click image` step finds the button
+/// wherever it is - but it had to be built by hand afterwards, from screenshots
+/// taken separately, by somebody who remembered which button each click was for.
+///
+/// The one moment that information exists for free is the moment of the click. So
+/// it is taken then, and the offer to use it is made when the recording stops.
+#[derive(Clone)]
+pub struct ClickShot {
+    /// Where this click landed in `events`.
+    pub index: usize,
+    pub button: MouseButton,
+    /// Screen coordinates of the click itself.
+    pub x: i32,
+    pub y: i32,
+    /// Top-left of the square, so the click's offset inside it is recoverable.
+    pub left: i32,
+    pub top: i32,
+    pub w: u32,
+    pub h: u32,
+    /// RGBA, opaque - ready to be a PNG without further thought.
+    pub rgba: Vec<u8>,
+    /// The scale the square was cut at, for the sidecar.
+    pub dpi: u32,
+}
+
+/// A recording of a hundred clicks holds 100 x 64 x 64 x 4 = 1.6 MB of squares.
+/// Ten times that is still small, and past it the offer stops being useful anyway.
+const MAX_CLICK_SHOTS: usize = 1000;
+
 /// Position of the window that was in the foreground when recording started.
 ///
 /// Lets playback re-anchor absolute coordinates if that window has since moved.
@@ -1858,6 +2324,9 @@ pub enum Cmp {
     Le,
     Gt,
     Ge,
+    /// Text containment, the one comparison that only makes sense once a variable
+    /// can hold text. Forgiving in the same way screen-text matching is.
+    Has,
 }
 
 impl Cmp {
@@ -1869,8 +2338,39 @@ impl Cmp {
             Cmp::Le => a <= b,
             Cmp::Gt => a > b,
             Cmp::Ge => a >= b,
+            // Numbers do not contain one another. Whoever asked for this meant the
+            // text, so the text is what answers.
+            Cmp::Has => Value::Num(a).as_text().contains(&Value::Num(b).as_text()),
         }
     }
+
+    /// The comparison a script actually asks for, once a variable can hold text.
+    ///
+    /// Two things that both read as numbers are compared as numbers, whichever kind
+    /// they are stored as: a count read off the screen into text and then compared
+    /// against 10 has to work. Anything else is compared as text, trimmed and with
+    /// case ignored, because screen text is never exactly what a human reads.
+    fn test_values(self, a: &Value, b: &Value) -> bool {
+        if self == Cmp::Has {
+            let (x, y) = (a.as_text(), b.as_text());
+            return crate::ocr::text_matches(&x, &y);
+        }
+        if let (Some(x), Some(y)) = (a.numeric(), b.numeric()) {
+            return self.test(x, y);
+        }
+        let (x, y) = (a.as_text(), b.as_text());
+        let (x, y) = (x.trim().to_lowercase(), y.trim().to_lowercase());
+        match self {
+            Cmp::Eq => x == y,
+            Cmp::Ne => x != y,
+            Cmp::Lt => x < y,
+            Cmp::Le => x <= y,
+            Cmp::Gt => x > y,
+            Cmp::Ge => x >= y,
+            Cmp::Has => x.contains(&y),
+        }
+    }
+
     fn symbol(self) -> &'static str {
         match self {
             Cmp::Eq => "==",
@@ -1879,9 +2379,123 @@ impl Cmp {
             Cmp::Le => "<=",
             Cmp::Gt => ">",
             Cmp::Ge => ">=",
+            Cmp::Has => "has",
         }
     }
-    const ALL: [Cmp; 6] = [Cmp::Eq, Cmp::Ne, Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge];
+    const ALL: [Cmp; 7] =
+        [Cmp::Eq, Cmp::Ne, Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge, Cmp::Has];
+}
+
+/// What a script variable holds.
+///
+/// Numbers only, until now. That made the three most useful things on a screen -
+/// what the text recognition read, what the window is called, what is on the
+/// clipboard - impossible to keep hold of. One more kind covers all three. It stops
+/// there deliberately: lists, tables and functions would turn the step list into a
+/// programming language, and a programming language cannot be edited with a mouse.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Value {
+    Num(f64),
+    Str(String),
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Value::Num(0.0)
+    }
+}
+
+impl Value {
+    /// The number this holds, if it holds one. Text that reads as a number counts:
+    /// a variable filled from the screen should not need converting before it can
+    /// be compared against a count.
+    pub fn numeric(&self) -> Option<f64> {
+        match self {
+            Value::Num(n) => Some(*n),
+            Value::Str(s) => {
+                let t = s.trim();
+                if t.is_empty() { None } else { t.parse::<f64>().ok() }
+            }
+        }
+    }
+
+    /// The number, with anything unreadable counting as zero. What every step that
+    /// wants a coordinate or a count uses.
+    pub fn as_num(&self) -> f64 {
+        self.numeric().unwrap_or(0.0)
+    }
+
+    pub fn as_text(&self) -> String {
+        match self {
+            // Whole numbers print without a tail: a count that shows as `7.0` in a
+            // log or a clipboard is noise.
+            Value::Num(n) => {
+                if n.fract() == 0.0 && n.abs() < 1e15 {
+                    format!("{n:.0}")
+                } else {
+                    format!("{n}")
+                }
+            }
+            Value::Str(s) => s.clone(),
+        }
+    }
+
+    pub fn is_text(&self) -> bool {
+        matches!(self, Value::Str(_))
+    }
+}
+
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_text())
+    }
+}
+
+/// Replaces `{name}` with what the variable holds.
+///
+/// `{{` is a literal brace, and a name nobody set is left exactly as written rather
+/// than becoming an empty string - a step whose text silently loses a word is much
+/// harder to diagnose than one that shows the placeholder it could not fill.
+fn expand_vars(text: &str, vars: &std::collections::HashMap<String, Value>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        // Both braces, because a doubled one of either kind is a literal, the same
+        // rule Rust's own format strings use.
+        let Some(at) = rest.find(['{', '}']) else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        if rest.starts_with("{{") || rest.starts_with("}}") {
+            out.push_str(&rest[..1]);
+            rest = &rest[2..];
+            continue;
+        }
+        if rest.starts_with('}') {
+            // A closing brace with nothing open is just a brace.
+            out.push('}');
+            rest = &rest[1..];
+            continue;
+        }
+        match rest.find('}') {
+            Some(end) => {
+                let name = &rest[1..end];
+                match vars.get(name) {
+                    Some(v) => out.push_str(&v.as_text()),
+                    None => out.push_str(&rest[..=end]),
+                }
+                rest = &rest[end + 1..];
+            }
+            // An unclosed brace is text, not an error.
+            None => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1901,6 +2515,26 @@ impl VarOp {
             VarOp::Mul => cur * v,
         }
     }
+
+    /// The same, once either side can be text.
+    ///
+    /// Adding to text joins it, which is how a message is built up a piece at a
+    /// time. Taking away from it or multiplying it is meaningless, so those read
+    /// both sides as numbers and answer with a number.
+    fn apply_values(self, cur: &Value, v: &Value) -> Value {
+        if self == VarOp::Set {
+            return v.clone();
+        }
+        if self == VarOp::Add && (cur.is_text() || v.is_text()) {
+            let joined = match (cur.numeric(), v.numeric()) {
+                // Two numbers written as text are still two numbers.
+                (Some(a), Some(b)) => return Value::Num(a + b),
+                _ => format!("{}{}", cur.as_text(), v.as_text()),
+            };
+            return Value::Str(joined);
+        }
+        Value::Num(self.apply(cur.as_num(), v.as_num()))
+    }
     fn symbol(self) -> &'static str {
         match self {
             VarOp::Set => "=",
@@ -1912,17 +2546,370 @@ impl VarOp {
     const ALL: [VarOp; 4] = [VarOp::Set, VarOp::Add, VarOp::Sub, VarOp::Mul];
 }
 
+/// Is the picture there, given what we decided last time?
+///
+/// One threshold makes a wobbling score flip between found and lost several times a
+/// second: 79, 81, 79, 82 around a threshold of 80 reads as four state changes and a
+/// script that acts on each of them. Two thresholds - one to appear, a lower one to
+/// disappear - turn that into one state change, which is what a Schmitt trigger is for
+/// and what every noisy sensor since has needed.
+fn match_decision(score: f64, appear_at: f64, lose_at: f64, was_present: bool) -> bool {
+    // A `lose_at` of zero, or one that is not actually lower, means the caller wants
+    // the old all-or-nothing behaviour.
+    let lo = if lose_at > 0.0 && lose_at < appear_at { lose_at } else { appear_at };
+    if was_present { score >= lo } else { score >= appear_at }
+}
+
+/// Folds one observation into a rolling history and answers "N of the last M".
+///
+/// A single frame is not evidence. A score of 83, then 51, then 74 is noise finding
+/// something briefly plausible; 82, 84, 83 is an object. `within` is capped at 32
+/// because the history is a bitmask, which is enough for several seconds of looking.
+fn stable_enough(history: &mut u32, raw: bool, of: u32, within: u32) -> bool {
+    let m = within.clamp(1, 32);
+    *history = (*history << 1) | u32::from(raw);
+    if of <= 1 && m <= 1 {
+        return raw;
+    }
+    let mask = if m >= 32 { u32::MAX } else { (1u32 << m) - 1 };
+    (*history & mask).count_ones() >= of.clamp(1, m)
+}
+
+/// Where a piece of text comes from.
+///
+/// The three that are not a file are the reason variables learnt to hold text at
+/// all: what the window is called, what is running, and what was last copied.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub enum TextSource {
+    #[default]
+    Clipboard,
+    /// Title of the window in front.
+    WindowTitle,
+    /// Executable name of the window in front, such as `RobloxPlayerBeta.exe`.
+    ProcessName,
+    /// A file, read as text. Capped, because a script should not be able to pull a
+    /// gigabyte into a variable by naming the wrong path.
+    File(String),
+}
+
+impl TextSource {
+    pub fn index(&self) -> usize {
+        match self {
+            TextSource::Clipboard => 0,
+            TextSource::WindowTitle => 1,
+            TextSource::ProcessName => 2,
+            TextSource::File(_) => 3,
+        }
+    }
+    pub fn from_index(i: usize) -> Self {
+        match i {
+            1 => TextSource::WindowTitle,
+            2 => TextSource::ProcessName,
+            3 => TextSource::File(String::new()),
+            _ => TextSource::Clipboard,
+        }
+    }
+}
+
+/// Where a piece of text goes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub enum TextSink {
+    #[default]
+    Clipboard,
+    File {
+        path: String,
+        /// Add to the end rather than replace. A log wants this; a hand-off file
+        /// does not.
+        append: bool,
+    },
+}
+
+impl TextSink {
+    pub fn index(&self) -> usize {
+        match self {
+            TextSink::Clipboard => 0,
+            TextSink::File { .. } => 1,
+        }
+    }
+    pub fn from_index(i: usize) -> Self {
+        match i {
+            1 => TextSink::File { path: String::new(), append: false },
+            _ => TextSink::Clipboard,
+        }
+    }
+}
+
+/// Most a file read into a variable is allowed to be.
+const TEXT_FILE_CAP: u64 = 1 << 20;
+
+/// Serde default for a flag that is on unless a file says otherwise.
+fn yes_bool() -> bool {
+    true
+}
+
+/// What the debug overlay draws, written by whatever last looked at the screen.
+///
+/// A global rather than something threaded through the engine: the looking happens
+/// on the playback thread and the drawing on the UI thread, and the only thing the
+/// two need to agree about is a few rectangles.
+#[derive(Clone, Debug, Default)]
+pub struct Sighting {
+    /// Where the search was allowed to look.
+    pub area: Option<(i32, i32, i32, i32)>,
+    /// Where it found something, and how sure it was.
+    pub hit: Option<(i32, i32, i32, i32, f32)>,
+    /// The rectangle text was last read from.
+    pub text: Option<(i32, i32, i32, i32)>,
+    /// The element UI Automation last returned.
+    pub element: Option<(i32, i32, i32, i32)>,
+    /// One line: what was looked for and what came back.
+    pub note: String,
+    /// Bumped on every write. The overlay redraws when this changes and not
+    /// otherwise: a layered window repainted ten times a second for no reason is a
+    /// visible flicker and a pointless slice of a core.
+    pub seq: u64,
+}
+
+static SIGHTING: Mutex<Sighting> = Mutex::new(Sighting {
+    area: None,
+    hit: None,
+    text: None,
+    element: None,
+    note: String::new(),
+    seq: 0,
+});
+
+/// What the variables window shows, written by the interpreter before each step.
+///
+/// The other half of the overlay. The overlay says where the script is looking;
+/// this says what it has found out so far, which is the half you need when the
+/// script is looking in the right place and still doing the wrong thing.
+#[derive(Clone, Debug, Default)]
+pub struct ScriptView {
+    /// Every variable, sorted, already rendered to text. Sorted here rather than in
+    /// the window so the rows do not dance about between frames.
+    pub vars: Vec<(String, String)>,
+    /// Which step is about to run, and how it reads.
+    pub pc: usize,
+    pub step: String,
+    /// How many `Call` steps deep this is.
+    pub depth: u32,
+    /// True while the interpreter is parked waiting for "next step".
+    pub waiting: bool,
+    pub running: bool,
+    pub seq: u64,
+}
+
+static SCRIPT_VIEW: Mutex<Option<ScriptView>> = Mutex::new(None);
+
+/// Off unless the variables window is open. A run nobody is watching pays one
+/// relaxed load per step for this.
+static WATCHING_VARS: AtomicBool = AtomicBool::new(false);
+
+pub fn watching_vars() -> bool {
+    WATCHING_VARS.load(Ordering::Relaxed)
+}
+
+pub fn set_watching_vars(on: bool) {
+    WATCHING_VARS.store(on, Ordering::Relaxed);
+    if !on {
+        *SCRIPT_VIEW.lock() = None;
+    }
+}
+
+pub fn script_view() -> Option<ScriptView> {
+    SCRIPT_VIEW.lock().clone()
+}
+
+fn note_script_view(f: impl FnOnce(&mut ScriptView)) {
+    if !watching_vars() {
+        return;
+    }
+    let mut slot = SCRIPT_VIEW.lock();
+    let v = slot.get_or_insert_with(ScriptView::default);
+    f(v);
+    v.seq = v.seq.wrapping_add(1);
+}
+
+/// Off unless the overlay window is open. Every write below is behind this, so a
+/// script that is not being watched pays one relaxed load per look.
+static WATCHING: AtomicBool = AtomicBool::new(false);
+
+pub fn watching() -> bool {
+    WATCHING.load(Ordering::Relaxed)
+}
+
+/// Records what was just looked at, if anybody is watching.
+fn note_sighting(f: impl FnOnce(&mut Sighting)) {
+    if !watching() {
+        return;
+    }
+    let mut s = SIGHTING.lock();
+    f(&mut s);
+    s.seq = s.seq.wrapping_add(1);
+}
+
 /// Something the script can ask about the screen or about itself.
+/// Where on the screen an image step is allowed to look.
+///
+/// Measured on a 2560x1440 desktop, one full-screen step costs 111 ms - 43 to copy the
+/// screen and 68 to sweep it - which caps a polling loop at about nine looks a second.
+/// A few hundred pixels square costs closer to twelve. Nothing else in this release
+/// buys as much.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub enum SearchArea {
+    /// Everything, across every monitor. Correct, and the slowest thing here.
+    #[default]
+    FullScreen,
+    /// Whatever window is in front right now.
+    ActiveWindow,
+    Rect { x: i32, y: i32, w: i32, h: i32 },
+    /// Around where this same template was last seen, which for anything that stays
+    /// put is a few hundred pixels rather than four million.
+    NearLast { margin: i32 },
+    /// Find another picture first, then look in a rectangle placed relative to
+    /// where that one landed.
+    ///
+    /// This is what a threshold cannot do. A row of identical buttons is identical;
+    /// which one to press is decided by the heading above it, and an anchor is how
+    /// a script says so. Two searches instead of one, and usually faster anyway,
+    /// because the second is confined to a few hundred pixels.
+    NearAnchor {
+        anchor: String,
+        /// Where the rectangle sits relative to the centre of the anchor.
+        dx: i32,
+        dy: i32,
+        w: i32,
+        h: i32,
+    },
+}
+
+/// What a step that did not find what it was looking for should do about it.
+///
+/// Until 1.5.0 there was only the first of these, and it was not a choice anybody
+/// had made - a `Click image` whose picture was not on screen did nothing at all
+/// and the script walked on to the next step. That is right for a poll inside a
+/// `While` and wrong for everything else, and the difference between the two is a
+/// macro that stops when the game logs you out and one that clicks at an empty
+/// desktop until morning.
+///
+/// `Continue` stays the default so that every macro written before this release
+/// behaves exactly as it did.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum OnMiss {
+    /// Walk on to the next step. What every version before 1.5.0 did, always.
+    #[default]
+    Continue,
+    /// End the run. The whole point of the field: a night macro that has lost its
+    /// footing should stop, not keep going.
+    Stop,
+    /// Leave the innermost `While`, exactly as a `Break` step would. For a loop
+    /// that is looking for one of several things.
+    Break,
+    /// Look again, up to `times` more times, `delay_ms` apart - and stop the run if
+    /// it is still not there.
+    ///
+    /// The stop at the end is deliberate and is the reason this is not spelled
+    /// "retry, then carry on". A retry that gives up quietly is the trap this whole
+    /// enum exists to close; somebody who wants that can set `Continue` and put the
+    /// step in a loop, which says so.
+    Retry { times: u32, delay_ms: u64 },
+}
+
+impl OnMiss {
+    const COUNT: usize = 4;
+
+    fn index(&self) -> usize {
+        match self {
+            OnMiss::Continue => 0,
+            OnMiss::Stop => 1,
+            OnMiss::Break => 2,
+            OnMiss::Retry { .. } => 3,
+        }
+    }
+
+    fn from_index(i: usize) -> Self {
+        match i {
+            1 => OnMiss::Stop,
+            2 => OnMiss::Break,
+            3 => OnMiss::Retry { times: 3, delay_ms: 500 },
+            _ => OnMiss::Continue,
+        }
+    }
+
+    fn name(&self, s: &Strings) -> &'static str {
+        match self {
+            OnMiss::Continue => s.m_continue,
+            OnMiss::Stop => s.m_stop,
+            OnMiss::Break => s.m_break,
+            OnMiss::Retry { .. } => s.m_retry,
+        }
+    }
+
+    /// How many extra looks this policy asks for.
+    fn retries(&self) -> (u32, u64) {
+        match self {
+            OnMiss::Retry { times, delay_ms } => (*times, *delay_ms),
+            _ => (0, 0),
+        }
+    }
+}
+
+/// A step that looks for something always carries one of these, and it is always
+/// `Continue` unless somebody said otherwise.
+fn miss_default() -> OnMiss {
+    OnMiss::Continue
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Condition {
     Always,
-    Var { name: String, cmp: Cmp, value: f64 },
+    Var { name: String, cmp: Cmp, value: Value },
     /// A template from the `templates/` folder is on screen.
-    Image { template: String, threshold: f64 },
+    Image {
+        template: String,
+        threshold: f64,
+        #[serde(default)]
+        area: SearchArea,
+        /// Confidence at which a picture already found counts as gone. Zero, or
+        /// anything not below `threshold`, keeps the single-threshold behaviour.
+        #[serde(default)]
+        lose_at: f64,
+        /// Require the match in `stable_of` of the last `stable_in` looks. Both at
+        /// zero or one means every look decides on its own.
+        #[serde(default)]
+        stable_of: u32,
+        #[serde(default)]
+        stable_in: u32,
+        /// Match outlines instead of greys. Survives a theme change and a
+        /// highlight; costs one extra pass over each plane.
+        #[serde(default)]
+        edge: bool,
+    },
     Pixel { x: i32, y: i32, r: u8, g: u8, b: u8, tol: u32 },
     Window { title: String },
+    /// An interface element Windows knows about is there.
+    ///
+    /// The first rung of the cascade: ask the application what is on screen before
+    /// resorting to looking at the pixels. Silent in anything that draws its own
+    /// interface, which includes every game engine, so a script that has to work
+    /// there falls through to the picture search below.
+    Element { query: uia::Query },
+    /// A process with this name is running. The name is matched without its path
+    /// and without case, so `roblox` finds `RobloxPlayerBeta.exe`.
+    Process { name: String },
     /// Text recognised inside a screen rectangle contains `needle`.
-    Text { x: i32, y: i32, w: i32, h: i32, needle: String },
+    Text {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        needle: String,
+        /// What is done to the pixels first. Absent in every file written before
+        /// 1.4.0, which is exactly the old behaviour.
+        #[serde(default)]
+        prep: ocr::Prep,
+    },
 }
 
 impl Condition {
@@ -1934,15 +2921,38 @@ impl Condition {
             Condition::Pixel { .. } => 3,
             Condition::Window { .. } => 4,
             Condition::Text { .. } => 5,
+            Condition::Process { .. } => 6,
+            Condition::Element { .. } => 7,
         }
     }
     fn from_index(i: usize) -> Self {
         match i {
-            1 => Condition::Var { name: "count".into(), cmp: Cmp::Lt, value: 10.0 },
-            2 => Condition::Image { template: String::new(), threshold: 0.85 },
+            1 => Condition::Var {
+                name: "count".into(),
+                cmp: Cmp::Lt,
+                value: Value::Num(10.0),
+            },
+            2 => Condition::Image {
+                template: String::new(),
+                threshold: 0.85,
+                area: SearchArea::default(),
+                lose_at: 0.0,
+                stable_of: 0,
+                stable_in: 0,
+                edge: false,
+            },
             3 => Condition::Pixel { x: 0, y: 0, r: 255, g: 0, b: 0, tol: 20 },
             4 => Condition::Window { title: String::new() },
-            5 => Condition::Text { x: 0, y: 0, w: 400, h: 120, needle: String::new() },
+            5 => Condition::Text {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 120,
+                needle: String::new(),
+                prep: ocr::Prep::default(),
+            },
+            6 => Condition::Process { name: String::new() },
+            7 => Condition::Element { query: uia::Query::default() },
             _ => Condition::Always,
         }
     }
@@ -1954,11 +2964,42 @@ pub enum StepKind {
     PlayEvents { from: usize, to: usize },
     Wait { ms: u64 },
     /// Blocks until a condition becomes true (or false, when `appear` is off).
-    WaitFor { cond: Condition, appear: bool, timeout_ms: u64 },
-    ClickImage { template: String, threshold: f64, button: MouseButton },
+    WaitFor {
+        cond: Condition,
+        appear: bool,
+        timeout_ms: u64,
+        /// What a timeout means. A wait that gives up used to be indistinguishable
+        /// from a wait that succeeded, which is the quietest failure in the program.
+        #[serde(default = "miss_default")]
+        miss: OnMiss,
+    },
+    ClickImage {
+        template: String,
+        threshold: f64,
+        button: MouseButton,
+        #[serde(default)]
+        area: SearchArea,
+        #[serde(default)]
+        edge: bool,
+        #[serde(default = "miss_default")]
+        miss: OnMiss,
+    },
+    /// Looks for a picture and writes what it found into variables, without clicking.
+    FindImage {
+        template: String,
+        threshold: f64,
+        #[serde(default)]
+        area: SearchArea,
+        /// Prefix for the results: `<var>.found`, `.x`, `.y`, `.w`, `.h`, `.score`.
+        var: String,
+        #[serde(default)]
+        edge: bool,
+        #[serde(default = "miss_default")]
+        miss: OnMiss,
+    },
     Click { x: i32, y: i32, button: MouseButton },
     Key { vk: u16, down: bool },
-    SetVar { name: String, op: VarOp, value: f64 },
+    SetVar { name: String, op: VarOp, value: Value },
     If { cond: Condition },
     Else,
     EndIf,
@@ -1968,13 +3009,88 @@ pub enum StepKind {
     Run { path: String, args: String },
     Exit,
     Log { text: String },
-    /// Recognises a screen rectangle and stores the first number it finds.
-    ReadNumber { x: i32, y: i32, w: i32, h: i32, var: String },
+    /// Finds an interface element and writes what it found into variables.
+    FindElement {
+        query: uia::Query,
+        /// Prefix for the results: `<var>` itself is the text, and `<var>.found`,
+        /// `.x`, `.y`, `.w`, `.h`, `.name` carry the rest.
+        var: String,
+        /// How long to keep looking. An interface that is still drawing itself is
+        /// the normal case just after a click.
+        #[serde(default)]
+        timeout_ms: u64,
+        #[serde(default = "miss_default")]
+        miss: OnMiss,
+    },
+    /// Presses an interface element.
+    ClickElement {
+        query: uia::Query,
+        button: MouseButton,
+        /// Ask the application to press it rather than clicking at it. Nothing
+        /// moves on screen, the window need not even be in front, and a control
+        /// that has shifted since it was found is still the one that is pressed.
+        #[serde(default = "yes_bool")]
+        invoke: bool,
+        #[serde(default)]
+        timeout_ms: u64,
+        #[serde(default = "miss_default")]
+        miss: OnMiss,
+    },
+    /// Recognises a screen rectangle and stores what it says, as text.
+    ReadText {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        var: String,
+        #[serde(default)]
+        prep: ocr::Prep,
+    },
+    /// Puts the clipboard, a window title, a process name or a file into a variable.
+    GetText { source: TextSource, var: String },
+    /// Sends text - with `{name}` filled in from the variables - to the clipboard or
+    /// to a file.
+    PutText { sink: TextSink, text: String },
+    /// Runs another macro file's script here, then carries on.
+    ///
+    /// The reuse that people ask for when they ask for functions, without becoming
+    /// a language. A subroutine is an ordinary macro: it is edited in this same
+    /// editor, played on its own to test it, and shared between projects as a file.
+    /// There is no parameter list and no return value - the variables are the same
+    /// ones, so a caller sets `target` before the call and reads `result` after it,
+    /// which is what a list of steps can express without growing a grammar.
+    ///
+    /// Nesting is capped at `MAX_CALL_DEPTH`, which is what keeps a file that calls
+    /// itself from being a stack overflow.
+    Call {
+        /// A file name, resolved next to the macro that named it and then in the
+        /// data folder. `.json` is added when no extension is given.
+        path: String,
+        /// What a file that will not load means. The same four choices as a search
+        /// that found nothing, for the same reason.
+        #[serde(default = "miss_default")]
+        miss: OnMiss,
+    },
+    /// Recognises a screen rectangle and stores the number it finds.
+    ReadNumber {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        var: String,
+        #[serde(default)]
+        prep: ocr::Prep,
+        /// What the reading is supposed to look like. Wrong-shaped readings are
+        /// refused rather than turned into a number nobody asked for, and with
+        /// `Auto` this is also what picks the profile.
+        #[serde(default)]
+        expect: ocr::Expect,
+    },
 }
 
 impl StepKind {
     /// Order used by the "Add" menu and the kind picker.
-    const COUNT: usize = 17;
+    const COUNT: usize = 24;
 
     fn index(&self) -> usize {
         match self {
@@ -1995,6 +3111,13 @@ impl StepKind {
             StepKind::Exit => 14,
             StepKind::Log { .. } => 15,
             StepKind::ReadNumber { .. } => 16,
+            StepKind::FindImage { .. } => 17,
+            StepKind::ReadText { .. } => 18,
+            StepKind::GetText { .. } => 19,
+            StepKind::PutText { .. } => 20,
+            StepKind::FindElement { .. } => 21,
+            StepKind::ClickElement { .. } => 22,
+            StepKind::Call { .. } => 23,
         }
     }
 
@@ -2002,18 +3125,34 @@ impl StepKind {
         match i {
             1 => StepKind::Wait { ms: 1000 },
             2 => StepKind::WaitFor {
-                cond: Condition::Image { template: String::new(), threshold: 0.85 },
+                cond: Condition::Image {
+                    template: String::new(),
+                    threshold: 0.85,
+                    area: SearchArea::default(),
+                    lose_at: 0.0,
+                    stable_of: 0,
+                    stable_in: 0,
+                    edge: false,
+                },
                 appear: true,
                 timeout_ms: 10_000,
+                miss: OnMiss::Continue,
             },
             3 => StepKind::ClickImage {
                 template: String::new(),
                 threshold: 0.85,
                 button: MouseButton::Left,
+                area: SearchArea::default(),
+                edge: false,
+                miss: OnMiss::Continue,
             },
             4 => StepKind::Click { x: 0, y: 0, button: MouseButton::Left },
             5 => StepKind::Key { vk: 0x20, down: true },
-            6 => StepKind::SetVar { name: "count".into(), op: VarOp::Add, value: 1.0 },
+            6 => StepKind::SetVar {
+                name: "count".into(),
+                op: VarOp::Add,
+                value: Value::Num(1.0),
+            },
             7 => StepKind::If { cond: Condition::Always },
             8 => StepKind::Else,
             9 => StepKind::EndIf,
@@ -2029,7 +3168,47 @@ impl StepKind {
                 w: 300,
                 h: 80,
                 var: "amount".into(),
+                prep: ocr::Prep::default(),
+                expect: ocr::Expect::default(),
             },
+            17 => StepKind::FindImage {
+                template: String::new(),
+                threshold: 0.85,
+                area: SearchArea::default(),
+                var: "target".into(),
+                edge: false,
+                miss: OnMiss::Continue,
+            },
+            18 => StepKind::ReadText {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 120,
+                var: "line".into(),
+                prep: ocr::Prep::default(),
+            },
+            19 => StepKind::GetText {
+                source: TextSource::default(),
+                var: "text".into(),
+            },
+            20 => StepKind::PutText {
+                sink: TextSink::default(),
+                text: "{text}".into(),
+            },
+            21 => StepKind::FindElement {
+                query: uia::Query::default(),
+                var: "elem".into(),
+                timeout_ms: 0,
+                miss: OnMiss::Continue,
+            },
+            22 => StepKind::ClickElement {
+                query: uia::Query::default(),
+                button: MouseButton::Left,
+                invoke: true,
+                timeout_ms: 2000,
+                miss: OnMiss::Continue,
+            },
+            23 => StepKind::Call { path: String::new(), miss: OnMiss::Stop },
             _ => StepKind::PlayEvents { from: 0, to: 0 },
         }
     }
@@ -2053,6 +3232,26 @@ impl StepKind {
             StepKind::Exit => s.k_exit,
             StepKind::Log { .. } => s.k_log,
             StepKind::ReadNumber { .. } => s.k_readnum,
+            StepKind::FindImage { .. } => s.k_findimg,
+            StepKind::ReadText { .. } => s.k_readtext,
+            StepKind::GetText { .. } => s.k_gettext,
+            StepKind::PutText { .. } => s.k_puttext,
+            StepKind::FindElement { .. } => s.k_findelem,
+            StepKind::ClickElement { .. } => s.k_clickelem,
+            StepKind::Call { .. } => s.k_call,
+        }
+    }
+
+    /// The policy this step carries, if it is one that can miss.
+    fn miss(&self) -> OnMiss {
+        match self {
+            StepKind::WaitFor { miss, .. }
+            | StepKind::ClickImage { miss, .. }
+            | StepKind::FindImage { miss, .. }
+            | StepKind::FindElement { miss, .. }
+            | StepKind::ClickElement { miss, .. }
+            | StepKind::Call { miss, .. } => *miss,
+            _ => OnMiss::Continue,
         }
     }
 }
@@ -2078,16 +3277,33 @@ fn describe_condition(c: &Condition, s: &Strings) -> String {
     match c {
         Condition::Always => s.c_always.to_string(),
         Condition::Var { name, cmp, value } => format!("{name} {} {value}", cmp.symbol()),
-        Condition::Image { template, threshold } => {
+        Condition::Image { template, threshold, .. } => {
             format!("{}: {template} ≥ {threshold:.2}", s.c_image)
         }
         Condition::Pixel { x, y, r, g, b, tol } => {
             format!("{}: ({x},{y}) = {r},{g},{b} ±{tol}", s.c_pixel)
         }
         Condition::Window { title } => format!("{}: {title}", s.c_window),
-        Condition::Text { x, y, w, h, needle } => {
+        Condition::Text { x, y, w, h, needle, .. } => {
             format!("{}: \"{needle}\" @ ({x},{y} {w}x{h})", s.c_text)
         }
+        Condition::Process { name } => format!("{}: {name}", s.c_process),
+        Condition::Element { query } => format!("{}: {}", s.c_element, describe_query(query)),
+    }
+}
+
+/// The tail a step's line gets when it will do something other than walk on.
+///
+/// Only shown when it is not the default: a list where every line ends in "carry
+/// on" says nothing, and a list where one line ends in "stop the script" says
+/// exactly where the run can end.
+fn describe_miss(kind: &StepKind, s: &Strings) -> String {
+    match kind.miss() {
+        OnMiss::Continue => String::new(),
+        OnMiss::Retry { times, delay_ms } => {
+            format!("  ⟲ {times}×{delay_ms}ms → {}", s.m_stop)
+        }
+        other => format!("  ⚠ {}", other.name(s)),
     }
 }
 
@@ -2099,13 +3315,20 @@ fn describe_step(step: &ScriptStep, s: &Strings, total_events: usize) -> String 
             format!("{name} {from}…{to}  ({covered}/{total_events})")
         }
         StepKind::Wait { ms } => format!("{name} {ms} ms"),
-        StepKind::WaitFor { cond, appear, timeout_ms } => format!(
-            "{name} {} {} ({timeout_ms} ms)",
+        StepKind::WaitFor { cond, appear, timeout_ms, .. } => format!(
+            "{name} {} {} ({timeout_ms} ms){}",
             describe_condition(cond, s),
-            if *appear { s.f_appear } else { s.f_gone }
+            if *appear { s.f_appear } else { s.f_gone },
+            describe_miss(&step.kind, s)
         ),
+        StepKind::FindImage { template, threshold, var, .. } => {
+            format!("{name} {template} ≥ {threshold:.2} → {var}{}", describe_miss(&step.kind, s))
+        }
         StepKind::ClickImage { template, threshold, .. } => {
-            format!("{name}: {template} ≥ {threshold:.2}")
+            format!("{name}: {template} ≥ {threshold:.2}{}", describe_miss(&step.kind, s))
+        }
+        StepKind::Call { path, .. } => {
+            format!("{name} {path}{}", describe_miss(&step.kind, s))
         }
         StepKind::Click { x, y, button } => format!("{name} ({x}, {y}) {button:?}"),
         StepKind::Key { vk, down } => {
@@ -2119,8 +3342,40 @@ fn describe_step(step: &ScriptStep, s: &Strings, total_events: usize) -> String 
         }
         StepKind::Run { path, args } => format!("{name} {path} {args}"),
         StepKind::Log { text } => format!("{name}: {text}"),
-        StepKind::ReadNumber { x, y, w, h, var } => {
+        StepKind::ReadNumber { x, y, w, h, var, .. } => {
             format!("{name} ({x},{y} {w}x{h}) → {var}")
+        }
+        StepKind::ReadText { x, y, w, h, var, .. } => {
+            format!("{name} ({x},{y} {w}x{h}) → {var}")
+        }
+        StepKind::FindElement { query, var, .. } => {
+            format!("{name}: {} → {var}{}", describe_query(query), describe_miss(&step.kind, s))
+        }
+        StepKind::ClickElement { query, invoke, .. } => {
+            format!(
+                "{name}: {}{}{}",
+                describe_query(query),
+                if *invoke { " ⚡" } else { "" },
+                describe_miss(&step.kind, s)
+            )
+        }
+        StepKind::GetText { source, var } => {
+            let from = match source {
+                TextSource::Clipboard => s.t_clipboard.to_string(),
+                TextSource::WindowTitle => s.t_wintitle.to_string(),
+                TextSource::ProcessName => s.t_process.to_string(),
+                TextSource::File(p) => p.clone(),
+            };
+            format!("{name}: {from} → {var}")
+        }
+        StepKind::PutText { sink, text } => {
+            let to = match sink {
+                TextSink::Clipboard => s.t_clipboard.to_string(),
+                TextSink::File { path, append } => {
+                    format!("{path}{}", if *append { " +" } else { "" })
+                }
+            };
+            format!("{name}: \"{text}\" → {to}")
         }
         _ => name.to_string(),
     }
@@ -2252,11 +3507,19 @@ pub struct MacroData {
     pub script: Vec<ScriptStep>,
     /// Starting values for the script's variables.
     #[serde(default)]
-    pub vars: std::collections::BTreeMap<String, f64>,
+    pub vars: std::collections::BTreeMap<String, Value>,
 }
 
 fn format_version() -> u32 {
     3
+}
+
+fn shot_size_default() -> u32 {
+    64
+}
+
+fn shot_miss_default() -> OnMiss {
+    OnMiss::Stop
 }
 
 impl MacroData {
@@ -2320,10 +3583,26 @@ fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(enc.finish()?)
 }
 
+/// The most a compressed macro is allowed to expand to.
+///
+/// Deflate reaches about 1000:1 on a repetitive stream, so a one-megabyte tail can
+/// ask for a gigabyte of memory. With `panic = "abort"` a failed allocation is not
+/// an error anybody handles - it is the process gone, mid-macro, with keys held.
+/// 512 MB is far beyond any real recording: the event cap is four million events,
+/// which is roughly 400 MB of JSON at its most verbose.
+const MAX_INFLATED: u64 = 512 * 1024 * 1024;
+
 fn gunzip(bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read as _;
     let mut out = Vec::new();
-    flate2::read::GzDecoder::new(bytes).read_to_end(&mut out)?;
+    // `take` rather than a check afterwards: the point is never to allocate the
+    // gigabyte, not to notice having done so.
+    let read = flate2::read::GzDecoder::new(bytes).take(MAX_INFLATED + 1);
+    let mut read = read;
+    read.read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_INFLATED {
+        anyhow::bail!("compressed data expands past {MAX_INFLATED} bytes - refusing it");
+    }
     Ok(out)
 }
 
@@ -2458,7 +3737,22 @@ fn one_f64() -> f64 {
     1.0
 }
 
+/// The largest appended payload that will be believed.
+///
+/// A macro is JSON and then gzip; 64 MB of that is a recording nobody has made.
+/// The number exists so that a length read out of a file cannot become the size of
+/// an allocation.
+const MAX_PAYLOAD: u64 = 64 * 1024 * 1024;
+
 /// Returns the offset where an appended payload starts, if this image has one.
+///
+/// Everything after the magic is attacker-controlled: this is the only place in the
+/// program that takes a length out of bytes it did not write and then acts on it,
+/// so the length is checked three ways before it is used. `16 + len` is a
+/// `checked_add` because in a release build - where overflow checks are off - a
+/// length of `u64::MAX - 15` wraps it to zero, and a `checked_sub` of zero
+/// succeeds. That was the hole: the subtraction looked careful and the addition
+/// underneath it was not.
 fn payload_offset(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < 16 {
         return None;
@@ -2469,9 +3763,13 @@ fn payload_offset(bytes: &[u8]) -> Option<usize> {
     }
     let mut len = [0u8; 8];
     len.copy_from_slice(&bytes[bytes.len() - 16..bytes.len() - 8]);
-    let len = u64::from_le_bytes(len) as usize;
-    let start = bytes.len().checked_sub(16 + len)?;
-    Some(start)
+    let len = u64::from_le_bytes(len);
+    if len > MAX_PAYLOAD {
+        return None;
+    }
+    let total = 16u64.checked_add(len)?;
+    let start = (bytes.len() as u64).checked_sub(total)?;
+    Some(start as usize)
 }
 
 /// Copies this executable and appends the macro, producing a standalone player.
@@ -2513,14 +3811,37 @@ fn read_self_payload() -> Option<Payload> {
         return None;
     }
     let len = u64::from_le_bytes(footer[..8].try_into().ok()?);
-    let start = size.checked_sub(16 + len)?;
+    // Three refusals before a single byte is allocated: a length larger than any
+    // real payload, a length whose footer arithmetic overflows, and a length that
+    // claims more bytes than the file holds. Only then is the read sized by it.
+    if len > MAX_PAYLOAD {
+        warn!("this executable's footer claims a {len}-byte payload - ignoring it");
+        return None;
+    }
+    let total = 16u64.checked_add(len)?;
+    let start = size.checked_sub(total)?;
 
     let mut blob = vec![0u8; len as usize];
     file.seek(SeekFrom::Start(start)).ok()?;
     file.read_exact(&mut blob).ok()?;
 
-    let json = gunzip(&blob).ok()?;
-    serde_json::from_slice::<Payload>(&json).ok()
+    let json = match gunzip(&blob) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("this executable's payload would not decompress: {e}");
+            return None;
+        }
+    };
+    // `normalize` is what caps the event count and rejects unbalanced blocks. It
+    // ran on files opened through the file dialog and never on this path, which
+    // meant the one input nobody chose was the one input nobody checked.
+    let mut payload = serde_json::from_slice::<Payload>(&json).ok()?;
+    if let Err(e) = payload.macro_data.normalize() {
+        warn!("this executable's payload is not a usable macro: {e}");
+        return None;
+    }
+    payload.speed = payload.speed.clamp(0.05, 10.0);
+    Some(payload)
 }
 
 // ============================================================================
@@ -2563,14 +3884,79 @@ impl EndAction {
 /// specific - search a screen buffer we already own, ignore transparent pixels,
 /// tolerate a slightly different size - and that is about 150 lines.
 pub mod vision {
-    /// A rectangle of screen pixels, RGBA, plus where it came from.
+    /// Which way round the three colour bytes of a pixel lie.
+    ///
+    /// The screen hands back BGRA and nothing downstream cares: the search reads a
+    /// brightness, and a brightness is the same number whichever end the red
+    /// coefficient is applied at. Carrying the order instead of rewriting fourteen
+    /// megabytes to hide it is what took the floor under a capture from 5.5 ms to
+    /// one `BitBlt`. Only the two places that genuinely need red first - saving a
+    /// PNG, and cutting a template - convert, and both are cold.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub enum Order {
+        /// Red, green, blue, alpha. What PNGs and templates hold.
+        #[default]
+        Rgba,
+        /// Blue, green, red, alpha. What GDI hands back.
+        Bgra,
+    }
+
+    impl Order {
+        /// Luma weights for byte 0, 1 and 2 in this order.
+        #[inline]
+        pub fn weights(self) -> (f32, f32, f32) {
+            match self {
+                Order::Rgba => (0.299, 0.587, 0.114),
+                Order::Bgra => (0.114, 0.587, 0.299),
+            }
+        }
+    }
+
+    /// A rectangle of screen pixels plus where it came from.
+    ///
+    /// `px` is four bytes a pixel in `order`. The alpha byte is whatever the source
+    /// left there - GDI leaves it at zero - and nothing that reads a `Frame` looks
+    /// at it: the search throws the haystack's mask away and keeps only the
+    /// template's. `to_rgba` is the one way out to a buffer that can be trusted.
     #[derive(Clone)]
     pub struct Frame {
         pub x: i32,
         pub y: i32,
         pub w: u32,
         pub h: u32,
-        pub rgba: Vec<u8>,
+        pub px: Vec<u8>,
+        pub order: Order,
+    }
+
+    impl Frame {
+        /// A frame that already holds red-first pixels.
+        pub fn rgba(x: i32, y: i32, w: u32, h: u32, px: Vec<u8>) -> Self {
+            Self { x, y, w, h, px, order: Order::Rgba }
+        }
+
+        /// True RGBA with an opaque alpha - what a PNG encoder and a template want.
+        ///
+        /// The only full pass over a captured buffer left in the program, and it
+        /// runs when a picture is saved rather than when one is looked for.
+        pub fn to_rgba(&self) -> Vec<u8> {
+            let mut out = self.px.clone();
+            let swap = self.order == Order::Bgra;
+            // One pass, not two. The alpha has to be written whatever the order -
+            // GDI leaves it at zero, and a template with a zero alpha is a template
+            // masked out of its own comparison.
+            for p in out.chunks_exact_mut(4) {
+                if swap {
+                    p.swap(0, 2);
+                }
+                p[3] = 255;
+            }
+            out
+        }
+
+        /// Cuts the whole frame out as a template.
+        pub fn as_template(&self, name: &str) -> Template {
+            Template { w: self.w, h: self.h, rgba: self.to_rgba(), name: name.to_string() }
+        }
     }
 
     /// A picture to look for, kept both as pixels and as a prepared grey plane.
@@ -2591,21 +3977,92 @@ pub mod vision {
         pub scale: f32,
     }
 
-    fn luma(rgba: &[u8], i: usize) -> f32 {
-        0.299 * rgba[i] as f32 + 0.587 * rgba[i + 1] as f32 + 0.114 * rgba[i + 2] as f32
+    fn luma(px: &[u8], i: usize, w: (f32, f32, f32)) -> f32 {
+        w.0 * px[i] as f32 + w.1 * px[i + 1] as f32 + w.2 * px[i + 2] as f32
     }
 
     /// Grey plane plus a mask: fully transparent pixels take no part in the score,
     /// which is what lets a non-rectangular icon be matched.
-    fn plane(rgba: &[u8], w: u32, h: u32) -> (Vec<f32>, Vec<bool>) {
+    ///
+    /// Scaled to 0..=1 rather than 0..=255. The correlation does not care - it is
+    /// invariant to both - but the one-pass form below subtracts a sum of squares
+    /// from a square of sums, and at 255 that subtraction throws away most of an
+    /// f32's precision on a large template.
+    fn plane(px: &[u8], w: u32, h: u32, order: Order) -> (Vec<f32>, Vec<bool>) {
         let n = (w * h) as usize;
         let mut g = vec![0.0; n];
         let mut m = vec![true; n];
+        let k = order.weights();
         for i in 0..n {
-            g[i] = luma(rgba, i * 4);
-            m[i] = rgba[i * 4 + 3] >= 16;
+            g[i] = luma(px, i * 4, k) * (1.0 / 255.0);
+            m[i] = px[i * 4 + 3] >= 16;
         }
         (g, m)
+    }
+
+    /// The grey plane only, for a haystack whose mask is thrown away anyway.
+    ///
+    /// Half the allocation and none of the alpha reads. A screen grab has no alpha
+    /// worth reading - GDI leaves it at zero - which is exactly why the search must
+    /// not consult it.
+    fn plane_grey(px: &[u8], w: u32, h: u32, order: Order) -> Vec<f32> {
+        let n = (w * h) as usize;
+        let mut g = vec![0.0; n];
+        let k = order.weights();
+        for i in 0..n {
+            g[i] = luma(px, i * 4, k) * (1.0 / 255.0);
+        }
+        g
+    }
+
+    /// Gradient magnitude, by the Sobel operator.
+    ///
+    /// What survives a change of theme: a button's outline sits in the same place
+    /// whether the panel behind it is light or dark, while its grey level does not.
+    /// Correlating the gradients instead of the greys is what makes a template cut
+    /// under one theme still match under another, and it is also what makes a
+    /// highlighted row match its unhighlighted self.
+    ///
+    /// The border replicates its neighbour rather than wrapping, so a template cut
+    /// tight against an edge still scores sensibly.
+    fn sobel(g: &[f32], w: u32, h: u32) -> Vec<f32> {
+        let n = (w as usize) * (h as usize);
+        let mut out = vec![0.0f32; n];
+        if w < 2 || h < 2 || g.len() < n {
+            return out;
+        }
+        let (wu, hu) = (w as usize, h as usize);
+        // The interior, where every neighbour exists. Two clamps per neighbour and
+        // eight neighbours per pixel is sixteen branches a pixel; over a 3.7
+        // megapixel screen that was most of the cost, and none of it was needed
+        // anywhere except the one-pixel border.
+        for y in 1..hu.saturating_sub(1) {
+            let (up, mid, dn) = ((y - 1) * wu, y * wu, (y + 1) * wu);
+            for x in 1..wu.saturating_sub(1) {
+                let (a, b, c) = (g[up + x - 1], g[up + x], g[up + x + 1]);
+                let (d, f) = (g[mid + x - 1], g[mid + x + 1]);
+                let (i, j, k) = (g[dn + x - 1], g[dn + x], g[dn + x + 1]);
+                let gx = (c + 2.0 * f + k) - (a + 2.0 * d + i);
+                let gy = (i + 2.0 * j + k) - (a + 2.0 * b + c);
+                out[mid + x] = (gx * gx + gy * gy).sqrt();
+            }
+        }
+        // The border replicates its neighbour rather than wrapping, so a template
+        // cut tight against an edge still scores sensibly. Copied from the ring
+        // inside it, which is what clamping would have produced anyway.
+        if wu >= 3 && hu >= 3 {
+            for x in 0..wu {
+                let sx = x.clamp(1, wu - 2);
+                out[x] = out[wu + sx];
+                out[(hu - 1) * wu + x] = out[(hu - 2) * wu + sx];
+            }
+            for y in 0..hu {
+                let sy = y.clamp(1, hu - 2);
+                out[y * wu] = out[sy * wu + 1];
+                out[y * wu + wu - 1] = out[sy * wu + wu - 2];
+            }
+        }
+        out
     }
 
     /// Nearest-neighbour box shrink. Good enough: the coarse pass only has to get
@@ -2662,7 +4119,7 @@ pub mod vision {
     }
 
     /// Resamples a template to a different size, nearest neighbour.
-    fn resize_rgba(rgba: &[u8], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u8> {
+    pub fn resize_rgba(rgba: &[u8], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u8> {
         let mut out = vec![0u8; (nw * nh * 4) as usize];
         for y in 0..nh {
             let sy = (y * h / nh).min(h - 1);
@@ -2676,67 +4133,286 @@ pub mod vision {
         out
     }
 
-    /// Correlation of one template placed at (ox, oy) in the haystack.
+    /// A template ready to be correlated: its mean already taken out, its own
+    /// variance already known.
+    ///
+    /// Both are the same at every position the window can land in, and the old code
+    /// worked them out again for each one - a second full pass over the template for
+    /// every pixel of the screen. Taking them out of the loop is most of the speed
+    /// here; the vector kernel below is the rest.
+    struct Prepared {
+        /// The template minus its mean, and zero wherever the mask says to ignore.
+        /// Because it sums to zero, the window's own mean drops out of the
+        /// numerator and the correlation needs one pass instead of two.
+        centered: Vec<f32>,
+        /// 1.0 where the pixel counts, 0.0 where it does not. Floats rather than
+        /// bools so the inner loop multiplies instead of branching.
+        mask: Vec<f32>,
+        /// True when nothing is masked out, which is every ordinary PNG.
+        dense: bool,
+        /// Whether to take the vector kernel. Decided here rather than at every
+        /// position: the coarse pass asks for a score a quarter of a million times,
+        /// and an atomic load and a branch on each of them is not free.
+        use_block: bool,
+        w: u32,
+        h: u32,
+        n: f32,
+        dt: f32,
+    }
+
+    fn prepare_template(tpl: &[f32], mask: &[bool], w: u32, h: u32) -> Option<Prepared> {
+        let len = (w as usize).checked_mul(h as usize)?;
+        if len == 0 || tpl.len() < len || mask.len() < len {
+            return None;
+        }
+        let n = mask[..len].iter().filter(|m| **m).count();
+        if n < 4 {
+            return None;
+        }
+        let sum: f32 = (0..len).filter(|i| mask[*i]).map(|i| tpl[i]).sum();
+        let mt = sum / n as f32;
+        let mut centered = vec![0.0f32; len];
+        let mut mf = vec![0.0f32; len];
+        let mut dt = 0.0f32;
+        for i in 0..len {
+            if mask[i] {
+                let c = tpl[i] - mt;
+                centered[i] = c;
+                mf[i] = 1.0;
+                dt += c * c;
+            }
+        }
+        // A template with no contrast at all correlates with everything equally,
+        // which is not an answer.
+        if dt <= f32::EPSILON {
+            return None;
+        }
+        let dense = n == len;
+        #[cfg(target_arch = "x86_64")]
+        let use_block = dense && w >= 8 && vectorised();
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_block = false;
+        Some(Prepared {
+            centered,
+            mask: mf,
+            dense,
+            use_block,
+            w,
+            h,
+            n: n as f32,
+            dt,
+        })
+    }
+
+    /// Correlation of a prepared template placed at (ox, oy) in the haystack.
     ///
     /// Returns a value in -1.0 ..= 1.0; 1.0 means identical up to brightness and
     /// contrast, which is why a screenshot taken under a different theme still
     /// matches.
-    fn score_at(
-        hay: &[f32],
-        hw: u32,
-        _hh: u32,
-        tpl: &[f32],
-        mask: &[bool],
-        tw: u32,
-        th: u32,
-        ox: u32,
-        oy: u32,
-    ) -> f32 {
-        let mut n = 0.0f32;
-        let mut sum_i = 0.0f32;
-        let mut sum_t = 0.0f32;
-        for y in 0..th {
-            let hrow = ((oy + y) * hw) as usize;
-            let trow = (y * tw) as usize;
-            for x in 0..tw {
-                if mask[trow + x as usize] {
-                    sum_i += hay[hrow + (ox + x) as usize];
-                    sum_t += tpl[trow + x as usize];
-                    n += 1.0;
-                }
-            }
-        }
-        if n < 4.0 {
+    fn score_at(hay: &[f32], hw: u32, p: &Prepared, ox: u32, oy: u32) -> f32 {
+        let tw = p.w as usize;
+        // Once, up front, instead of once per row: the last row of the window
+        // reaches furthest into the haystack, so if it fits, every earlier one does.
+        let last = ((oy + p.h - 1) as usize) * (hw as usize) + ox as usize + tw;
+        if p.h == 0 || tw == 0 || last > hay.len() || p.centered.len() < tw * p.h as usize
+        {
             return -1.0;
         }
-        let (mi, mt) = (sum_i / n, sum_t / n);
-        let mut num = 0.0f32;
-        let mut di = 0.0f32;
-        let mut dt = 0.0f32;
-        for y in 0..th {
-            let hrow = ((oy + y) * hw) as usize;
-            let trow = (y * tw) as usize;
-            for x in 0..tw {
-                if mask[trow + x as usize] {
-                    let a = hay[hrow + (ox + x) as usize] - mi;
-                    let b = tpl[trow + x as usize] - mt;
-                    num += a * b;
-                    di += a * a;
-                    dt += b * b;
-                }
+        let (sum_i, sum_ii, dot) = if p.use_block {
+            #[cfg(target_arch = "x86_64")]
+            {
+                // SAFETY: the bounds above cover every row it reads, and vectorised
+                // has asked the processor for the features it is compiled against.
+                unsafe { sums_block_avx2(hay, hw, p, ox, oy) }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                unreachable!()
+            }
+        } else {
+            let (mut a, mut b, mut d) = (0.0f32, 0.0f32, 0.0f32);
+            for y in 0..p.h {
+                let hrow = ((oy + y) * hw + ox) as usize;
+                let trow = (y * p.w) as usize;
+                let hs = &hay[hrow..hrow + tw];
+                let cs = &p.centered[trow..trow + tw];
+                let (ra, rb, rd) = if p.dense {
+                    sums_dense_scalar(hs, cs)
+                } else {
+                    sums_masked(hs, &p.mask[trow..trow + tw], cs)
+                };
+                a += ra;
+                b += rb;
+                d += rd;
+            }
+            (a, b, d)
+        };
+        let mi = sum_i / p.n;
+        let di = sum_ii - p.n * mi * mi;
+        let den = (di * p.dt).sqrt();
+        if den <= f32::EPSILON { -1.0 } else { dot / den }
+    }
+
+    /// Set by the benchmark to price the vector kernel against the plain one.
+    /// Nothing else touches it, and it costs one relaxed load per row.
+    static SCALAR_ONLY: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_scalar_only(on: bool) {
+        SCALAR_ONLY.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this build is using the vector kernel right now.
+    pub fn vectorised() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            !SCALAR_ONLY.load(std::sync::atomic::Ordering::Relaxed) && has_avx2()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// One row: the sum of the window, the sum of its squares, and its dot product
+    /// with the centred template.
+    fn sums_dense_scalar(h: &[f32], c: &[f32]) -> (f32, f32, f32) {
+        let n = h.len().min(c.len());
+        let (mut a, mut b, mut d) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let x = h[i];
+            a += x;
+            b += x * x;
+            d += x * c[i];
+        }
+        (a, b, d)
+    }
+
+    /// The same, when some of the template is transparent. The mask is a multiplier
+    /// rather than a branch, and the centred template is already zero where it does
+    /// not count, so the dot product needs no mask at all.
+    fn sums_masked(h: &[f32], m: &[f32], c: &[f32]) -> (f32, f32, f32) {
+        let n = h.len().min(m.len()).min(c.len());
+        let (mut a, mut b, mut d) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let x = h[i] * m[i];
+            a += x;
+            b += x * h[i];
+            d += h[i] * c[i];
+        }
+        (a, b, d)
+    }
+
+    /// Does this processor have AVX2 and FMA? Asked once, then remembered.
+    ///
+    /// A runtime question rather than a build-time one on purpose: the release ships
+    /// a plain x86-64 build as well as an x86-64-v3 one, and the plain build should
+    /// still use the vector unit on a machine that has one.
+    #[cfg(target_arch = "x86_64")]
+    fn has_avx2() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static CACHE: AtomicU8 = AtomicU8::new(0);
+        match CACHE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let ok = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+                CACHE.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+                ok
             }
         }
-        let den = (di * dt).sqrt();
-        if den <= f32::EPSILON { -1.0 } else { num / den }
+    }
+
+    /// The whole window at once, rather than a row at a time.
+    ///
+    /// The accumulators live across every row and are folded down once at the end.
+    /// Per row it was three horizontal sums for every eight floats, and on the
+    /// coarse pass - where a 32-pixel template shrinks to an eight-wide one - that
+    /// cost more than the multiply-adds it replaced. Measured: row at a time, a
+    /// 32x32 template came out slower with the vector path on than off.
+    ///
+    /// # Safety
+    /// Every row from `oy` to `oy + p.h`, at column `ox` for `p.w` floats, must lie
+    /// inside `hay`, and `p.centered` must hold `p.w * p.h` of them. `score_at`
+    /// checks both before calling.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn sums_block_avx2(
+        hay: &[f32],
+        hw: u32,
+        p: &Prepared,
+        ox: u32,
+        oy: u32,
+    ) -> (f32, f32, f32) {
+        use std::arch::x86_64::*;
+        let tw = p.w as usize;
+        unsafe {
+            let (mut va, mut vb, mut vd) =
+                (_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps());
+            let (mut a, mut b, mut d) = (0.0f32, 0.0f32, 0.0f32);
+            for y in 0..p.h {
+                let hp = hay.as_ptr().add(((oy + y) as usize) * (hw as usize) + ox as usize);
+                let cp = p.centered.as_ptr().add((y as usize) * tw);
+                let mut i = 0usize;
+                while i + 8 <= tw {
+                    let x = _mm256_loadu_ps(hp.add(i));
+                    let c = _mm256_loadu_ps(cp.add(i));
+                    va = _mm256_add_ps(va, x);
+                    vb = _mm256_fmadd_ps(x, x, vb);
+                    vd = _mm256_fmadd_ps(x, c, vd);
+                    i += 8;
+                }
+                while i < tw {
+                    let x = *hp.add(i);
+                    a += x;
+                    b += x * x;
+                    d += x * *cp.add(i);
+                    i += 1;
+                }
+            }
+            (a + hsum256(va), b + hsum256(vb), d + hsum256(vd))
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
+        use std::arch::x86_64::*;
+        // No unsafe block: with the feature enabled these intrinsics are safe, and
+        // the caller has already established that the processor has it.
+        let s = _mm_add_ps(_mm256_extractf128_ps(v, 1), _mm256_castps256_ps128(v));
+        let s = _mm_hadd_ps(s, s);
+        let s = _mm_hadd_ps(s, s);
+        _mm_cvtss_f32(s)
     }
 
     /// Best position of `tpl` inside `hay` at one fixed scale.
-    fn find_at_scale(hay: &Frame, tpl_rgba: &[u8], tw: u32, th: u32) -> Option<(u32, u32, f32)> {
+    /// 0 means "as many as the machine has". Set to 1 to compare a parallel answer
+    /// against the answer the single-threaded sweep would have given, which is the
+    /// only way to tell a real regression from a template that matches in ten places.
+    static MAX_THREADS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    pub fn set_max_threads(n: usize) {
+        MAX_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn find_at_scale(
+        hay: &Frame,
+        tpl_rgba: &[u8],
+        tw: u32,
+        th: u32,
+        edge: bool,
+    ) -> Option<(u32, u32, f32)> {
         if tw == 0 || th == 0 || tw > hay.w || th > hay.h {
             return None;
         }
-        let (hg, _) = plane(&hay.rgba, hay.w, hay.h);
-        let (tg, tm) = plane(tpl_rgba, tw, th);
+        let mut hg = plane_grey(&hay.px, hay.w, hay.h, hay.order);
+        let (mut tg, tm) = plane(tpl_rgba, tw, th, Order::Rgba);
+        if edge {
+            hg = sobel(&hg, hay.w, hay.h);
+            tg = sobel(&tg, tw, th);
+        }
 
         // Coarse pass on a shrunken copy: a full-resolution sweep of a 4K screen is
         // billions of operations, and the answer is always in the same place anyway.
@@ -2765,12 +4441,48 @@ pub mod vision {
         let (cmask, _, _) = shrink_mask(&tm, tw, th, step);
 
         let mut best = (0u32, 0u32, -1.0f32);
-        if ctw > 0 && cth > 0 && ctw <= chw && cth <= chh {
-            for oy in 0..=(chh - cth) {
-                for ox in 0..=(chw - ctw) {
-                    let sc = score_at(&chay, chw, chh, &ctpl, &cmask, ctw, cth, ox, oy);
-                    if sc > best.2 {
-                        best = (ox, oy, sc);
+        let coarse = prepare_template(&ctpl, &cmask, ctw, cth);
+        if let Some(cp) = coarse.as_ref().filter(|_| ctw <= chw && cth <= chh) {
+            let rows = chh - cth + 1;
+            let cap = MAX_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+            let cores = if cap > 0 {
+                cap
+            } else {
+                std::thread::available_parallelism().map_or(1, |n| n.get())
+            };
+            // Below a few dozen rows apiece the threads cost more than the work, and a
+            // small search area is exactly where that happens.
+            let threads = ((rows as usize) / 48).clamp(1, cores);
+            let scan = |lo: u32, hi: u32| {
+                let mut b = (0u32, 0u32, -1.0f32);
+                for oy in lo..hi {
+                    for ox in 0..=(chw - ctw) {
+                        let sc = score_at(&chay, chw, cp, ox, oy);
+                        if sc > b.2 {
+                            b = (ox, oy, sc);
+                        }
+                    }
+                }
+                b
+            };
+            if threads <= 1 {
+                best = scan(0, rows);
+            } else {
+                let chunk = rows.div_ceil(threads as u32);
+                let parts: Vec<(u32, u32, f32)> = std::thread::scope(|sc| {
+                    let handles: Vec<_> = (0..threads as u32)
+                        .map(|t| {
+                            let (lo, hi) = (t * chunk, ((t + 1) * chunk).min(rows));
+                            sc.spawn(move || scan(lo, hi))
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap_or((0, 0, -1.0))).collect()
+                });
+                // Merged in row order with a strict `>`, so a tie resolves to the same
+                // position the single-threaded sweep would have picked.
+                for p in parts {
+                    if p.2 > best.2 {
+                        best = p;
                     }
                 }
             }
@@ -2788,10 +4500,11 @@ pub mod vision {
         let x1 = (cx + pad).min(hay.w - tw);
         let y1 = (cy + pad).min(hay.h - th);
 
+        let fp = prepare_template(&tg, &tm, tw, th)?;
         let mut fine = (x0, y0, -1.0f32);
         for oy in y0..=y1 {
             for ox in x0..=x1 {
-                let sc = score_at(&hg, hay.w, hay.h, &tg, &tm, tw, th, ox, oy);
+                let sc = score_at(&hg, hay.w, &fp, ox, oy);
                 if sc > fine.2 {
                     fine = (ox, oy, sc);
                 }
@@ -2805,6 +4518,20 @@ pub mod vision {
     /// Returns the best hit found even when it is below `threshold`, so the UI can
     /// tell "nothing like it on screen" apart from "almost, try a lower threshold".
     pub fn find(hay: &Frame, tpl: &Template, multiscale: bool) -> Option<Hit> {
+        find_mode(hay, tpl, multiscale, false)
+    }
+
+    /// The same, with a choice about what is correlated.
+    ///
+    /// `edge` correlates the outlines instead of the greys. Slower by one pass over
+    /// each plane, and the thing to reach for when a template stops matching after
+    /// a theme change or under a highlight.
+    pub fn find_mode(
+        hay: &Frame,
+        tpl: &Template,
+        multiscale: bool,
+        edge: bool,
+    ) -> Option<Hit> {
         let scales: &[f32] =
             if multiscale { &[1.0, 0.9, 1.1, 0.8, 1.25] } else { &[1.0] };
         let mut best: Option<Hit> = None;
@@ -2816,7 +4543,7 @@ pub mod vision {
             } else {
                 resize_rgba(&tpl.rgba, tpl.w, tpl.h, tw, th)
             };
-            if let Some((ox, oy, score)) = find_at_scale(hay, &rgba, tw, th) {
+            if let Some((ox, oy, score)) = find_at_scale(hay, &rgba, tw, th, edge) {
                 let hit = Hit {
                     x: hay.x + ox as i32 + tw as i32 / 2,
                     y: hay.y + oy as i32 + th as i32 / 2,
@@ -2842,6 +4569,8 @@ pub mod vision {
 /// `oar-ocr`) can be added later without touching anything above this line, and so
 /// a build that cannot use WinRT still compiles with `--no-default-features`.
 pub mod ocr {
+    use serde::{Deserialize, Serialize};
+
     /// One recognised line, in screen coordinates.
     #[derive(Clone, Debug, PartialEq)]
     pub struct TextBox {
@@ -2850,6 +4579,365 @@ pub mod ocr {
         pub y: i32,
         pub w: i32,
         pub h: i32,
+    }
+
+    /// What is done to a region's pixels before the engine sees them.
+    ///
+    /// Windows OCR was built for documents: dark text, light paper, generous size,
+    /// and no knobs at all. Screen text is none of those - a pale HUD number over
+    /// moving artwork is the hard case - so everything that can be done has to be
+    /// done to the pixels first. This is worth more than a second engine would be,
+    /// and it adds nothing to the binary.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+    pub enum Prep {
+        /// Straight to the engine, bar the enlargement it needs to answer at all.
+        /// What every version up to now did.
+        #[default]
+        None,
+        /// Ordinary interface text: grey, with the contrast pulled out to the full
+        /// range. Costs nothing when the text was already clean.
+        Ui,
+        /// The same, enlarged harder. For text too small to have enough pixels.
+        Small,
+        /// A HUD over artwork: grey, stretched, then cut to black and white at the
+        /// threshold that separates them best, so the picture behind stops counting.
+        Game,
+        /// Digits on a plate: black and white, enlarged hard, nothing else.
+        Digits,
+        /// Try them in turn and keep the reading that fits the expected format best.
+        /// Costs one recognition per rung it has to climb, so it belongs in a step
+        /// that runs occasionally, not in a tight polling loop.
+        Auto,
+    }
+
+    impl Prep {
+        /// Everything `Auto` tries, cheapest first.
+        pub const LADDER: [Prep; 5] =
+            [Prep::None, Prep::Ui, Prep::Small, Prep::Game, Prep::Digits];
+
+        /// The enlargement this profile wants, on top of what the engine needs.
+        pub fn min_scale(self) -> u32 {
+            match self {
+                Prep::Small | Prep::Digits => 3,
+                Prep::Game => 2,
+                _ => 1,
+            }
+        }
+
+        pub fn index(self) -> usize {
+            match self {
+                Prep::None => 0,
+                Prep::Ui => 1,
+                Prep::Small => 2,
+                Prep::Game => 3,
+                Prep::Digits => 4,
+                Prep::Auto => 5,
+            }
+        }
+
+        pub fn from_index(i: usize) -> Self {
+            match i {
+                1 => Prep::Ui,
+                2 => Prep::Small,
+                3 => Prep::Game,
+                4 => Prep::Digits,
+                5 => Prep::Auto,
+                _ => Prep::None,
+            }
+        }
+    }
+
+    /// Luma, one byte per pixel. Takes the channel order because a screen grab
+    /// arrives blue-first and converting it just to weight it would be a wasted
+    /// pass over the whole region.
+    fn gray_of(px: &[u8], order: crate::vision::Order) -> Vec<u8> {
+        let (r, b) = match order {
+            crate::vision::Order::Rgba => (299u32, 114u32),
+            crate::vision::Order::Bgra => (114u32, 299u32),
+        };
+        px.chunks_exact(4)
+            .map(|p| {
+                ((r * p[0] as u32 + 587 * p[1] as u32 + b * p[2] as u32) / 1000) as u8
+            })
+            .collect()
+    }
+
+    /// The darkest and brightest values worth keeping, ignoring `cut` of the pixels
+    /// at each end.
+    ///
+    /// Plain min and max are useless on a screen: one antialiased pixel at pure black
+    /// and one at pure white, and the stretch that follows does nothing at all.
+    fn ends(g: &[u8], cut: f32) -> (u8, u8) {
+        let mut hist = [0u32; 256];
+        for &v in g {
+            hist[v as usize] += 1;
+        }
+        let drop = ((g.len() as f32) * cut) as u32;
+        let (mut lo, mut hi) = (0u8, 255u8);
+        let mut acc = 0u32;
+        for (i, &c) in hist.iter().enumerate() {
+            acc += c;
+            if acc > drop {
+                lo = i as u8;
+                break;
+            }
+        }
+        acc = 0;
+        for (i, &c) in hist.iter().enumerate().rev() {
+            acc += c;
+            if acc > drop {
+                hi = i as u8;
+                break;
+            }
+        }
+        (lo, hi)
+    }
+
+    /// Pulls the kept range out to the full 0..=255.
+    fn stretch(g: &mut [u8], lo: u8, hi: u8) {
+        if hi <= lo {
+            return;
+        }
+        let span = (hi - lo) as f32;
+        for v in g.iter_mut() {
+            *v = (((*v as f32 - lo as f32) / span) * 255.0).clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    /// Otsu's threshold: the cut that leaves the two halves as unlike each other as
+    /// possible.
+    ///
+    /// Chosen because it has no parameters. How bright a game's HUD is on this
+    /// machine, at this time of day, over this background is not something a script
+    /// should have to be told.
+    pub fn otsu(g: &[u8]) -> u8 {
+        let mut hist = [0u64; 256];
+        for &v in g {
+            hist[v as usize] += 1;
+        }
+        let total = g.len() as f64;
+        if total == 0.0 {
+            return 128;
+        }
+        let sum: f64 = hist.iter().enumerate().map(|(i, &c)| i as f64 * c as f64).sum();
+        let (mut w_b, mut sum_b, mut best, mut best_t) = (0.0f64, 0.0f64, -1.0f64, 128u8);
+        for (t, &count) in hist.iter().enumerate() {
+            w_b += count as f64;
+            if w_b == 0.0 {
+                continue;
+            }
+            let w_f = total - w_b;
+            if w_f == 0.0 {
+                break;
+            }
+            sum_b += t as f64 * count as f64;
+            let d = sum_b / w_b - (sum - sum_b) / w_f;
+            let between = w_b * w_f * d * d;
+            if between > best {
+                best = between;
+                best_t = t as u8;
+            }
+        }
+        best_t
+    }
+
+    /// Cuts to black and white, ending up with dark text on a light ground whichever
+    /// way round it started.
+    ///
+    /// The engine was trained on documents. Light text on a dark panel is the common
+    /// case on a screen and reads markedly worse than its own inverse, so whichever
+    /// side is in the minority is taken to be the text.
+    fn binarize(g: &mut [u8], t: u8) {
+        let dark = g.iter().filter(|&&v| v <= t).count();
+        let invert = dark * 2 > g.len();
+        for v in g.iter_mut() {
+            let light = *v > t;
+            *v = if light != invert { 255 } else { 0 };
+        }
+    }
+
+    fn gray_to_rgba(g: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; g.len() * 4];
+        for (i, &v) in g.iter().enumerate() {
+            out[i * 4] = v;
+            out[i * 4 + 1] = v;
+            out[i * 4 + 2] = v;
+            out[i * 4 + 3] = 255;
+        }
+        out
+    }
+
+    /// Applies a profile to a region's pixels.
+    ///
+    /// Pure and free of anything Windows-shaped, so the whole ladder can be tested
+    /// without a screen, an engine or a language pack.
+    pub fn prepare(px: &[u8], prep: Prep, order: crate::vision::Order) -> Vec<u8> {
+        if prep == Prep::None || px.len() < 4 {
+            return px.to_vec();
+        }
+        let mut g = gray_of(px, order);
+        // Digits skips the stretch: it is about to be cut in two anyway, and the
+        // stretch only moves where the cut lands.
+        if !matches!(prep, Prep::Digits) {
+            let (lo, hi) = ends(&g, 0.02);
+            stretch(&mut g, lo, hi);
+        }
+        if matches!(prep, Prep::Game | Prep::Digits) {
+            let t = otsu(&g);
+            binarize(&mut g, t);
+        }
+        gray_to_rgba(&g)
+    }
+
+    /// What a reading is supposed to look like.
+    ///
+    /// The useful question is not "how sure is the engine" - that number is on a
+    /// scale nobody can interpret, is not comparable between engines, and this one
+    /// does not expose it - but "is this the shape of the thing I asked for".
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+    pub enum Expect {
+        #[default]
+        Any,
+        /// Digits, with the separators screens put in them: `1,250` passes.
+        Integer,
+        /// A number that may carry a decimal point.
+        Decimal,
+        /// A clock: `2:05` or `1:02:03`.
+        Time,
+        /// A tiny pattern: `#` one digit, `@` one letter, `?` any one character,
+        /// `*` any run including none, everything else itself, case ignored.
+        ///
+        /// Deliberately not a regular expression. It has to be typeable into a text
+        /// box by somebody automating a game, and it must not cost a crate.
+        Pattern(String),
+    }
+
+    impl Expect {
+        pub fn index(&self) -> usize {
+            match self {
+                Expect::Any => 0,
+                Expect::Integer => 1,
+                Expect::Decimal => 2,
+                Expect::Time => 3,
+                Expect::Pattern(_) => 4,
+            }
+        }
+
+        pub fn from_index(i: usize) -> Self {
+            match i {
+                1 => Expect::Integer,
+                2 => Expect::Decimal,
+                3 => Expect::Time,
+                4 => Expect::Pattern("##:##".into()),
+                _ => Expect::Any,
+            }
+        }
+    }
+
+    /// Does the pattern describe the text?
+    pub fn pattern_matches(pat: &str, text: &str) -> bool {
+        fn go(p: &[char], t: &[char]) -> bool {
+            match p.first() {
+                None => t.is_empty(),
+                Some('*') => (0..=t.len()).any(|i| go(&p[1..], &t[i..])),
+                Some(&c) => match t.first() {
+                    None => false,
+                    Some(&d) => {
+                        let ok = match c {
+                            '#' => d.is_ascii_digit(),
+                            '@' => d.is_alphabetic(),
+                            '?' => true,
+                            _ => c.eq_ignore_ascii_case(&d),
+                        };
+                        ok && go(&p[1..], &t[1..])
+                    }
+                },
+            }
+        }
+        // A run of stars is one star. Without this, four of them against a long line
+        // is exponential, and a pattern typed by hand collects them easily.
+        let mut p: Vec<char> = Vec::new();
+        for c in pat.chars() {
+            if c == '*' && p.last() == Some(&'*') {
+                continue;
+            }
+            p.push(c);
+        }
+        let t: Vec<char> = text.trim().chars().collect();
+        go(&p, &t)
+    }
+
+    /// First decimal number in a piece of text.
+    ///
+    /// `,` is read as a thousands separator and `.` as the point, which is what game
+    /// interfaces overwhelmingly use: `1,250.5` is 1250.5.
+    pub fn first_decimal(text: &str) -> Option<f64> {
+        let mut cur = String::new();
+        let mut point = false;
+        for ch in text.chars().chain(std::iter::once(' ')) {
+            if ch.is_ascii_digit() {
+                cur.push(ch);
+            } else if ch == ',' && !cur.is_empty() {
+                continue;
+            } else if ch == '.' && !cur.is_empty() && !point {
+                point = true;
+                cur.push('.');
+            } else if !cur.is_empty() {
+                break;
+            }
+        }
+        cur.trim_end_matches('.').parse::<f64>().ok()
+    }
+
+    /// Does the reading fit the format that was asked for?
+    pub fn accepts(e: &Expect, text: &str) -> bool {
+        match e {
+            Expect::Any => !text.trim().is_empty(),
+            Expect::Integer => first_number(text).is_some(),
+            Expect::Decimal => first_decimal(text).is_some(),
+            Expect::Time => parse_clock(text).is_some(),
+            Expect::Pattern(p) => !p.is_empty() && pattern_matches(p, text),
+        }
+    }
+
+    /// The number a reading carries, under the format that was asked for.
+    pub fn value_of(e: &Expect, text: &str) -> Option<f64> {
+        match e {
+            Expect::Time => parse_clock(text),
+            Expect::Decimal => first_decimal(text),
+            Expect::Integer => first_number(text),
+            // The old behaviour, and still the right default: a clock reads as
+            // seconds, anything else as a plain number.
+            _ => parse_clock(text).or_else(|| first_number(text)),
+        }
+    }
+
+    /// How much a reading looks like what was asked for, from 0 to 1.
+    ///
+    /// Half of it is whether the format parses at all; half is how much of the text
+    /// belongs to the alphabet that format implies. Both halves are needed: a clock
+    /// that came back as `O2:3A` fails the first, and a clock lifted out of a
+    /// sentence passes the first while failing the second.
+    pub fn quality(text: &str, e: &Expect) -> f64 {
+        let t = text.trim();
+        if t.is_empty() {
+            return 0.0;
+        }
+        let parsed = if accepts(e, t) { 1.0 } else { 0.0 };
+        let belongs = |c: char| match e {
+            Expect::Integer => c.is_ascii_digit() || matches!(c, ',' | '.'),
+            Expect::Decimal => c.is_ascii_digit() || matches!(c, ',' | '.' | '-'),
+            Expect::Time => c.is_ascii_digit() || c == ':',
+            Expect::Pattern(_) | Expect::Any => {
+                c.is_alphanumeric() || c.is_ascii_punctuation()
+            }
+        };
+        let total = t.chars().filter(|c| !c.is_whitespace()).count();
+        if total == 0 {
+            return 0.0;
+        }
+        let good = t.chars().filter(|c| !c.is_whitespace() && belongs(*c)).count();
+        0.5 * parsed + 0.5 * (good as f64 / total as f64)
     }
 
     /// Loose text comparison for screen text.
@@ -2928,27 +5016,76 @@ pub mod ocr {
     ///
     /// Nearest neighbour on purpose: rendered glyphs are hard-edged, and smoothing
     /// them on the way up makes recognition worse, not better.
+    /// Enlarges a frame into the BGRA order `SoftwareBitmap` expects.
+    ///
+    /// A frame that already holds BGRA - everything the screen hands back - is
+    /// copied four bytes at a time instead of channel by channel. This used to undo
+    /// the swap `capture` had just performed: two full passes over the buffer that
+    /// cancelled each other out.
+    ///
+    /// The alpha byte is always written. GDI leaves it at zero, and a zero alpha in
+    /// a premultiplied `Bgra8` bitmap is a fully transparent pixel - the engine
+    /// would read an empty image and say so.
     #[cfg(all(windows, feature = "winocr"))]
-    fn upscale_to_bgra(rgba: &[u8], w: u32, h: u32, k: u32) -> (Vec<u8>, u32, u32) {
+    fn upscale_to_bgra(
+        px: &[u8],
+        w: u32,
+        h: u32,
+        k: u32,
+        order: crate::vision::Order,
+    ) -> (Vec<u8>, u32, u32) {
         let (nw, nh) = (w * k, h * k);
         let mut out = vec![0u8; (nw as usize) * (nh as usize) * 4];
+        let swap = order == crate::vision::Order::Rgba;
         for y in 0..nh {
             let sy = y / k;
             for x in 0..nw {
                 let sx = x / k;
                 let s = ((sy * w + sx) * 4) as usize;
                 let d = ((y * nw + x) * 4) as usize;
-                out[d] = rgba[s + 2];
-                out[d + 1] = rgba[s + 1];
-                out[d + 2] = rgba[s];
+                if swap {
+                    out[d] = px[s + 2];
+                    out[d + 1] = px[s + 1];
+                    out[d + 2] = px[s];
+                } else {
+                    out[d] = px[s];
+                    out[d + 1] = px[s + 1];
+                    out[d + 2] = px[s + 2];
+                }
                 out[d + 3] = 255;
             }
         }
         (out, nw, nh)
     }
 
-    #[cfg(all(windows, feature = "winocr"))]
+    /// Recognises a region, preparing its pixels first.
+    ///
+    /// `Auto` is not resolved here: it means "try several", which needs a format to
+    /// judge the answers against, and that lives in `read_region_as`.
+    pub fn recognize_with(
+        frame: &crate::vision::Frame,
+        prep: Prep,
+    ) -> anyhow::Result<Vec<TextBox>> {
+        if prep == Prep::None {
+            return recognize_prepared(frame, 1);
+        }
+        let px = prepare(&frame.px, prep, frame.order);
+        // Grey: every channel holds the same byte, so the order label is a
+        // formality. `Rgba` is the honest one - `gray_to_rgba` also sets alpha.
+        let prepared = crate::vision::Frame::rgba(frame.x, frame.y, frame.w, frame.h, px);
+        recognize_prepared(&prepared, prep.min_scale())
+    }
+
+    /// The plain reading, with nothing done to the pixels. What 1.3.5 did.
     pub fn recognize(frame: &crate::vision::Frame) -> anyhow::Result<Vec<TextBox>> {
+        recognize_with(frame, Prep::None)
+    }
+
+    #[cfg(all(windows, feature = "winocr"))]
+    fn recognize_prepared(
+        frame: &crate::vision::Frame,
+        min_scale: u32,
+    ) -> anyhow::Result<Vec<TextBox>> {
         use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
         use windows::Media::Ocr::OcrEngine;
         use windows::Security::Cryptography::CryptographicBuffer;
@@ -2959,12 +5096,13 @@ pub mod ocr {
         // Windows OCR returns nothing at all for images under 40x40, and small
         // interface text reads much better enlarged. Scale so the short side clears
         // that floor with room to spare, while keeping the long side inside the
-        // engine's own limit of roughly 4096 pixels.
+        // engine's own limit of roughly 4096 pixels. A profile can ask for more than
+        // the floor needs; it can never ask for more than the ceiling allows.
         let short = frame.w.min(frame.h).max(1);
         let long = frame.w.max(frame.h).max(1);
         let want = (64 + short - 1) / short;
         let cap = (4000 / long).max(1);
-        let scale = want.clamp(1, 8).min(cap);
+        let scale = want.max(min_scale).clamp(1, 8).min(cap);
         if short * scale < 40 {
             // Fully qualified: this module deliberately imports nothing from the
             // crate root, and an unqualified `warn!` is a rustc attribute here.
@@ -2974,7 +5112,8 @@ pub mod ocr {
             );
         }
 
-        let (bgra, bw, bh) = upscale_to_bgra(&frame.rgba, frame.w, frame.h, scale);
+        let (bgra, bw, bh) =
+            upscale_to_bgra(&frame.px, frame.w, frame.h, scale, frame.order);
         let buffer = CryptographicBuffer::CreateFromByteArray(&bgra)?;
         let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
             &buffer,
@@ -3022,7 +5161,10 @@ pub mod ocr {
     }
 
     #[cfg(not(all(windows, feature = "winocr")))]
-    pub fn recognize(_frame: &crate::vision::Frame) -> anyhow::Result<Vec<TextBox>> {
+    fn recognize_prepared(
+        _frame: &crate::vision::Frame,
+        _min_scale: u32,
+    ) -> anyhow::Result<Vec<TextBox>> {
         Err(anyhow::anyhow!("this build has no OCR backend"))
     }
 
@@ -3031,6 +5173,462 @@ pub mod ocr {
         let frame = crate::platform::capture(x, y, w, h)
             .ok_or_else(|| anyhow::anyhow!("could not capture the screen"))?;
         recognize(&frame)
+    }
+
+    /// What one attempt at a region came back with.
+    pub struct Reading {
+        pub boxes: Vec<TextBox>,
+        /// How well the text fits the format asked for, 0 to 1.
+        pub quality: f64,
+        /// Which profile produced it. Interesting when `Auto` chose.
+        pub prep: Prep,
+    }
+
+    impl Reading {
+        pub fn text(&self) -> String {
+            joined(&self.boxes)
+        }
+    }
+
+    /// Reads a region, climbing the ladder of profiles when asked to.
+    ///
+    /// The ladder stops at the first perfect fit rather than always running to the
+    /// end: on text that was already clean, `Auto` costs exactly what `None` costs.
+    pub fn read_region_as(
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        prep: Prep,
+        expect: &Expect,
+    ) -> anyhow::Result<Reading> {
+        let frame = crate::platform::capture(x, y, w, h)
+            .ok_or_else(|| anyhow::anyhow!("could not capture the screen"))?;
+        if prep != Prep::Auto {
+            let boxes = recognize_with(&frame, prep)?;
+            let quality = quality(&joined(&boxes), expect);
+            return Ok(Reading { boxes, quality, prep });
+        }
+        let mut best: Option<Reading> = None;
+        let mut last_err: Option<anyhow::Error> = None;
+        for rung in Prep::LADDER {
+            match recognize_with(&frame, rung) {
+                Ok(boxes) => {
+                    let q = quality(&joined(&boxes), expect);
+                    if best.as_ref().is_none_or(|b| q > b.quality) {
+                        best = Some(Reading { boxes, quality: q, prep: rung });
+                    }
+                    if best.as_ref().is_some_and(|b| b.quality >= 0.999) {
+                        break;
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        best.ok_or_else(|| {
+            last_err.unwrap_or_else(|| anyhow::anyhow!("no profile produced a reading"))
+        })
+    }
+}
+
+// ============================================================================
+// UI Automation
+// ============================================================================
+
+/// Asking Windows what is on the screen instead of looking at it.
+///
+/// Where it works, this beats both of the other two: a button found by its name is
+/// found at any resolution, under any theme, in any language the application was
+/// not translated into, and without a threshold to tune. Where it does not work it
+/// is worth saying plainly - and it does not work often:
+///
+///   * it only sees what an application chooses to expose;
+///   * Unity, DirectX, OpenGL and canvas-drawn interfaces expose nothing at all,
+///     which includes the game this program was written for;
+///   * across a privilege boundary it is limited or silent.
+///
+/// So the honest arrangement is a cascade: ask here first, fall back to the picture
+/// search, then to text recognition, then to fixed coordinates. This is the rung
+/// that costs nothing when it works and has to be given up on quickly when it does
+/// not.
+pub mod uia {
+    use serde::{Deserialize, Serialize};
+
+    /// What to look for.
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+    pub struct Query {
+        /// The text a screen reader would read out. Matched without case, exactly
+        /// first and then as a substring.
+        pub name: String,
+        /// The identifier the application gives the control, when it gives one.
+        /// Exact, and by far the most reliable thing here when it exists.
+        pub automation_id: String,
+        /// `Button`, `Edit`, `Text`, `CheckBox`, `List`, `ListItem`, `Tab`,
+        /// `TreeItem`, `MenuItem`, `Window`. Empty means any.
+        pub control: String,
+        /// Search inside the window in front rather than the whole desktop. Much
+        /// faster, and almost always what was meant.
+        #[serde(default = "yes")]
+        pub in_front: bool,
+    }
+
+    fn yes() -> bool {
+        true
+    }
+
+    impl Query {
+        /// Does this actually name anything?
+        ///
+        /// It matters more than it looks. With all three fields empty the conditions
+        /// below collapse to "true", and a subtree search for "true" returns the
+        /// root - so an unfilled query reported the whole window as found, and
+        /// `Press element` fell through to clicking the middle of it. A step that
+        /// has just been added from the menu is exactly that query.
+        pub fn is_empty(&self) -> bool {
+            self.name.trim().is_empty()
+                && self.automation_id.trim().is_empty()
+                && control_id(&self.control) == 0
+        }
+    }
+
+    /// What was found.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Found {
+        pub name: String,
+        /// What the control holds, for the ones that hold something.
+        pub value: String,
+        /// Centre, in screen coordinates.
+        pub x: i32,
+        pub y: i32,
+        pub w: i32,
+        pub h: i32,
+    }
+
+    /// The control types worth naming in a picker, and the identifiers Windows uses
+    /// for them.
+    ///
+    /// A short list on purpose: these are the ones an automation script presses,
+    /// reads or waits for. The full set has fifty entries and would make the picker
+    /// useless.
+    pub const CONTROLS: [(&str, i32); 11] = [
+        ("", 0),
+        ("Button", 50000),
+        ("CheckBox", 50002),
+        ("ComboBox", 50003),
+        ("Edit", 50004),
+        ("List", 50008),
+        ("ListItem", 50007),
+        ("MenuItem", 50011),
+        ("Tab", 50018),
+        ("Text", 50020),
+        ("Window", 50032),
+    ];
+
+    pub fn control_id(name: &str) -> i32 {
+        CONTROLS
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, id)| *id)
+            .unwrap_or(0)
+    }
+
+    #[cfg(windows)]
+    mod imp {
+        use super::{Found, Query, control_id};
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+        use windows::Win32::System::Variant::{VARIANT, VT_BSTR, VT_I4, VariantClear};
+        use windows::Win32::UI::Accessibility::*;
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        use windows::core::{BSTR, Interface};
+
+        thread_local! {
+            /// One automation object per thread, kept for the life of the thread.
+            ///
+            /// Creating it is a COM activation and costs milliseconds; a script that
+            /// polls for an element would otherwise pay that on every look.
+            static AUTOMATION: std::cell::RefCell<Option<IUIAutomation>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        fn automation() -> Option<IUIAutomation> {
+            AUTOMATION.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    // The caller's thread has already called CoInitializeEx. This is
+                    // never reached from the hook thread, where a COM activation
+                    // would be a way to have Windows unhook us.
+                    *slot = unsafe {
+                        CoCreateInstance::<_, IUIAutomation>(
+                            &CUIAutomation,
+                            None,
+                            CLSCTX_INPROC_SERVER,
+                        )
+                        .ok()
+                    };
+                }
+                slot.clone()
+            })
+        }
+
+        /// A VARIANT built by hand, released when it goes out of scope.
+        ///
+        /// windows-rs exposes the raw union here rather than a wrapper, and the union
+        /// owns the string it is given, so something has to free it. The conditions
+        /// below copy what they need out of it before this drops.
+        struct Var(VARIANT);
+
+        impl Var {
+            fn int(v: i32) -> Self {
+                let mut out = VARIANT::default();
+                unsafe {
+                    let inner = &mut *out.Anonymous.Anonymous;
+                    inner.vt = VT_I4;
+                    inner.Anonymous.lVal = v;
+                }
+                Var(out)
+            }
+
+            fn text(s: &str) -> Self {
+                let mut out = VARIANT::default();
+                unsafe {
+                    let inner = &mut *out.Anonymous.Anonymous;
+                    inner.vt = VT_BSTR;
+                    inner.Anonymous.bstrVal = std::mem::ManuallyDrop::new(BSTR::from(s));
+                }
+                Var(out)
+            }
+        }
+
+        impl Drop for Var {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = VariantClear(&mut self.0);
+                }
+            }
+        }
+
+        /// The element to search from: the window in front, or the desktop.
+        fn root(a: &IUIAutomation, in_front: bool) -> Option<IUIAutomationElement> {
+            unsafe {
+                if in_front {
+                    let hwnd: HWND = GetForegroundWindow();
+                    if !hwnd.0.is_null() {
+                        if let Ok(e) = a.ElementFromHandle(hwnd) {
+                            return Some(e);
+                        }
+                    }
+                }
+                a.GetRootElement().ok()
+            }
+        }
+
+        /// Everything about an element the caller could want, asked for in one trip.
+        ///
+        /// Every property is a call into another process, and there are several.
+        /// Asking one at a time is several round trips into an application that may
+        /// be busy; a cache request makes it one.
+        fn cache(a: &IUIAutomation) -> Option<IUIAutomationCacheRequest> {
+            unsafe {
+                let c = a.CreateCacheRequest().ok()?;
+                let _ = c.AddProperty(UIA_NamePropertyId);
+                let _ = c.AddProperty(UIA_BoundingRectanglePropertyId);
+                let _ = c.AddProperty(UIA_ControlTypePropertyId);
+                let _ = c.AddPattern(UIA_ValuePatternId);
+                let _ = c.AddPattern(UIA_InvokePatternId);
+                let _ = c.SetAutomationElementMode(AutomationElementMode_Full);
+                Some(c)
+            }
+        }
+
+        fn pattern<T: Interface>(e: &IUIAutomationElement, id: UIA_PATTERN_ID) -> Option<T> {
+            unsafe {
+                if let Ok(p) = e.GetCachedPattern(id) {
+                    if let Ok(t) = p.cast::<T>() {
+                        return Some(t);
+                    }
+                }
+                e.GetCurrentPattern(id).ok()?.cast::<T>().ok()
+            }
+        }
+
+        fn read(e: &IUIAutomationElement) -> Option<Found> {
+            unsafe {
+                let name = e.CachedName().or_else(|_| e.CurrentName()).unwrap_or_default();
+                let value = pattern::<IUIAutomationValuePattern>(e, UIA_ValuePatternId)
+                    .and_then(|p| p.CurrentValue().ok())
+                    .unwrap_or_default();
+                let r = e
+                    .CachedBoundingRectangle()
+                    .or_else(|_| e.CurrentBoundingRectangle())
+                    .ok()?;
+                let (w, h) = (r.right - r.left, r.bottom - r.top);
+                // A control scrolled out of sight reports an empty rectangle.
+                // Reporting its centre as (0, 0) would send a click to the corner of
+                // the screen, so it counts as not found.
+                if w <= 0 || h <= 0 {
+                    return None;
+                }
+                Some(Found {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                    x: r.left + w / 2,
+                    y: r.top + h / 2,
+                    w,
+                    h,
+                })
+            }
+        }
+
+        /// Conditions for everything that can be matched exactly.
+        fn narrow(
+            a: &IUIAutomation,
+            q: &Query,
+            with_name: bool,
+        ) -> Option<IUIAutomationCondition> {
+            unsafe {
+                let mut cond = a.CreateTrueCondition().ok()?;
+                let id = control_id(&q.control);
+                if id != 0 {
+                    let v = Var::int(id);
+                    let c = a.CreatePropertyCondition(UIA_ControlTypePropertyId, &v.0).ok()?;
+                    cond = a.CreateAndCondition(&cond, &c).ok()?;
+                }
+                if !q.automation_id.trim().is_empty() {
+                    let v = Var::text(q.automation_id.trim());
+                    let c =
+                        a.CreatePropertyCondition(UIA_AutomationIdPropertyId, &v.0).ok()?;
+                    cond = a.CreateAndCondition(&cond, &c).ok()?;
+                }
+                if with_name && !q.name.trim().is_empty() {
+                    let v = Var::text(q.name.trim());
+                    let c = a
+                        .CreatePropertyConditionEx(
+                            UIA_NamePropertyId,
+                            &v.0,
+                            PropertyConditionFlags_IgnoreCase,
+                        )
+                        .ok()?;
+                    cond = a.CreateAndCondition(&cond, &c).ok()?;
+                }
+                Some(cond)
+            }
+        }
+
+        /// One look. The waiting is added by `find`.
+        pub fn look(q: &Query) -> Option<(Found, IUIAutomationElement)> {
+            if q.is_empty() {
+                return None;
+            }
+            let a = automation()?;
+            let root = root(&a, q.in_front)?;
+            let cache = cache(&a);
+            let want = q.name.trim().to_lowercase();
+
+            unsafe {
+                // The exact name first: one call, and the application does the
+                // matching. Only when that fails is the wider sweep worth its cost.
+                if let Some(cond) = narrow(&a, q, true) {
+                    let hit = match &cache {
+                        Some(c) => root.FindFirstBuildCache(TreeScope_Subtree, &cond, c).ok(),
+                        None => root.FindFirst(TreeScope_Subtree, &cond).ok(),
+                    };
+                    if let Some(e) = hit {
+                        if let Some(f) = read(&e) {
+                            return Some((f, e));
+                        }
+                    }
+                }
+                if want.is_empty() {
+                    return None;
+                }
+                // Substring: everything the other conditions allow, filtered here.
+                // This is the expensive path, and the reason naming a control type is
+                // worth it - it turns a whole tree into a handful of elements.
+                let cond = narrow(&a, q, false)?;
+                let all = match &cache {
+                    Some(c) => root.FindAllBuildCache(TreeScope_Subtree, &cond, c).ok()?,
+                    None => root.FindAll(TreeScope_Subtree, &cond).ok()?,
+                };
+                let n = all.Length().unwrap_or(0);
+                for i in 0..n {
+                    let Ok(e) = all.GetElement(i) else { continue };
+                    let Some(f) = read(&e) else { continue };
+                    if f.name.to_lowercase().contains(&want) {
+                        return Some((f, e));
+                    }
+                }
+                None
+            }
+        }
+
+        /// Presses the element the way the application itself would.
+        ///
+        /// Better than a synthetic click when it is offered: no cursor moves, no
+        /// window has to be in front, and a control that has moved since it was found
+        /// is still the control that gets pressed.
+        pub fn invoke(e: &IUIAutomationElement) -> bool {
+            match pattern::<IUIAutomationInvokePattern>(e, UIA_InvokePatternId) {
+                Some(p) => unsafe { p.Invoke().is_ok() },
+                None => false,
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    mod imp {
+        use super::{Found, Query};
+        pub fn look(q: &Query) -> Option<(Found, ())> {
+            let _ = q.is_empty();
+            None
+        }
+        pub fn invoke(_e: &()) -> bool {
+            false
+        }
+    }
+
+    /// Looks for an element, waiting up to `timeout_ms` for it to turn up.
+    ///
+    /// The wait is here rather than in the caller because an interface that is still
+    /// drawing itself is the normal case after a click, and a script that has to
+    /// write its own retry loop around every element is a script nobody writes.
+    pub fn find(q: &Query, timeout_ms: u64) -> Option<Found> {
+        if q.is_empty() {
+            tracing::warn!("an element step names nothing to look for");
+            return None;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some((f, _)) = imp::look(q) {
+                return Some(f);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+    }
+
+    /// Finds an element and presses it through the application's own pattern.
+    ///
+    /// Returns what was found when the press went through, and nothing when either
+    /// the element was not there or it has no press to offer - which is the caller's
+    /// cue to fall back to a real click on the rectangle.
+    pub fn press(q: &Query, timeout_ms: u64) -> Option<Found> {
+        if q.is_empty() {
+            tracing::warn!("an element step names nothing to press");
+            return None;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some((f, e)) = imp::look(q) {
+                return imp::invoke(&e).then_some(f);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
     }
 }
 
@@ -3366,12 +5964,629 @@ mod platform {
         }
     }
 
-    /// Grabs a rectangle of the screen as RGBA.
+
+    // ---------------------------------------------------------------------
+    // Desktop Duplication
+    // ---------------------------------------------------------------------
+    //
+    // `BitBlt` out of the desktop DC costs about six milliseconds before it has
+    // copied a single useful pixel, and the same blit between two memory DCs of
+    // the same size costs 0.13 ms. Both numbers are printed by `--selftest vision`
+    // under "Where a capture goes". The gap is the readback: the composited
+    // desktop does not live in system memory, and GDI has to go and fetch it every
+    // time. Nothing about the destination bitmap changes that - the table prices a
+    // DIB section against the device bitmap it replaced and they come out equal.
+    //
+    // Desktop Duplication is the interface that does not pay it. The compositor
+    // hands over the surface it already has, the copy that reaches the CPU is only
+    // the rectangle that was asked for, and - the part that matters most for a
+    // script polling a settled screen - a frame that has not changed is not sent
+    // at all, so the poll costs one sub-rectangle copy out of a texture that is
+    // already there.
+    //
+    // Every failure here falls back to GDI rather than failing the capture: an
+    // older machine, a remote session, a driver that says no, a rectangle that
+    // straddles two monitors, or a rotated display all keep working exactly as
+    // they did.
+    #[cfg(windows)]
+    mod dupe {
+        use super::super::win32::RECT;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use windows::Win32::Graphics::Direct3D::{
+            D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_11_0,
+        };
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
+            D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+            D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_SAMPLE_DESC,
+        };
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+            IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+        };
+        use windows::core::Interface as _;
+
+        /// Turned off by a configuration switch. Process-wide, because it is a
+        /// setting rather than a discovery.
+        static ENABLED: AtomicBool = AtomicBool::new(true);
+
+        // Turned off for good, on this thread, by three consecutive failures - a
+        // machine that cannot do this should stop being asked twenty times a
+        // second.
+        //
+        // Per thread rather than process-wide, and that is not a detail. Each
+        // thread duplicates the output for itself, so a thread that cannot get one
+        // - because another already holds it, because it started while a
+        // full-screen application had the output, because the monitor it asked
+        // about has since been unplugged - is saying something about itself and
+        // not about the machine. A global count would let one unlucky search
+        // thread put every future playback back on the slow path for the rest of
+        // the session, and nothing would ever say why.
+        thread_local! {
+            static STRIKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        /// Counts what the fast path actually did, for the benchmark and the log.
+        pub static HITS: AtomicU64 = AtomicU64::new(0);
+        pub static REUSED: AtomicU64 = AtomicU64::new(0);
+        pub static MISSES: AtomicU64 = AtomicU64::new(0);
+
+        const MAX_STRIKES: u64 = 3;
+
+        pub fn set_enabled(on: bool) {
+            ENABLED.store(on, Ordering::Relaxed);
+            if on {
+                // Only this thread's count. Another thread that has given up did so
+                // for a reason that flipping a setting does not change; it clears
+                // its own when a capture next works.
+                STRIKES.with(|c| c.set(0));
+            }
+        }
+
+        pub fn enabled() -> bool {
+            ENABLED.load(Ordering::Relaxed) && STRIKES.with(|c| c.get()) < MAX_STRIKES
+        }
+
+        pub fn counters() -> (u64, u64, u64) {
+            (
+                HITS.load(Ordering::Relaxed),
+                REUSED.load(Ordering::Relaxed),
+                MISSES.load(Ordering::Relaxed),
+            )
+        }
+
+        pub fn reset_counters() {
+            HITS.store(0, Ordering::Relaxed);
+            REUSED.store(0, Ordering::Relaxed);
+            MISSES.store(0, Ordering::Relaxed);
+        }
+
+        fn strike(why: &str) {
+            let n = STRIKES.with(|c| {
+                let n = c.get() + 1;
+                c.set(n);
+                n
+            });
+            if n == MAX_STRIKES {
+                tracing::warn!(
+                    "desktop duplication gave up on this thread after {n} failures ({why}); \
+                     screen captures fall back to GDI"
+                );
+            }
+        }
+
+        /// One duplicated output plus the textures that go with it.
+        ///
+        /// `latest` is a full-size copy of the last frame the compositor handed
+        /// over, kept on the GPU. It exists so that a poll which finds no new frame
+        /// still has the current screen to cut a rectangle out of: a settled screen
+        /// sends nothing, and without this the second look would have nothing to
+        /// look at.
+        struct Dup {
+            device: ID3D11Device,
+            ctx: ID3D11DeviceContext,
+            dup: IDXGIOutputDuplication,
+            /// The output's rectangle in desktop coordinates.
+            bounds: RECT,
+            latest: Option<ID3D11Texture2D>,
+            /// Staging texture sized to the last rectangle asked for.
+            stage: Option<(ID3D11Texture2D, u32, u32)>,
+        }
+
+        thread_local! {
+            static DUP: std::cell::RefCell<Option<Dup>> = const {
+                std::cell::RefCell::new(None)
+            };
+        }
+
+        pub fn release() {
+            DUP.with(|d| {
+                *d.borrow_mut() = None;
+            });
+            // A run that has ended takes its verdict with it. The next one may find
+            // the output free, the resolution settled, or the game closed.
+            STRIKES.with(|c| c.set(0));
+        }
+
+        /// Builds a duplication for the output that wholly contains `want`.
+        ///
+        /// A rectangle spanning two monitors is refused rather than stitched: one
+        /// duplication is one output, and a script that sweeps both screens is
+        /// better served by the path that already handles it than by half a frame.
+        unsafe fn build(want: RECT) -> Option<Dup> {
+            unsafe {
+                let mut device: Option<ID3D11Device> = None;
+                let mut ctx: Option<ID3D11DeviceContext> = None;
+                let levels = [D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0];
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    super::super::win32::HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    Some(&levels),
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut ctx),
+                )
+                .ok()?;
+                let device = device?;
+                let ctx = ctx?;
+
+                let dxgi: IDXGIDevice = device.cast().ok()?;
+                let adapter = dxgi.GetAdapter().ok()?;
+                let mut i = 0u32;
+                while let Ok(output) = adapter.EnumOutputs(i) {
+                    i += 1;
+                    let desc = output.GetDesc().ok()?;
+                    // A rotated output arrives rotated, and un-rotating it here
+                    // would cost more than the readback it saves.
+                    if desc.Rotation != DXGI_MODE_ROTATION_IDENTITY {
+                        continue;
+                    }
+                    let b = desc.DesktopCoordinates;
+                    let holds = want.left >= b.left
+                        && want.top >= b.top
+                        && want.right <= b.right
+                        && want.bottom <= b.bottom;
+                    if !holds {
+                        continue;
+                    }
+                    let out1: IDXGIOutput1 = output.cast().ok()?;
+                    let dup = out1.DuplicateOutput(&device).ok()?;
+                    return Some(Dup {
+                        device,
+                        ctx,
+                        dup,
+                        bounds: b,
+                        latest: None,
+                        stage: None,
+                    });
+                }
+                None
+            }
+        }
+
+        impl Dup {
+            /// Pulls the newest frame across, if the compositor has one.
+            ///
+            /// `Ok(false)` means nothing changed, which is the common answer while a
+            /// script waits for a button and is the reason this is fast at all.
+            unsafe fn pump(&mut self, patient: bool) -> Result<bool, windows::core::Error> {
+                unsafe {
+                    let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+                    let mut res: Option<IDXGIResource> = None;
+                    // Nothing yet to fall back on: wait briefly for the first
+                    // frame. Afterwards never block - a poll that sleeps to learn
+                    // that nothing moved is worse than the blit it replaced.
+                    //
+                    // The wait is short and it is struck against, because the
+                    // compositor sends a frame when something *changes*: a screen
+                    // that is genuinely frozen sends nothing, and a patient wait
+                    // followed by a GDI fallback would then be slower than GDI on
+                    // its own. Three of those and this thread stops asking.
+                    let timeout = if patient { 60 } else { 0 };
+                    match self.dup.AcquireNextFrame(timeout, &mut info, &mut res) {
+                        Ok(()) => {}
+                        Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+                        Err(e) => return Err(e),
+                    }
+                    let got = (|| -> Result<bool, windows::core::Error> {
+                        let res = res.ok_or_else(|| {
+                            windows::core::Error::from(DXGI_ERROR_ACCESS_LOST)
+                        })?;
+                        // AccumulatedFrames of 0 with a desktop pointer is a
+                        // cursor-only update: the pixels behind it did not move.
+                        if info.LastPresentTime == 0 && self.latest.is_some() {
+                            return Ok(false);
+                        }
+                        let tex: ID3D11Texture2D = res.cast()?;
+                        if self.latest.is_none() {
+                            let mut desc = D3D11_TEXTURE2D_DESC::default();
+                            tex.GetDesc(&mut desc);
+                            desc.Usage = D3D11_USAGE_DEFAULT;
+                            desc.BindFlags = 0;
+                            desc.CPUAccessFlags = 0;
+                            desc.MiscFlags = 0;
+                            let mut made: Option<ID3D11Texture2D> = None;
+                            self.device.CreateTexture2D(&desc, None, Some(&mut made))?;
+                            self.latest = made;
+                        }
+                        let Some(dst) = self.latest.as_ref() else {
+                            return Ok(false);
+                        };
+                        // Stays on the GPU. The only thing that crosses to the CPU
+                        // is the rectangle the caller asked for, below.
+                        self.ctx.CopyResource(dst, &tex);
+                        Ok(true)
+                    })();
+                    let _ = self.dup.ReleaseFrame();
+                    got
+                }
+            }
+
+            /// Copies one rectangle of the last frame into system memory, BGRA.
+            unsafe fn read(&mut self, x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
+                unsafe {
+                    let src = self.latest.as_ref()?.clone();
+                    let fits = self.stage.as_ref().is_some_and(|(_, sw, sh)| *sw == w && *sh == h);
+                    if !fits {
+                        let desc = D3D11_TEXTURE2D_DESC {
+                            Width: w,
+                            Height: h,
+                            MipLevels: 1,
+                            ArraySize: 1,
+                            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Usage: D3D11_USAGE_STAGING,
+                            BindFlags: 0,
+                            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                            MiscFlags: 0,
+                        };
+                        let mut made: Option<ID3D11Texture2D> = None;
+                        self.device.CreateTexture2D(&desc, None, Some(&mut made)).ok()?;
+                        self.stage = made.map(|t| (t, w, h));
+                    }
+                    let (stage, _, _) = self.stage.as_ref()?;
+                    // Desktop coordinates into output-local ones.
+                    let lx = (x - self.bounds.left).max(0) as u32;
+                    let ly = (y - self.bounds.top).max(0) as u32;
+                    let region = D3D11_BOX {
+                        left: lx,
+                        top: ly,
+                        front: 0,
+                        right: lx + w,
+                        bottom: ly + h,
+                        back: 1,
+                    };
+                    self.ctx.CopySubresourceRegion(
+                        stage,
+                        0,
+                        0,
+                        0,
+                        0,
+                        &src,
+                        0,
+                        Some(&region),
+                    );
+                    let mut map = D3D11_MAPPED_SUBRESOURCE::default();
+                    self.ctx.Map(stage, 0, D3D11_MAP_READ, 0, Some(&mut map)).ok()?;
+                    let row = (w as usize) * 4;
+                    let n = row * (h as usize);
+                    let mut buf: Vec<u8> = Vec::with_capacity(n);
+                    let pitch = map.RowPitch as usize;
+                    if map.pData.is_null() || pitch < row {
+                        self.ctx.Unmap(stage, 0);
+                        return None;
+                    }
+                    // The pitch is the driver's, not ours, and is routinely larger
+                    // than the row: copying the block whole would shear the image.
+                    for r in 0..h as usize {
+                        std::ptr::copy_nonoverlapping(
+                            (map.pData as *const u8).add(r * pitch),
+                            buf.as_mut_ptr().add(r * row),
+                            row,
+                        );
+                    }
+                    buf.set_len(n);
+                    self.ctx.Unmap(stage, 0);
+                    Some(buf)
+                }
+            }
+        }
+
+        /// The fast path. `None` means "GDI, please" and is never an error the
+        /// caller has to handle.
+        pub fn capture(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
+            if !enabled() {
+                return None;
+            }
+            // Saturating, not wrapping. A `Read text` step takes its rectangle from
+            // whatever somebody typed into the box, and an x of `i32::MAX` would
+            // otherwise wrap `right` to a negative number - which is a rectangle the
+            // containment test below would happily accept.
+            let want = RECT {
+                left: x,
+                top: y,
+                right: x.saturating_add(w),
+                bottom: y.saturating_add(h),
+            };
+            DUP.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                let holds = slot.as_ref().is_some_and(|d| {
+                    want.left >= d.bounds.left
+                        && want.top >= d.bounds.top
+                        && want.right <= d.bounds.right
+                        && want.bottom <= d.bounds.bottom
+                });
+                if !holds {
+                    *slot = None;
+                    *slot = unsafe { build(want) };
+                }
+                let Some(d) = slot.as_mut() else {
+                    MISSES.fetch_add(1, Ordering::Relaxed);
+                    strike("no duplicable output holds the rectangle");
+                    return None;
+                };
+                let patient = d.latest.is_none();
+                match unsafe { d.pump(patient) } {
+                    Ok(true) => {
+                        HITS.fetch_add(1, Ordering::Relaxed);
+                        STRIKES.with(|c| c.set(0));
+                    }
+                    Ok(false) if d.latest.is_some() => {
+                        // Nothing changed, so the frame already here is the screen.
+                        REUSED.fetch_add(1, Ordering::Relaxed);
+                        STRIKES.with(|c| c.set(0));
+                    }
+                    Ok(false) => {
+                        // Never got a first frame; GDI can answer this one. A strike,
+                        // so a screen that never changes cannot make every capture
+                        // pay the wait before falling back anyway.
+                        MISSES.fetch_add(1, Ordering::Relaxed);
+                        strike("no first frame arrived");
+                        return None;
+                    }
+                    Err(e) => {
+                        // Access lost happens on a resolution change, a session
+                        // switch, or a full-screen application taking the output.
+                        // Rebuilding is the documented cure, and it is not a
+                        // failure worth a strike.
+                        tracing::debug!("desktop duplication reset: {e}");
+                        *slot = None;
+                        MISSES.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                }
+                let out = unsafe { d.read(x, y, w as u32, h as u32) };
+                if out.is_none() {
+                    MISSES.fetch_add(1, Ordering::Relaxed);
+                    *slot = None;
+                    strike("the staging copy failed");
+                }
+                out
+            })
+        }
+    }
+
+    #[cfg(windows)]
+    pub use dupe::{
+        counters as capture_counters, reset_counters as reset_capture_counters,
+        set_enabled as set_fast_capture,
+    };
+
+    /// A memory DC and a DIB kept alive between captures, one per thread.
     ///
-    /// GDI hands back bottom-up BGRA; a negative height in the header asks for
-    /// top-down rows, and the channel swap happens on the way out.
+    /// Three costs used to be paid on every single look at the screen: a memory DC
+    /// and a bitmap created and destroyed (GDI object churn, against a per-process
+    /// quota of 10 000 objects), a fresh zeroed allocation, and a `GetDIBits` that
+    /// copied and reformatted the whole frame a second time.
+    ///
+    /// A DIB section removes the second copy outright - `BitBlt` writes straight
+    /// into memory this process can already read - and caching it removes the
+    /// churn. The playback thread looks at the same rectangle thousands of times in
+    /// a row, so the cache hits essentially always; a size change throws it away
+    /// and builds the next one.
+    struct DibCache {
+        mem: HDC,
+        bmp: HBITMAP,
+        old: HGDIOBJ,
+        bits: *mut u8,
+        w: i32,
+        h: i32,
+    }
+
+    impl DibCache {
+        /// `None` if GDI would not give us either object. Nothing is leaked on the
+        /// way out: each step undoes itself.
+        unsafe fn new(w: i32, h: i32) -> Option<Self> {
+            unsafe {
+                let mem = CreateCompatibleDC(None);
+                if mem.is_invalid() {
+                    return None;
+                }
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h, // top-down, so row 0 is the top one
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut bits: *mut c_void = std::ptr::null_mut();
+                let made = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0);
+                let Ok(bmp) = made else {
+                    let _ = DeleteDC(mem);
+                    return None;
+                };
+                if bits.is_null() {
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    let _ = DeleteDC(mem);
+                    return None;
+                }
+                let old = SelectObject(mem, HGDIOBJ(bmp.0));
+                Some(Self { mem, bmp, old, bits: bits as *mut u8, w, h })
+            }
+        }
+
+        #[inline]
+        fn bytes(&self) -> usize {
+            (self.w as usize) * (self.h as usize) * 4
+        }
+    }
+
+    impl Drop for DibCache {
+        fn drop(&mut self) {
+            unsafe {
+                SelectObject(self.mem, self.old);
+                let _ = DeleteObject(HGDIOBJ(self.bmp.0));
+                let _ = DeleteDC(self.mem);
+            }
+        }
+    }
+
+    thread_local! {
+        static DIB: std::cell::RefCell<Option<DibCache>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    /// Drops this thread's cached bitmap. Called when a playback run ends, so a
+    /// full-screen grab does not sit on 14 MB of committed memory afterwards.
+    pub fn release_capture_cache() {
+        DIB.with(|c| {
+            *c.borrow_mut() = None;
+        });
+        #[cfg(windows)]
+        dupe::release();
+    }
+
+    /// Just the screen DC, taken and given back. The fixed cost of asking GDI for
+    /// the desktop, with no pixels moved. Benchmark only.
+    pub fn probe_screen_dc() -> bool {
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return false;
+            }
+            ReleaseDC(None, screen);
+            true
+        }
+    }
+
+    /// A capture that stops before the copy out: DC, `BitBlt` into the cached DIB,
+    /// DC back. What the frame costs to *reach*, as opposed to to own. Benchmark
+    /// only - the pixels are left in the cache and nobody reads them.
+    pub fn probe_blt(x: i32, y: i32, w: i32, h: i32) -> bool {
+        if w <= 0 || h <= 0 {
+            return false;
+        }
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return false;
+            }
+            let ok = DIB.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if !slot.as_ref().is_some_and(|c| c.w == w && c.h == h) {
+                    *slot = None;
+                    *slot = DibCache::new(w, h);
+                }
+                let Some(cache) = slot.as_ref() else { return false };
+                BitBlt(cache.mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_ok()
+            });
+            ReleaseDC(None, screen);
+            ok
+        }
+    }
+
+    /// The old arrangement: a device-format bitmap made and thrown away each time,
+    /// which is what a DIB section replaced. Benchmark only, kept so the claim that
+    /// the destination was never the expensive part can be checked rather than
+    /// asserted.
+    pub fn probe_blt_ddb(x: i32, y: i32, w: i32, h: i32) -> bool {
+        if w <= 0 || h <= 0 {
+            return false;
+        }
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return false;
+            }
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(mem, HGDIOBJ(bmp.0));
+            let ok = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_ok();
+            SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            ok
+        }
+    }
+
+    /// The same blit with no screen at either end: cached DIB to a scratch DIB.
+    /// Prices the copy itself, so the screen readback can be told apart from it.
+    pub fn probe_blt_mem(w: i32, h: i32) -> bool {
+        if w <= 0 || h <= 0 {
+            return false;
+        }
+        unsafe {
+            let src = DIB.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if !slot.as_ref().is_some_and(|c| c.w == w && c.h == h) {
+                    *slot = None;
+                    *slot = DibCache::new(w, h);
+                }
+                slot.as_ref().map(|c| c.mem)
+            });
+            let Some(src) = src else { return false };
+            let Some(dst) = DibCache::new(w, h) else { return false };
+            BitBlt(dst.mem, 0, 0, w, h, Some(src), 0, 0, SRCCOPY).is_ok()
+        }
+    }
+
+    /// Grabs a rectangle of the screen.
+    ///
+    /// The pixels come back in GDI's own BGRA order and are not touched on the way
+    /// out; the `Frame` says which order they are in and the two consumers that
+    /// care read that. See `vision::Order`.
     pub fn capture(x: i32, y: i32, w: i32, h: i32) -> Option<crate::vision::Frame> {
         if w <= 0 || h <= 0 {
+            return None;
+        }
+        // A rectangle big enough to overflow the multiply below is not a rectangle
+        // any screen has; refusing it here keeps every later cast honest.
+        if (w as i64) * (h as i64) > (1i64 << 28) {
+            return None;
+        }
+        // The compositor's own copy, when this machine will give us one.
+        if let Some(px) = dupe::capture(x, y, w, h) {
+            return Some(crate::vision::Frame {
+                x,
+                y,
+                w: w as u32,
+                h: h as u32,
+                px,
+                order: crate::vision::Order::Bgra,
+            });
+        }
+        capture_gdi(x, y, w, h)
+    }
+
+    /// The fallback, and the only path before 1.5.0. Kept whole rather than folded
+    /// into the caller: `--selftest vision` prices one against the other, and a
+    /// machine where duplication misbehaves is one configuration switch away from
+    /// this being all that runs.
+    pub fn capture_gdi(x: i32, y: i32, w: i32, h: i32) -> Option<crate::vision::Frame> {
+        if w <= 0 || h <= 0 || (w as i64) * (h as i64) > (1i64 << 28) {
             return None;
         }
         unsafe {
@@ -3379,52 +6594,36 @@ mod platform {
             if screen.is_invalid() {
                 return None;
             }
-            let mem = CreateCompatibleDC(Some(screen));
-            let bmp = CreateCompatibleBitmap(screen, w, h);
-            let old = SelectObject(mem, HGDIOBJ(bmp.0));
-
-            let ok = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_ok();
-
-            let mut info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w,
-                    biHeight: -h, // top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-            let rows = if ok {
-                GetDIBits(
-                    mem,
-                    bmp,
-                    0,
-                    h as u32,
-                    Some(buf.as_mut_ptr() as *mut c_void),
-                    &mut info,
-                    DIB_RGB_COLORS,
-                )
-            } else {
-                0
-            };
-
-            SelectObject(mem, old);
-            let _ = DeleteObject(HGDIOBJ(bmp.0));
-            let _ = DeleteDC(mem);
+            let out = DIB.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                let fits = slot.as_ref().is_some_and(|c| c.w == w && c.h == h);
+                if !fits {
+                    // Dropped first, so the old objects are gone before the new ones
+                    // are asked for rather than both being held at once.
+                    *slot = None;
+                    *slot = DibCache::new(w, h);
+                }
+                let cache = slot.as_ref()?;
+                if BitBlt(cache.mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_err() {
+                    return None;
+                }
+                // `Vec::with_capacity` rather than `vec![0; n]`: the zeroing pass is
+                // a full write of the frame that the copy immediately overwrites.
+                let n = cache.bytes();
+                let mut buf: Vec<u8> = Vec::with_capacity(n);
+                std::ptr::copy_nonoverlapping(cache.bits, buf.as_mut_ptr(), n);
+                buf.set_len(n);
+                Some(buf)
+            });
             ReleaseDC(None, screen);
-
-            if rows == 0 {
-                return None;
-            }
-            for px in buf.chunks_exact_mut(4) {
-                px.swap(0, 2); // BGRA -> RGBA
-                px[3] = 255; // GDI leaves alpha at zero
-            }
-            Some(crate::vision::Frame { x, y, w: w as u32, h: h as u32, rgba: buf })
+            Some(crate::vision::Frame {
+                x,
+                y,
+                w: w as u32,
+                h: h as u32,
+                px: out?,
+                order: crate::vision::Order::Bgra,
+            })
         }
     }
 
@@ -3624,6 +6823,161 @@ mod platform {
     /// Exact match first, then a case-insensitive substring search: window titles
     /// pick up suffixes all the time ("Roblox" becomes "Roblox - Level 7"), and an
     /// exact-only lookup made anchoring fail exactly when it was needed most.
+    /// Dots per inch of the display the front window is on. 96 is 100 %.
+    pub fn current_dpi() -> u32 {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let dpi = if hwnd.0.is_null() { 0 } else { GetDpiForWindow(hwnd) };
+            if dpi == 0 { 96 } else { dpi }
+        }
+    }
+
+    /// Where the window in front is, for `SearchArea::ActiveWindow`.
+    pub fn foreground_rect() -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return None;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(hwnd, &mut r).is_err() {
+                return None;
+            }
+            Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        }
+    }
+
+    /// Executable name of the window in front, without its path.
+    ///
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` rather than the full right: it is the
+    /// least this needs, and it is the one that works across an elevation boundary
+    /// in the direction that matters.
+    pub fn foreground_process() -> String {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return String::new();
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == 0 {
+                return String::new();
+            }
+            let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+                return String::new();
+            };
+            let mut buf = [0u16; 260];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(
+                h,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            )
+            .is_ok();
+            let _ = CloseHandle(h);
+            if !ok {
+                return String::new();
+            }
+            let full = String::from_utf16_lossy(&buf[..len as usize]);
+            full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string()
+        }
+    }
+
+    /// Is a process whose name contains `name` running?
+    ///
+    /// A substring, without case, so `roblox` finds `RobloxPlayerBeta.exe` - asking
+    /// somebody to type the exact executable name is asking them to get it wrong.
+    pub fn process_running(name: &str) -> bool {
+        let needle = name.trim().to_lowercase();
+        if needle.is_empty() {
+            return false;
+        }
+        unsafe {
+            let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+                return false;
+            };
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut found = false;
+            if Process32FirstW(snap, &mut entry).is_ok() {
+                loop {
+                    let end = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    let exe = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                    if exe.to_lowercase().contains(&needle) {
+                        found = true;
+                        break;
+                    }
+                    if Process32NextW(snap, &mut entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(snap);
+            found
+        }
+    }
+
+    /// The clipboard as text. Empty when it holds something else, or nothing.
+    pub fn clipboard_text() -> String {
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return String::new();
+            }
+            let out = (|| {
+                const CF_UNICODETEXT: u32 = 13;
+                let handle = GetClipboardData(CF_UNICODETEXT).ok()?;
+                let hglobal = HGLOBAL(handle.0);
+                let ptr = GlobalLock(hglobal) as *const u16;
+                if ptr.is_null() {
+                    return None;
+                }
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 && len < 1_000_000 {
+                    len += 1;
+                }
+                let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+                let _ = GlobalUnlock(hglobal);
+                Some(text)
+            })();
+            let _ = CloseClipboard();
+            out.unwrap_or_default()
+        }
+    }
+
+    /// Replaces the clipboard with `text`. False when Windows would not hand it over,
+    /// which happens whenever another application is holding it open.
+    pub fn set_clipboard_text(text: &str) -> bool {
+        unsafe {
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            wide.push(0);
+            let bytes = wide.len() * 2;
+            let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
+                return false;
+            };
+            let ptr = GlobalLock(h) as *mut u16;
+            if ptr.is_null() {
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+            let _ = GlobalUnlock(h);
+            if OpenClipboard(None).is_err() {
+                return false;
+            }
+            let _ = EmptyClipboard();
+            const CF_UNICODETEXT: u32 = 13;
+            let ok = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))).is_ok();
+            let _ = CloseClipboard();
+            ok
+        }
+    }
+
     /// The window a title (or the start of one) refers to.
     fn find_window_handle(title: &str) -> Option<HWND> {
         unsafe {
@@ -3949,6 +7303,7 @@ mod platform {
     pub fn capture(_: i32, _: i32, _: i32, _: i32) -> Option<crate::vision::Frame> {
         None
     }
+    pub fn release_capture_cache() {}
     pub fn virtual_screen_rect() -> (i32, i32, i32, i32) {
         (0, 0, 1, 1)
     }
@@ -3960,6 +7315,24 @@ mod platform {
     }
     pub fn find_window_rect(_: &str) -> Option<(i32, i32, i32, i32)> {
         None
+    }
+    pub fn foreground_rect() -> Option<(i32, i32, i32, i32)> {
+        None
+    }
+    pub fn current_dpi() -> u32 {
+        96
+    }
+    pub fn foreground_process() -> String {
+        String::new()
+    }
+    pub fn process_running(_: &str) -> bool {
+        false
+    }
+    pub fn clipboard_text() -> String {
+        String::new()
+    }
+    pub fn set_clipboard_text(_: &str) -> bool {
+        false
     }
     pub fn probe_window_us(_: &str, _: u32) -> Option<u64> {
         None
@@ -4025,6 +7398,11 @@ pub struct AppState {
     pub held_by_desktop: AtomicBool,
     /// Raised by the hotkey: abandon whatever step is running and move on.
     pub skip_step: AtomicBool,
+    /// Stop before every step and wait to be told to go on. Debugging by watching
+    /// rather than by reading the log afterwards.
+    pub step_mode: AtomicBool,
+    /// Raised by the "next step" button: run exactly one more step.
+    pub step_once: AtomicBool,
     /// Set while playback is parked waiting for the target window.
     pub waiting_window: AtomicBool,
     pub target_pause_unfocused: AtomicBool,
@@ -4062,6 +7440,11 @@ pub struct AppState {
 
     // recording settings
     pub capture_mouse_moves: AtomicBool,
+    /// Cut a square out of the screen at each click while recording.
+    pub record_click_shots: AtomicBool,
+    pub click_shot_size: AtomicU32,
+    /// The squares from the recording that just finished, waiting to be offered.
+    pub click_shots: Mutex<Vec<ClickShot>>,
     pub mouse_sample_us: AtomicU64,
     pub record_window_anchor: AtomicBool,
 
@@ -4102,6 +7485,8 @@ impl AppState {
             play_generation: AtomicU64::new(0),
             held_by_desktop: AtomicBool::new(false),
             skip_step: AtomicBool::new(false),
+            step_mode: AtomicBool::new(false),
+            step_once: AtomicBool::new(false),
             waiting_window: AtomicBool::new(false),
             target_pause_unfocused: AtomicBool::new(false),
             target_title: Mutex::new(String::new()),
@@ -4131,6 +7516,9 @@ impl AppState {
             speed: Mutex::new(1.0),
 
             capture_mouse_moves: AtomicBool::new(true),
+            record_click_shots: AtomicBool::new(false),
+            click_shot_size: AtomicU32::new(64),
+            click_shots: Mutex::new(Vec::new()),
             mouse_sample_us: AtomicU64::new(5_000),
             record_window_anchor: AtomicBool::new(true),
 
@@ -4164,6 +7552,9 @@ impl AppState {
 /// Called at startup and once per UI frame, so the running engine can never drift
 /// from what the user sees.
 fn apply_config_to_state(cfg: &AppConfig, state: &AppState) {
+    platform::set_fast_capture(cfg.fast_capture);
+    state.record_click_shots.store(cfg.record_click_shots, Ordering::Relaxed);
+    state.click_shot_size.store(cfg.click_shot_size.clamp(16, 512), Ordering::Relaxed);
     state.loop_play.store(cfg.loop_play, Ordering::Relaxed);
     state.play_count_limit.store(cfg.play_count_limit, Ordering::Relaxed);
     state.absolute_mouse.store(cfg.absolute_mouse, Ordering::Relaxed);
@@ -4363,6 +7754,123 @@ fn spawn_search(
 }
 
 /// Inserts a click at `(x, y)` into the macro, right after `at`.
+/// Turns a recording plus the squares cut at its clicks into a script.
+///
+/// The rule is that nothing is thrown away. Everything between one converted click
+/// and the next stays a `Play events` step over exactly that range, so the
+/// keystrokes, the scrolling and the recorded timing all survive; only the clicks
+/// themselves become `Click image`. A macro that was a list of coordinates comes
+/// back as a list of pictures with the typing still in it.
+///
+/// A click is only converted when it is really a click: press and release close
+/// together in time and place, with nothing in between. A drag is press, move,
+/// release, and turning that into "find the picture and click it" would silently
+/// drop the drag - so a drag stays in its `Play events` range where it works.
+///
+/// Returns the new script and the shots that were used, in step order.
+fn script_from_click_shots(
+    data: &MacroData,
+    shots: &[ClickShot],
+    names: &[String],
+    threshold: f64,
+    miss: OnMiss,
+) -> (Vec<ScriptStep>, usize) {
+    let events = &data.events;
+    let mut out: Vec<ScriptStep> = Vec::new();
+    let mut cursor = 0usize; // first event not yet covered
+    let mut made = 0usize;
+
+    for (shot, name) in shots.iter().zip(names.iter()) {
+        let down = shot.index;
+        if down < cursor || down >= events.len() {
+            continue; // an edit moved the ground under it
+        }
+        let Some(up) = matching_release(events, down, shot.button) else {
+            continue;
+        };
+        // Everything before the press, replayed as it was recorded.
+        if down > cursor {
+            out.push(ScriptStep::new(StepKind::PlayEvents { from: cursor, to: down - 1 }));
+        }
+        out.push(ScriptStep::new(StepKind::ClickImage {
+            template: name.clone(),
+            threshold,
+            button: shot.button,
+            // Near where it was last seen, widening to the whole screen when it is
+            // not there. The first look of the run is a full sweep because nothing
+            // has been seen yet, which is the correct place to spend the time.
+            area: SearchArea::NearLast { margin: 160 },
+            edge: false,
+            miss,
+        }));
+        made += 1;
+        cursor = up + 1;
+    }
+    if cursor < events.len() {
+        out.push(ScriptStep::new(StepKind::PlayEvents {
+            from: cursor,
+            to: events.len() - 1,
+        }));
+    }
+    (out, made)
+}
+
+/// The release that closes a press, when the pair is a click rather than a drag.
+///
+/// `None` for a drag, for a press that was never released, and for a press with
+/// another button event inside it.
+fn matching_release(events: &[MacroEvent], down: usize, button: MouseButton) -> Option<usize> {
+    let (dx, dy, dt) = match events.get(down)?.kind {
+        InputEventKind::MouseButton { x, y, .. } => (x, y, events[down].t_us),
+        _ => return None,
+    };
+    for (j, e) in events.iter().enumerate().skip(down + 1) {
+        match e.kind {
+            InputEventKind::MouseButton { button: b, down: false, x, y } if b == button => {
+                // Eight pixels and two seconds. Past either it was a drag or a
+                // press-and-hold, and neither is a click that a picture can stand
+                // in for.
+                let moved = (x - dx).abs().max((y - dy).abs());
+                let held = e.t_us.saturating_sub(dt);
+                return (moved <= 8 && held <= 2_000_000).then_some(j);
+            }
+            // Any other button going down or up inside the pair means this was not
+            // a plain click.
+            InputEventKind::MouseButton { .. } => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Writes one shot to `templates/<name>.png` with its scale beside it.
+fn save_click_shot(shot: &ClickShot, name: &str) -> Result<()> {
+    let dir = paths::templates_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join(format!("{name}.png"));
+    let img = image::RgbaImage::from_raw(shot.w, shot.h, shot.rgba.clone())
+        .ok_or_else(|| anyhow::anyhow!("click shot {name} has the wrong number of bytes"))?;
+    img.save(&path).with_context(|| format!("writing {}", path.display()))?;
+    // Written now because now is the only moment the scale it was cut at is known.
+    save_template_meta(&path, &TemplateMeta { dpi: shot.dpi });
+    Ok(())
+}
+
+/// A file name for one shot: the recording's stamp, the step number, the button.
+///
+/// Deliberately not the window title or anything else guessable - two recordings
+/// of the same screen must not overwrite each other's pictures, and a name that is
+/// obviously machine-made invites renaming it to something meaningful.
+fn click_shot_name(stamp: &str, n: usize) -> String {
+    format!("rec_{stamp}_{n:02}")
+}
+
+/// A stamp that sorts and does not collide within a session.
+fn recording_stamp() -> String {
+    let (y, mo, d, _, h, mi) = platform::local_time();
+    format!("{y:04}{mo:02}{d:02}_{h:02}{mi:02}")
+}
+
 fn editor_insert_click(data: &mut MacroData, at: usize, x: i32, y: i32) {
     let t = data.events.get(at).map(|e| e.t_us).unwrap_or(0);
     let gap = 30_000u64;
@@ -4858,10 +8366,90 @@ struct ScriptCtx<'a> {
     data: &'a MacroData,
     generation: u64,
     map: CoordMap,
-    vars: std::collections::HashMap<String, f64>,
-    templates: std::collections::HashMap<String, Option<Arc<vision::Template>>>,
+    vars: std::collections::HashMap<String, Value>,
+    templates: std::collections::HashMap<String, Vec<Arc<vision::Template>>>,
     /// What OCR last read, for diagnosis.
     last_text: String,
+    /// Where each template was last seen, so `NearLast` has somewhere to
+    /// look. Per run: a position from an hour ago is a guess, not a hint.
+    last_hit: std::collections::HashMap<String, (i32, i32)>,
+    /// Whether each template counts as present, for the two-threshold decision.
+    /// Keyed by template rather than by step: two steps watching the same picture
+    /// are watching the same thing on screen, and should agree about it.
+    latched: std::collections::HashMap<String, bool>,
+    /// The last 32 answers per template, as a bitmask.
+    history: std::collections::HashMap<String, u32>,
+    /// How many `Call` steps are on the stack above this one.
+    depth: u32,
+    /// Macros already loaded by a `Call`, so a call inside a loop reads the file
+    /// once rather than once per turn of the loop.
+    called: std::collections::HashMap<String, Arc<MacroData>>,
+}
+
+/// How deep `Call` may nest.
+///
+/// This is what stands between a macro that calls itself and a stack overflow, and
+/// under `panic = "abort"` a stack overflow is the process gone with keys held. Any
+/// number would do; eight is past what a list of steps is worth expressing and
+/// small enough that the log tells you what happened rather than scrolling past.
+const MAX_CALL_DEPTH: u32 = 8;
+
+/// Where a `Break` at `pc` should land: just past the innermost enclosing
+/// `EndWhile`, or the end of the script when there is no loop around it.
+///
+/// Shared by the `Break` step and by the `Break` miss policy, which have to agree:
+/// two spellings of the same jump that disagreed about nesting would be a very
+/// quiet bug.
+fn break_target(steps: &[ScriptStep], pc: usize) -> usize {
+    let mut depth = 0usize;
+    let mut j = pc + 1;
+    while j < steps.len() {
+        match steps[j].kind {
+            StepKind::While { .. } => depth += 1,
+            StepKind::EndWhile => {
+                if depth == 0 {
+                    return j + 1;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    steps.len()
+}
+
+/// What the interpreter does next after a step that looked for something.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MissAct {
+    /// It was there.
+    Found,
+    /// It was not, and the step says to walk on anyway.
+    Next,
+    /// It was not, and the step says to end the run.
+    Stop,
+    /// It was not, and the step says to leave the loop.
+    Break,
+    /// Stop or a new generation arrived while we were looking.
+    Cancelled,
+}
+
+/// Everything a look at the screen needs to know beyond which picture to find.
+struct MatchOpts {
+    threshold: f64,
+    lose_at: f64,
+    stable_of: u32,
+    stable_in: u32,
+    area: SearchArea,
+    /// Correlate outlines rather than greys.
+    edge: bool,
+}
+
+impl MatchOpts {
+    /// The plain case: one threshold, no memory.
+    fn plain(threshold: f64, area: SearchArea, edge: bool) -> Self {
+        Self { threshold, lose_at: 0.0, stable_of: 0, stable_in: 0, area, edge }
+    }
 }
 
 /// Why a script run ended.
@@ -4873,21 +8461,99 @@ enum ScriptEnd {
 }
 
 /// Loads a template from `<data>/templates/<name>.png`, once per run.
-fn load_template_file(name: &str) -> Option<Arc<vision::Template>> {
-    let mut path = paths::templates_dir().join(name);
+/// What a template was cut out at, so it can be rescaled when the screen differs.
+///
+/// A picture snipped on a 150 % display is half again the size of the same button on
+/// a 100 % one, and no threshold will bridge that. Recording the scale at capture time
+/// costs one small file and removes the guessing.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct TemplateMeta {
+    /// Dots per inch of the display it was captured on. 96 is 100 %.
+    pub dpi: u32,
+}
+
+fn meta_path(png: &std::path::Path) -> std::path::PathBuf {
+    let mut p = png.to_path_buf();
+    let ext = p.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+    p.set_extension(format!("{ext}.json"));
+    p
+}
+
+pub fn load_template_meta(png: &std::path::Path) -> Option<TemplateMeta> {
+    let text = std::fs::read_to_string(meta_path(png)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn save_template_meta(png: &std::path::Path, meta: &TemplateMeta) {
+    if let Ok(text) = serde_json::to_string_pretty(meta) {
+        let _ = std::fs::write(meta_path(png), text);
+    }
+}
+
+/// Every picture that counts as `name`.
+///
+/// A file gives one. A folder gives all the PNGs inside it, which is how one button
+/// can be a normal state, a hovered state and a dark theme without three separate
+/// steps in the script. The cost is linear in the number of variants, so this wants a
+/// search area rather than the whole desktop.
+fn load_template_set(name: &str) -> Vec<Arc<vision::Template>> {
+    load_template_set_at(&paths::templates_dir().join(name), name)
+}
+
+fn load_template_set_at(base: &std::path::Path, name: &str) -> Vec<Arc<vision::Template>> {
+    let base = base.to_path_buf();
+    if base.is_dir() {
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&base)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
+            .collect();
+        // Alphabetical, so which variant wins a tie does not depend on the file system.
+        files.sort();
+        let out: Vec<_> = files.iter().filter_map(|p| load_one_template(p, name)).collect();
+        if out.is_empty() {
+            warn!("template folder '{}' holds no PNGs", base.display());
+        }
+        return out;
+    }
+    let mut path = base;
     if path.extension().is_none() {
         path.set_extension("png");
     }
-    match image::open(&path) {
+    load_one_template(&path, name).into_iter().collect()
+}
+
+fn load_one_template(path: &std::path::Path, name: &str) -> Option<Arc<vision::Template>> {
+    match image::open(path) {
         Ok(img) => {
             let rgba = img.to_rgba8();
             let (w, h) = (rgba.width(), rgba.height());
-            Some(Arc::new(vision::Template {
-                w,
-                h,
-                rgba: rgba.into_raw(),
-                name: name.to_string(),
-            }))
+            let mut raw = rgba.into_raw();
+            let (mut w, mut h) = (w, h);
+            // The screen it was cut from against the screen it will be looked for on.
+            // Only when the first of those is actually recorded: a template with no
+            // sidecar is one this version never saw saved, and guessing a scale for it
+            // would break every picture made before this release.
+            let known_dpi = load_template_meta(path).map(|m| m.dpi.max(1));
+            let now = platform::current_dpi().max(1);
+            let scale = now as f64 / known_dpi.unwrap_or(now) as f64;
+            if !(0.98..=1.02).contains(&scale) && (0.2..=5.0).contains(&scale) {
+                let (nw, nh) = (
+                    ((w as f64 * scale).round() as u32).max(2),
+                    ((h as f64 * scale).round() as u32).max(2),
+                );
+                raw = vision::resize_rgba(&raw, w, h, nw, nh);
+                info!(
+                    "template '{}' rescaled {w}x{h} -> {nw}x{nh} ({:?} dpi -> {now} dpi)",
+                    path.display(),
+                    known_dpi
+                );
+                w = nw;
+                h = nh;
+            }
+            Some(Arc::new(vision::Template { w, h, rgba: raw, name: name.to_string() }))
         }
         Err(e) => {
             warn!("template '{}' could not be loaded: {e}", path.display());
@@ -4935,44 +8601,358 @@ impl ScriptCtx<'_> {
         !self.stopping()
     }
 
-    fn template(&mut self, name: &str) -> Option<Arc<vision::Template>> {
+    fn template_set(&mut self, name: &str) -> Vec<Arc<vision::Template>> {
         if !self.templates.contains_key(name) {
-            let t = load_template_file(name);
+            let t = load_template_set(name);
             self.templates.insert(name.to_string(), t);
         }
-        self.templates.get(name).cloned().flatten()
+        self.templates.get(name).cloned().unwrap_or_default()
     }
 
     /// Searches the screen and records the result in `match_x` / `match_y` / `match_score`.
-    fn find_image(&mut self, name: &str, threshold: f64) -> bool {
-        let Some(tpl) = self.template(name) else {
-            return false;
+    /// Turns a search area into the rectangle to capture, clamped to the desktop.
+    fn resolve_area(&self, name: &str, area: &SearchArea, tw: u32, th: u32) -> (i32, i32, i32, i32) {
+        let full = platform::virtual_screen_rect();
+        let want = match area {
+            SearchArea::FullScreen => full,
+            SearchArea::ActiveWindow => platform::foreground_rect().unwrap_or(full),
+            SearchArea::Rect { x, y, w, h } => (*x, *y, *w, *h),
+            SearchArea::NearLast { margin } => match self.last_hit.get(name) {
+                Some((cx, cy)) => {
+                    let m = (*margin).max(8);
+                    let w = tw as i32 + m * 2;
+                    let h = th as i32 + m * 2;
+                    (cx - w / 2, cy - h / 2, w, h)
+                }
+                // Nothing seen yet, so there is nowhere to look near.
+                None => full,
+            },
+            // Resolved into a rectangle before this is reached; arriving here means
+            // the anchor was not found, and the whole screen is the safe answer.
+            SearchArea::NearAnchor { .. } => full,
         };
-        let (rx, ry, rw, rh) = platform::virtual_screen_rect();
-        let Some(frame) = platform::capture(rx, ry, rw, rh) else {
-            return false;
+        // A window can be off-screen and a hand-typed rectangle can be nonsense; the
+        // capture has to stay inside the desktop either way.
+        let x = want.0.clamp(full.0, full.0 + full.2 - 1);
+        let y = want.1.clamp(full.1, full.1 + full.3 - 1);
+        let w = want.2.clamp(1, full.0 + full.2 - x);
+        let h = want.3.clamp(1, full.1 + full.3 - y);
+        (x, y, w, h)
+    }
+
+    /// Turns an anchored area into a plain rectangle by finding the anchor first.
+    ///
+    /// The anchor is looked for near where it was last seen before the whole screen
+    /// is swept, so a settled interface costs one cheap look. Its own coordinates
+    /// are scaffolding: `match_x` and friends belong to the target, and are put back
+    /// exactly as they were.
+    fn anchor_area(&mut self, area: &SearchArea, threshold: f64, edge: bool) -> Option<SearchArea> {
+        let SearchArea::NearAnchor { anchor, dx, dy, w, h } = area else {
+            return Some(area.clone());
         };
-        match vision::find(&frame, &tpl, false) {
-            Some(hit) => {
-                self.vars.insert("match_x".into(), hit.x as f64);
-                self.vars.insert("match_y".into(), hit.y as f64);
-                self.vars.insert("match_score".into(), hit.score as f64);
-                hit.score as f64 >= threshold
+        if anchor.trim().is_empty() {
+            warn!("an anchored search has no anchor named");
+            return None;
+        }
+        let name = anchor.clone();
+        let saved: Vec<(String, Option<Value>)> = ["match_x", "match_y", "match_score"]
+            .iter()
+            .map(|k| (k.to_string(), self.vars.get(*k).cloned()))
+            .collect();
+        let opts = MatchOpts::plain(threshold, SearchArea::NearLast { margin: 80 }, edge);
+        let found = self.find_image_into(&name, &opts, None);
+        for (k, v) in saved {
+            match v {
+                Some(val) => self.vars.insert(k, val),
+                None => self.vars.remove(&k),
+            };
+        }
+        if !found {
+            return None;
+        }
+        let (ax, ay) = *self.last_hit.get(&name)?;
+        Some(SearchArea::Rect { x: ax + dx, y: ay + dy, w: *w, h: *h })
+    }
+
+    /// Looks for a template and records where it landed.
+    ///
+    /// `prefix` names the variables written: the old `match_` names are still produced
+    /// so existing macros keep working, and a `Find image` step asks for its own.
+    fn find_image_into(
+        &mut self,
+        name: &str,
+        opts: &MatchOpts,
+        prefix: Option<&str>,
+    ) -> bool {
+        let set = self.template_set(name);
+        let Some(first) = set.first().cloned() else {
+            if let Some(p) = prefix {
+                self.vars.insert(format!("{p}.found"), Value::Num(0.0));
             }
-            None => {
-                self.vars.insert("match_score".into(), 0.0);
-                false
+            return false;
+        };
+        // An anchored area is resolved before anything is captured: without its
+        // anchor there is nowhere to look, and falling back to the whole screen
+        // would defeat the point of having said where to look.
+        let Some(area) = self.anchor_area(&opts.area, opts.threshold, opts.edge) else {
+            self.vars.insert("match_score".into(), Value::Num(0.0));
+            if let Some(p) = prefix {
+                self.vars.insert(format!("{p}.found"), Value::Num(0.0));
+                self.vars.insert(format!("{p}.score"), Value::Num(0.0));
+            }
+            return false;
+        };
+        // One capture, every variant scored against it: the screen is the expensive
+        // part, and taking it once per variant would make a folder of five cost five
+        // times as much for no reason.
+        let edge = opts.edge;
+        let look = |ctx: &Self, area: &SearchArea| {
+            let (rx, ry, rw, rh) = ctx.resolve_area(name, area, first.w, first.h);
+            let frame = platform::capture(rx, ry, rw, rh)?;
+            set.iter()
+                .filter_map(|t| vision::find_mode(&frame, t, false, edge).map(|h| (h, t.w, t.h)))
+                .max_by(|a, b| a.0.score.total_cmp(&b.0.score))
+        };
+        let mut hit = look(self, &area);
+        // The cascade: a guess about where something was is worth trying first and
+        // worth abandoning quickly. A pinned rectangle is not a guess, so it is not
+        // widened - the user meant that rectangle.
+        if matches!(area, SearchArea::NearLast { .. })
+            && hit.as_ref().is_none_or(|(h, _, _)| (h.score as f64) < opts.threshold)
+        {
+            hit = look(self, &SearchArea::FullScreen);
+        }
+
+        let score = hit.as_ref().map_or(0.0, |(h, _, _)| h.score as f64);
+        note_sighting(|s| {
+            let (rx, ry, rw, rh) = self.resolve_area(name, &area, first.w, first.h);
+            s.area = Some((rx, ry, rw, rh));
+            s.hit = hit.as_ref().map(|(h, w, ht)| {
+                (h.x - *w as i32 / 2, h.y - *ht as i32 / 2, *w as i32, *ht as i32, h.score)
+            });
+            s.note = format!("{name}  {score:.3} / {:.2}", opts.threshold);
+        });
+        if let Some((h, _, _)) = &hit {
+            self.vars.insert("match_x".into(), Value::Num(h.x as f64));
+            self.vars.insert("match_y".into(), Value::Num(h.y as f64));
+        }
+        self.vars.insert("match_score".into(), Value::Num(score));
+
+        // Two thresholds and a history, but only for the callers that asked: a click
+        // step that shares a template must not leave state behind for a wait step.
+        let stateful = opts.lose_at > 0.0 || opts.stable_in > 1;
+        let ok = if stateful {
+            let was = self.latched.get(name).copied().unwrap_or(false);
+            let raw = match_decision(score, opts.threshold, opts.lose_at, was);
+            let hist = self.history.entry(name.to_string()).or_insert(0);
+            let settled = stable_enough(hist, raw, opts.stable_of, opts.stable_in);
+            self.latched.insert(name.to_string(), settled);
+            settled
+        } else {
+            score >= opts.threshold
+        };
+        if ok {
+            if let Some((h, _, _)) = &hit {
+                self.last_hit.insert(name.to_string(), (h.x, h.y));
             }
         }
+        if let Some(p) = prefix {
+            self.vars
+                .insert(format!("{p}.found"), Value::Num(if ok { 1.0 } else { 0.0 }));
+            let (sc, hx, hy, hw, hh) = match &hit {
+                Some((h, w, ht)) => (h.score as f64, h.x as f64, h.y as f64, *w, *ht),
+                None => (0.0, 0.0, 0.0, first.w, first.h),
+            };
+            self.vars.insert(format!("{p}.score"), Value::Num(sc));
+            self.vars.insert(format!("{p}.x"), Value::Num(hx));
+            self.vars.insert(format!("{p}.y"), Value::Num(hy));
+            // The variant that won, not the first one: a hovered button can be a
+            // different size from its resting state.
+            self.vars.insert(format!("{p}.w"), Value::Num(hw as f64));
+            self.vars.insert(format!("{p}.h"), Value::Num(hh as f64));
+        }
+        ok
+    }
+
+    fn find_image(&mut self, name: &str, opts: &MatchOpts) -> bool {
+        self.find_image_into(name, opts, None)
+    }
+
+    /// Publishes the state of the run and, in step mode, waits to be let through.
+    ///
+    /// Returns false if the run should end. Called once per step, and when nobody
+    /// is watching it is a relaxed load and a return.
+    fn step_gate(&self, pc: usize, step: &ScriptStep, total_events: usize) -> bool {
+        let stepping = self.state.step_mode.load(Ordering::Relaxed);
+        if !watching_vars() && !stepping {
+            return true;
+        }
+        let s = get_strings(0, Lang::En);
+        let mut rows: Vec<(String, String)> = self
+            .vars
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let text = describe_step(step, s, total_events);
+        let depth = self.depth;
+        note_script_view(|v| {
+            v.vars = rows;
+            v.pc = pc;
+            v.step = text;
+            v.depth = depth;
+            v.running = true;
+            v.waiting = stepping;
+        });
+        if !stepping {
+            return true;
+        }
+        // Parked. Stop, a new generation, and turning step mode off all release it,
+        // so there is no way to leave a run stuck here with no button to press.
+        loop {
+            if self.stopping() {
+                return false;
+            }
+            if self.state.step_once.swap(false, Ordering::Relaxed) {
+                break;
+            }
+            if !self.state.step_mode.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        note_script_view(|v| v.waiting = false);
+        true
+    }
+
+    /// Runs a look, retries it as the policy asks, and says what to do if it never
+    /// came back true.
+    ///
+    /// One place for all six steps that can fail to find something, so that "stop
+    /// the script" means the same thing in each of them and a retry counts the same
+    /// way. `what` is only for the log, and the log is the point: a run that ended
+    /// because a picture was missing should say which picture.
+    fn attempt(
+        &mut self,
+        miss: OnMiss,
+        what: &str,
+        mut look: impl FnMut(&mut Self) -> bool,
+    ) -> MissAct {
+        if look(self) {
+            return MissAct::Found;
+        }
+        let (times, delay_ms) = miss.retries();
+        for n in 1..=times {
+            if self.stopping() {
+                return MissAct::Cancelled;
+            }
+            info!("{what}: not found, trying again ({n} of {times})");
+            if delay_ms > 0 && !self.nap(delay_ms) {
+                return MissAct::Cancelled;
+            }
+            if look(self) {
+                return MissAct::Found;
+            }
+        }
+        match miss {
+            OnMiss::Continue => MissAct::Next,
+            OnMiss::Stop => {
+                warn!("{what}: not found - stopping the script, as the step asks");
+                MissAct::Stop
+            }
+            OnMiss::Break => {
+                info!("{what}: not found - leaving the loop, as the step asks");
+                MissAct::Break
+            }
+            OnMiss::Retry { times, .. } => {
+                warn!(
+                    "{what}: still not found after {times} more tries - stopping the script"
+                );
+                MissAct::Stop
+            }
+        }
+    }
+
+    /// Loads a macro named by a `Call` step, once per run.
+    ///
+    /// Looked for next to the macro that named it first, then in the data folder.
+    /// A bare name gets `.json`, because that is what the save dialog offers and
+    /// typing the extension is a thing to get wrong rather than a thing to decide.
+    fn call_target(&mut self, path: &str) -> Option<Arc<MacroData>> {
+        let key = path.to_string();
+        if let Some(hit) = self.called.get(&key) {
+            return Some(hit.clone());
+        }
+        let raw = expand_vars(path, &self.vars);
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            warn!("a Call step names no file");
+            return None;
+        }
+        let mut candidate = std::path::PathBuf::from(trimmed);
+        if candidate.extension().is_none() {
+            candidate.set_extension("json");
+        }
+        let mut tries: Vec<std::path::PathBuf> = Vec::new();
+        if candidate.is_absolute() {
+            tries.push(candidate.clone());
+        } else {
+            if let Some(dir) =
+                self.state.current_path.lock().as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            {
+                tries.push(dir.join(&candidate));
+            }
+            tries.push(paths::data_dir().join(&candidate));
+            tries.push(paths::sub_dir("macros").join(&candidate));
+        }
+        for t in &tries {
+            match load_macro(t) {
+                Ok(data) => {
+                    info!("call: loaded '{}'", t.display());
+                    let arc = Arc::new(data);
+                    self.called.insert(key, arc.clone());
+                    return Some(arc);
+                }
+                Err(e) => tracing::debug!("call: '{}' did not load: {e}", t.display()),
+            }
+        }
+        warn!(
+            "call: '{trimmed}' was not found - looked in {}",
+            tries
+                .iter()
+                .map(|t| t.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        None
     }
 
     fn eval(&mut self, cond: &Condition) -> bool {
         match cond {
             Condition::Always => true,
             Condition::Var { name, cmp, value } => {
-                cmp.test(self.vars.get(name).copied().unwrap_or(0.0), *value)
+                let cur = self.vars.get(name).cloned().unwrap_or_default();
+                cmp.test_values(&cur, value)
             }
-            Condition::Image { template, threshold } => self.find_image(template, *threshold),
+            Condition::Image {
+                template,
+                threshold,
+                area,
+                lose_at,
+                stable_of,
+                stable_in,
+                edge,
+            } => {
+                let opts = MatchOpts {
+                    threshold: *threshold,
+                    lose_at: *lose_at,
+                    stable_of: *stable_of,
+                    stable_in: *stable_in,
+                    area: area.clone(),
+                    edge: *edge,
+                };
+                self.find_image(template, &opts)
+            }
             Condition::Pixel { x, y, r, g, b, tol } => {
                 match platform::screen_pixel(*x, *y) {
                     Some((pr, pg, pb)) => {
@@ -4985,10 +8965,18 @@ impl ScriptCtx<'_> {
                 }
             }
             Condition::Window { title } => platform::find_window_rect(title).is_some(),
-            Condition::Text { x, y, w, h, needle } => {
-                match ocr::read_region(*x, *y, *w, *h) {
-                    Ok(boxes) => {
-                        let all = ocr::joined(&boxes);
+            Condition::Process { name } => platform::process_running(name),
+            // One look, not a wait: a `Wait for` step is already a loop, and an
+            // `If` should answer about now rather than about the next two seconds.
+            Condition::Element { query } => uia::find(query, 0).is_some(),
+            Condition::Text { x, y, w, h, needle, prep } => {
+                note_sighting(|s| s.text = Some((*x, *y, *w, *h)));
+                // The needle is the format here: a reading that does not contain it
+                // is the wrong reading, so `Auto` has something to judge by.
+                let expect = ocr::Expect::Pattern(format!("*{needle}*"));
+                match ocr::read_region_as(*x, *y, *w, *h, *prep, &expect) {
+                    Ok(r) => {
+                        let all = r.text();
                         self.last_text = all.clone();
                         ocr::text_matches(&all, needle)
                     }
@@ -5138,6 +9126,51 @@ fn click_guarded(
 /// the shell, because `CreateProcess` cannot open a `.lnk` shortcut, a URL or a
 /// document - it would just fail, silently, which is the worst possible outcome
 /// for a step that runs while nobody is watching.
+/// A file as text, capped so that naming the wrong path cannot pull a gigabyte
+/// into a variable.
+fn read_text_file(path: &str) -> String {
+    use std::io::Read as _;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("could not read {path}: {e}");
+            return String::new();
+        }
+    };
+    let mut buf = Vec::new();
+    match file.take(TEXT_FILE_CAP).read_to_end(&mut buf) {
+        Ok(n) => {
+            if n as u64 == TEXT_FILE_CAP {
+                warn!("{path} was longer than {TEXT_FILE_CAP} bytes and was cut short");
+            }
+            // Lossy on purpose: a log written by something else is not always UTF-8,
+            // and refusing to read it at all would be worse than a few question marks.
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        Err(e) => {
+            warn!("could not read {path}: {e}");
+            String::new()
+        }
+    }
+}
+
+/// Writes text to a file, replacing it or adding to the end.
+fn write_text_file(path: &str, text: &str, append: bool) {
+    use std::io::Write as _;
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        // Truncating and appending at once is a contradiction, and Windows returns
+        // an error for it rather than picking one.
+        .truncate(!append)
+        .open(path)
+        .and_then(|mut f| f.write_all(text.as_bytes()));
+    if let Err(e) = result {
+        warn!("could not write {path}: {e}");
+    }
+}
+
 fn run_program(path: &str, args: &str) {
     let path = path.trim();
     if path.is_empty() {
@@ -5188,6 +9221,9 @@ fn run_script(
     mover: &mut MoveEngine,
     guard: &mut FrameGuard,
 ) -> ScriptEnd {
+    // Only for the log lines a miss policy writes; the interpreter itself has no
+    // opinions about language.
+    let s = get_strings(0, Lang::En);
     let steps = &ctx.data.script;
     let blocks = match resolve_blocks(steps) {
         Ok(b) => b,
@@ -5219,6 +9255,9 @@ fn run_script(
             pc += 1;
             continue;
         }
+        if !ctx.step_gate(pc, step, ctx.data.events.len()) {
+            return ScriptEnd::Stopped;
+        }
         if ctx.state.skip_step.swap(false, Ordering::Relaxed) {
             info!("skipping step #{pc}");
             pc += 1;
@@ -5238,40 +9277,79 @@ fn run_script(
                 }
                 pc += 1;
             }
-            StepKind::WaitFor { cond, appear, timeout_ms } => {
-                let deadline = Instant::now() + Duration::from_millis(*timeout_ms);
-                loop {
-                    if ctx.stopping() {
-                        return ScriptEnd::Stopped;
+            StepKind::WaitFor { cond, appear, timeout_ms, miss } => {
+                // A wait that gave up and a wait that succeeded used to be the same
+                // thing to everything downstream. Now the wait answers, and the
+                // policy decides what the answer means.
+                let (c, want, limit, m) = (cond.clone(), *appear, *timeout_ms, *miss);
+                let act = ctx.attempt(m, &format!("wait for {}", describe_condition(&c, s)), |ctx| {
+                    let deadline = Instant::now() + Duration::from_millis(limit);
+                    loop {
+                        if ctx.stopping() {
+                            return false;
+                        }
+                        // Skipping counts as success: the hotkey means "get on with
+                        // it", and firing a stop policy because the user asked to move
+                        // on would be the opposite of what they asked for.
+                        if ctx.state.skip_step.swap(false, Ordering::Relaxed) {
+                            info!("wait skipped");
+                            return true;
+                        }
+                        let c = c.clone();
+                        if ctx.eval(&c) == want {
+                            return true;
+                        }
+                        if Instant::now() >= deadline {
+                            info!("wait timed out");
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(120));
                     }
-                    if ctx.state.skip_step.swap(false, Ordering::Relaxed) {
-                        info!("wait skipped");
-                        break;
-                    }
-                    let c = cond.clone();
-                    if ctx.eval(&c) == *appear {
-                        break;
-                    }
-                    if Instant::now() >= deadline {
-                        info!("wait timed out");
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(120));
+                });
+                match act {
+                    MissAct::Found | MissAct::Next => pc += 1,
+                    MissAct::Stop => return ScriptEnd::Finished,
+                    MissAct::Break => pc = break_target(steps, pc),
+                    MissAct::Cancelled => return ScriptEnd::Stopped,
                 }
-                pc += 1;
             }
-            StepKind::ClickImage { template, threshold, button } => {
-                let name = template.clone();
-                if ctx.find_image(&name, *threshold) {
-                    let x = ctx.vars.get("match_x").copied().unwrap_or(0.0) as i32;
-                    let y = ctx.vars.get("match_y").copied().unwrap_or(0.0) as i32;
-                    mover.goto(x, y);
-                    guard.note_move(now_us());
-                    if !click_guarded(ctx, *button, pressed, mover, guard) {
-                        return ScriptEnd::Stopped;
-                    }
+            StepKind::FindImage { template, threshold, area, var, edge, miss } => {
+                let (name, v) = (template.clone(), var.clone());
+                let opts = MatchOpts::plain(*threshold, area.clone(), *edge);
+                let m = *miss;
+                let act = ctx.attempt(m, &format!("find image '{name}'"), |ctx| {
+                    ctx.find_image_into(&name, &opts, Some(&v))
+                });
+                match act {
+                    MissAct::Found | MissAct::Next => pc += 1,
+                    MissAct::Stop => return ScriptEnd::Finished,
+                    MissAct::Break => pc = break_target(steps, pc),
+                    MissAct::Cancelled => return ScriptEnd::Stopped,
                 }
-                pc += 1;
+            }
+            StepKind::ClickImage { template, threshold, button, area, edge, miss } => {
+                let name = template.clone();
+                let opts = MatchOpts::plain(*threshold, area.clone(), *edge);
+                let (b, m) = (*button, *miss);
+                let act = ctx.attempt(m, &format!("click image '{name}'"), |ctx| {
+                    ctx.find_image(&name, &opts)
+                });
+                match act {
+                    MissAct::Found => {
+                        let x = ctx.vars.get("match_x").map_or(0.0, |v| v.as_num()) as i32;
+                        let y = ctx.vars.get("match_y").map_or(0.0, |v| v.as_num()) as i32;
+                        mover.goto(x, y);
+                        guard.note_move(now_us());
+                        if !click_guarded(ctx, b, pressed, mover, guard) {
+                            return ScriptEnd::Stopped;
+                        }
+                        pc += 1;
+                    }
+                    MissAct::Next => pc += 1,
+                    MissAct::Stop => return ScriptEnd::Finished,
+                    MissAct::Break => pc = break_target(steps, pc),
+                    MissAct::Cancelled => return ScriptEnd::Stopped,
+                }
             }
             StepKind::Click { x, y, button } => {
                 let (mx, my) = ctx.map.map(*x, *y);
@@ -5291,8 +9369,14 @@ fn run_script(
                 pc += 1;
             }
             StepKind::SetVar { name, op, value } => {
-                let cur = ctx.vars.get(name).copied().unwrap_or(0.0);
-                ctx.vars.insert(name.clone(), op.apply(cur, *value));
+                let cur = ctx.vars.get(name).cloned().unwrap_or_default();
+                // Text on the right may name other variables, which is what makes
+                // building a message out of pieces possible at all.
+                let rhs = match value {
+                    Value::Str(t) => Value::Str(expand_vars(t, &ctx.vars)),
+                    n => n.clone(),
+                };
+                ctx.vars.insert(name.clone(), op.apply_values(&cur, &rhs));
                 pc += 1;
             }
             StepKind::If { cond } => {
@@ -5324,48 +9408,260 @@ fn run_script(
             StepKind::EndWhile => {
                 pc = blocks.start_of[pc].unwrap_or(steps.len());
             }
-            StepKind::Break => {
-                // Jump past the innermost enclosing EndWhile.
-                let mut depth = 0usize;
-                let mut j = pc + 1;
-                let mut target = steps.len();
-                while j < steps.len() {
-                    match steps[j].kind {
-                        StepKind::While { .. } => depth += 1,
-                        StepKind::EndWhile => {
-                            if depth == 0 {
-                                target = j + 1;
-                                break;
-                            }
-                            depth -= 1;
-                        }
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                pc = target;
-            }
+            StepKind::Break => pc = break_target(steps, pc),
             StepKind::Run { path, args } => {
-                run_program(path, args);
+                run_program(
+                    &expand_vars(path, &ctx.vars),
+                    &expand_vars(args, &ctx.vars),
+                );
                 pc += 1;
+            }
+            StepKind::Call { path, miss } => {
+                let (want, m) = (path.clone(), *miss);
+                if ctx.depth >= MAX_CALL_DEPTH {
+                    warn!(
+                        "call '{want}' refused: already {} deep, and {MAX_CALL_DEPTH} is \
+                         the limit - a macro that calls itself would take the process \
+                         down with it",
+                        ctx.depth
+                    );
+                    match m {
+                        OnMiss::Break => {
+                            pc = break_target(steps, pc);
+                            continue;
+                        }
+                        OnMiss::Continue => {
+                            pc += 1;
+                            continue;
+                        }
+                        _ => return ScriptEnd::Finished,
+                    }
+                }
+                let mut loaded = None;
+                let act = ctx.attempt(m, &format!("call '{want}'"), |ctx| {
+                    loaded = ctx.call_target(&want);
+                    loaded.is_some()
+                });
+                match act {
+                    MissAct::Found => {}
+                    MissAct::Next => {
+                        pc += 1;
+                        continue;
+                    }
+                    MissAct::Stop => return ScriptEnd::Finished,
+                    MissAct::Break => {
+                        pc = break_target(steps, pc);
+                        continue;
+                    }
+                    MissAct::Cancelled => return ScriptEnd::Stopped,
+                }
+                let Some(child) = loaded else {
+                    pc += 1;
+                    continue;
+                };
+                // The variables, the template cache and the sighting history move
+                // into the callee and come back out. Sharing them is what makes a
+                // subroutine useful without inventing parameters: the caller sets
+                // `target` before the call and reads `result` after it.
+                let end = {
+                    let mut inner = ScriptCtx {
+                        state: ctx.state,
+                        data: &child,
+                        generation: ctx.generation,
+                        map: ctx.map,
+                        vars: std::mem::take(&mut ctx.vars),
+                        templates: std::mem::take(&mut ctx.templates),
+                        last_text: std::mem::take(&mut ctx.last_text),
+                        last_hit: std::mem::take(&mut ctx.last_hit),
+                        latched: std::mem::take(&mut ctx.latched),
+                        history: std::mem::take(&mut ctx.history),
+                        depth: ctx.depth + 1,
+                        called: std::mem::take(&mut ctx.called),
+                    };
+                    let end = run_script(&mut inner, pressed, mover, guard);
+                    ctx.vars = std::mem::take(&mut inner.vars);
+                    ctx.templates = std::mem::take(&mut inner.templates);
+                    ctx.last_text = std::mem::take(&mut inner.last_text);
+                    ctx.last_hit = std::mem::take(&mut inner.last_hit);
+                    ctx.latched = std::mem::take(&mut inner.latched);
+                    ctx.history = std::mem::take(&mut inner.history);
+                    ctx.called = std::mem::take(&mut inner.called);
+                    end
+                };
+                match end {
+                    // A callee that ran out of steps has returned. A `Break` inside
+                    // it belonged to its own loops and does not reach out here.
+                    ScriptEnd::Finished => pc += 1,
+                    ScriptEnd::Stopped => return ScriptEnd::Stopped,
+                    ScriptEnd::QuitApp => return ScriptEnd::QuitApp,
+                }
             }
             StepKind::Exit => return ScriptEnd::QuitApp,
             StepKind::Log { text } => {
-                info!("script: {text}");
+                info!("script: {}", expand_vars(text, &ctx.vars));
                 pc += 1;
             }
-            StepKind::ReadNumber { x, y, w, h, var } => {
-                match ocr::read_region(*x, *y, *w, *h) {
-                    Ok(boxes) => {
-                        let all = ocr::joined(&boxes);
-                        // A clock reads as seconds, anything else as a plain number,
-                        // which covers both "02:34" and "Gems: 1,250".
-                        let value = ocr::parse_clock(&all)
-                            .or_else(|| ocr::first_number(&all))
-                            .unwrap_or(0.0);
-                        info!("ocr read '{}' -> {var} = {value}", all.replace('\n', " / "));
+            StepKind::FindElement { query, var, timeout_ms, miss } => {
+                let (q, t, m) = (query.clone(), *timeout_ms, *miss);
+                let mut found = None;
+                let act = ctx.attempt(m, &format!("find element \"{}\"", q.name), |_| {
+                    found = uia::find(&q, t);
+                    found.is_some()
+                });
+                match act {
+                    MissAct::Found | MissAct::Next => {}
+                    MissAct::Stop => return ScriptEnd::Finished,
+                    MissAct::Break => {
+                        pc = break_target(steps, pc);
+                        continue;
+                    }
+                    MissAct::Cancelled => return ScriptEnd::Stopped,
+                }
+                let query = &q;
+                note_sighting(|s| {
+                    s.element = found.as_ref().map(|f| {
+                        (f.x - f.w / 2, f.y - f.h / 2, f.w, f.h)
+                    });
+                    s.note = match &found {
+                        Some(f) => format!("element \"{}\"", f.name),
+                        None => format!("no element matched \"{}\"", query.name),
+                    };
+                });
+                let ok = found.is_some();
+                ctx.vars.insert(format!("{var}.found"), Value::Num(f64::from(ok)));
+                match &found {
+                    Some(f) => {
+                        info!("element '{}' at {},{} ({}x{})", f.name, f.x, f.y, f.w, f.h);
+                        // The value if it has one, the name if it does not: a text
+                        // box holds its contents, a button holds its label.
+                        let text =
+                            if f.value.is_empty() { f.name.clone() } else { f.value.clone() };
+                        ctx.vars.insert(var.clone(), Value::Str(text));
+                        ctx.vars.insert(format!("{var}.name"), Value::Str(f.name.clone()));
+                        ctx.vars.insert(format!("{var}.x"), Value::Num(f.x as f64));
+                        ctx.vars.insert(format!("{var}.y"), Value::Num(f.y as f64));
+                        ctx.vars.insert(format!("{var}.w"), Value::Num(f.w as f64));
+                        ctx.vars.insert(format!("{var}.h"), Value::Num(f.h as f64));
+                    }
+                    None => {
+                        ctx.vars.insert(var.clone(), Value::Str(String::new()));
+                    }
+                }
+                pc += 1;
+            }
+            StepKind::ClickElement { query, button, invoke, timeout_ms, miss } => {
+                // Asking the application to press it comes first when it was asked
+                // for; a control with nothing to invoke falls through to a real
+                // click on the rectangle, which is what the fallback is for.
+                let (q, t, inv, b, m) = (query.clone(), *timeout_ms, *invoke, *button, *miss);
+                let mut pressed_it = false;
+                let mut target = None;
+                let act = ctx.attempt(m, &format!("press element \"{}\"", q.name), |_| {
+                    if inv && uia::press(&q, t).is_some() {
+                        pressed_it = true;
+                        return true;
+                    }
+                    target = uia::find(&q, t);
+                    target.is_some()
+                });
+                match act {
+                    MissAct::Found => {
+                        if !pressed_it {
+                            if let Some(f) = target {
+                                mover.goto(f.x, f.y);
+                                guard.note_move(now_us());
+                                if !click_guarded(ctx, b, pressed, mover, guard) {
+                                    return ScriptEnd::Stopped;
+                                }
+                            }
+                        }
+                        pc += 1;
+                    }
+                    MissAct::Next => pc += 1,
+                    MissAct::Stop => return ScriptEnd::Finished,
+                    MissAct::Break => pc = break_target(steps, pc),
+                    MissAct::Cancelled => return ScriptEnd::Stopped,
+                }
+            }
+            StepKind::ReadText { x, y, w, h, var, prep } => {
+                note_sighting(|s| s.text = Some((*x, *y, *w, *h)));
+                match ocr::read_region_as(*x, *y, *w, *h, *prep, &ocr::Expect::Any) {
+                    Ok(r) => {
+                        let all = r.text();
+                        info!(
+                            "ocr read '{}' [{:?} q{:.2}] -> {var}",
+                            all.replace('\n', " / "),
+                            r.prep,
+                            r.quality
+                        );
+                        ctx.vars.insert(format!("{var}.quality"), Value::Num(r.quality));
+                        ctx.vars.insert(var.clone(), Value::Str(all.clone()));
                         ctx.last_text = all;
-                        ctx.vars.insert(var.clone(), value);
+                    }
+                    Err(e) => warn!("ocr failed: {e}"),
+                }
+                pc += 1;
+            }
+            StepKind::GetText { source, var } => {
+                let text = match source {
+                    TextSource::Clipboard => platform::clipboard_text(),
+                    TextSource::WindowTitle => {
+                        platform::foreground_title().unwrap_or_default()
+                    }
+                    TextSource::ProcessName => platform::foreground_process(),
+                    TextSource::File(path) => {
+                        read_text_file(&expand_vars(path, &ctx.vars))
+                    }
+                };
+                info!("{var} = \"{}\"", text.replace('\n', " / "));
+                ctx.vars.insert(var.clone(), Value::Str(text));
+                pc += 1;
+            }
+            StepKind::PutText { sink, text } => {
+                let out = expand_vars(text, &ctx.vars);
+                match sink {
+                    TextSink::Clipboard => {
+                        // Another application holding the clipboard open is common
+                        // and temporary, so this is a warning rather than a stop.
+                        if !platform::set_clipboard_text(&out) {
+                            warn!("the clipboard would not take the text");
+                        }
+                    }
+                    TextSink::File { path, append } => {
+                        write_text_file(&expand_vars(path, &ctx.vars), &out, *append)
+                    }
+                }
+                pc += 1;
+            }
+            StepKind::ReadNumber { x, y, w, h, var, prep, expect } => {
+                note_sighting(|s| s.text = Some((*x, *y, *w, *h)));
+                match ocr::read_region_as(*x, *y, *w, *h, *prep, expect) {
+                    Ok(r) => {
+                        let all = r.text();
+                        // A reading that does not fit the format asked for is not a
+                        // small error, it is a different number. Leaving the variable
+                        // alone lets the script see the old value and decide, which
+                        // beats silently writing a zero.
+                        match ocr::value_of(expect, &all) {
+                            Some(value) if ocr::accepts(expect, &all) => {
+                                info!(
+                                    "ocr read '{}' [{:?} q{:.2}] -> {var} = {value}",
+                                    all.replace('\n', " / "),
+                                    r.prep,
+                                    r.quality
+                                );
+                                ctx.vars.insert(var.clone(), Value::Num(value));
+                            }
+                            _ => warn!(
+                                "ocr read '{}' [{:?} q{:.2}] does not fit {:?} - {var} kept",
+                                all.replace('\n', " / "),
+                                r.prep,
+                                r.quality,
+                                expect
+                            ),
+                        }
+                        ctx.vars.insert(format!("{var}.quality"), Value::Num(r.quality));
+                        ctx.last_text = all;
                     }
                     Err(e) => warn!("ocr failed: {e}"),
                 }
@@ -5432,9 +9728,14 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
             data: &data,
             generation,
             map,
-            vars: data.vars.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            vars: data.vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             templates: Default::default(),
             last_text: String::new(),
+            last_hit: std::collections::HashMap::new(),
+            latched: std::collections::HashMap::new(),
+            history: std::collections::HashMap::new(),
+            depth: 0,
+            called: std::collections::HashMap::new(),
         };
         let mut count: u64 = 0;
         let started = Instant::now();
@@ -5473,6 +9774,15 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
 
         pressed.release_all(&state);
         platform::end_high_res_timer();
+        // A full-screen grab holds 14 MB of committed bitmap; there is no reason
+        // for it to survive the run that asked for it.
+        platform::release_capture_cache();
+        // The variables stay on screen after the run - the last values are usually
+        // the interesting ones - but the window has to stop claiming it is live.
+        note_script_view(|v| {
+            v.running = false;
+            v.waiting = false;
+        });
         if state.play_generation.load(Ordering::Relaxed) == generation {
             state.paused.store(false, Ordering::Relaxed);
             state.playing.store(false, Ordering::Relaxed);
@@ -5643,6 +9953,7 @@ fn playback_loop(state: Arc<AppState>, data: MacroData, generation: u64) {
 
     pressed.release_all(&state);
     platform::end_high_res_timer();
+    platform::release_capture_cache();
     state.held_by_desktop.store(false, Ordering::Relaxed);
 
     if let Some(action) = finish_action {
@@ -5829,6 +10140,7 @@ fn start_recording(state: &Arc<AppState>) {
         data.version = 2;
         data.anchor = anchor;
     }
+    state.click_shots.lock().clear();
     *state.last_x.lock() = i32::MIN;
     *state.last_y.lock() = i32::MIN;
     state.last_move_us.store(0, Ordering::Relaxed);
@@ -5859,6 +10171,10 @@ fn start_playback(state: &Arc<AppState>) {
     state.stop_play.store(false, Ordering::Relaxed);
     state.paused.store(false, Ordering::Relaxed);
     state.skip_step.store(false, Ordering::Relaxed);
+    // A "let one step through" left over from a previous run would spend itself on
+    // this run's first step, which is the one moment somebody stepping through a
+    // script most wants to see.
+    state.step_once.store(false, Ordering::Relaxed);
     state.playing.store(true, Ordering::Relaxed);
 
     let s = state.clone();
@@ -5904,14 +10220,335 @@ fn stop_everything(state: &Arc<AppState>) {
 }
 
 fn collector_thread(rx: Receiver<MacroEvent>, state: Arc<AppState>) {
-    while let Ok(event) = rx.recv() {
-        if state.recording.load(Ordering::Relaxed) {
+    // Set once this thread has taken a screen grab, which is the only reason it
+    // would be holding a bitmap - and, with the fast path, a Direct3D device and a
+    // full-screen texture. Events stop arriving the moment recording stops, so a
+    // plain `recv` would block here forever with all of that still held; the
+    // timeout is what gives the thread somewhere to notice and let go.
+    let mut holding_capture = false;
+    loop {
+        let event = match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(e) => e,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if holding_capture && !state.recording.load(Ordering::Relaxed) {
+                    platform::release_capture_cache();
+                    holding_capture = false;
+                }
+                continue;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        if !state.recording.load(Ordering::Relaxed) {
+            continue;
+        }
+        let index = {
             let mut data = state.macro_data.lock();
-            if data.events.len() < MAX_EVENTS {
-                data.events.push(event);
+            if data.events.len() >= MAX_EVENTS {
+                continue;
+            }
+            data.events.push(event);
+            data.events.len() - 1
+        };
+        // The square is cut here rather than in the hook. A low-level hook holds up
+        // every keystroke and click on the machine until it returns, and a screen
+        // grab is milliseconds; taking one in there would make the mouse stutter
+        // for everybody. This thread is one channel hop behind, which is fast
+        // enough that the button is still drawn the way it was clicked.
+        if let InputEventKind::MouseButton { button, down: true, x, y } = event.kind {
+            holding_capture |= take_click_shot(&state, index, button, x, y);
+        }
+    }
+}
+
+/// Cuts the square around one click, if the setting asks for it.
+///
+/// Returns whether the screen was actually touched, so the caller knows whether it is
+/// now holding a capture cache worth releasing.
+fn take_click_shot(
+    state: &AppState,
+    index: usize,
+    button: MouseButton,
+    x: i32,
+    y: i32,
+) -> bool {
+    if !state.record_click_shots.load(Ordering::Relaxed) {
+        return false;
+    }
+    if state.click_shots.lock().len() >= MAX_CLICK_SHOTS {
+        return false;
+    }
+    let side = state.click_shot_size.load(Ordering::Relaxed).clamp(16, 512) as i32;
+    let (vx, vy, vw, vh) = platform::virtual_screen_rect();
+    // Centred on the click and then pushed inside the desktop, so a click near an
+    // edge still gets a full square rather than a sliver.
+    let left = (x - side / 2).clamp(vx, (vx + vw - side).max(vx));
+    let top = (y - side / 2).clamp(vy, (vy + vh - side).max(vy));
+    let w = side.min(vw);
+    let h = side.min(vh);
+    let Some(frame) = platform::capture(left, top, w, h) else {
+        return true; // it tried, so the cache may well exist
+    };
+    state.click_shots.lock().push(ClickShot {
+        index,
+        button,
+        x,
+        y,
+        left,
+        top,
+        w: frame.w,
+        h: frame.h,
+        rgba: frame.to_rgba(),
+        dpi: platform::current_dpi(),
+    });
+    true
+}
+
+// ============================================================================
+// Debug overlay
+// ============================================================================
+
+/// A see-through window over everything, drawing what the script just looked at.
+///
+/// A layered Win32 window rather than a second eframe viewport, for three reasons.
+/// The first is decisive: a transparent viewport needs the GL config chosen at
+/// start-up to carry an alpha channel, and on a machine whose driver does not offer
+/// one eframe says so in the log and creates the window *opaque* - which for a
+/// full-screen overlay means covering the desktop in grey. A colour-keyed layered
+/// window has no such dependency. The second is that this costs no GL surface and
+/// no second render loop. The third is that GDI draws in physical pixels, which is
+/// what every rectangle here is already measured in, so a mixed-DPI desktop needs no
+/// conversion and nothing drifts on the second monitor.
+#[cfg(windows)]
+mod overlay {
+    use super::win32::*;
+    use super::{SIGHTING, wide};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+
+    /// Painted where nothing should be seen. Windows makes every pixel of exactly
+    /// this colour transparent, and a transparent pixel is also not clickable.
+    const KEY: u32 = 0x0010_0F0E;
+
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    static WANTED: AtomicBool = AtomicBool::new(false);
+    static HWND_SLOT: AtomicIsize = AtomicIsize::new(0);
+
+    /// Turns the overlay on or off. Cheap and idempotent; safe to call every frame.
+    pub fn set_enabled(on: bool) {
+        let was = WANTED.swap(on, Ordering::Relaxed);
+        if on {
+            // Not skipped when it was already wanted: switching it off and straight
+            // back on can catch the thread mid-teardown, and then nothing would ever
+            // put the window back while the box stayed ticked. Two atomics a frame.
+            if !RUNNING.swap(true, Ordering::Relaxed) {
+                let _ = std::thread::Builder::new()
+                    .name("overlay".into())
+                    .spawn(|| unsafe { run() });
+            }
+            return;
+        }
+        if !was {
+            return;
+        }
+        // The thread notices `WANTED` and takes its own window down: a window may
+        // only be destroyed by the thread that created it. The message is only to
+        // wake it sooner than its next tick.
+        let h = HWND_SLOT.load(Ordering::Relaxed);
+        if h != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(h as *mut std::ffi::c_void)),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
             }
         }
     }
+
+    pub fn shutdown() {
+        set_enabled(false);
+    }
+
+    unsafe fn run() {
+        unsafe {
+            let hinst = GetModuleHandleW(None).map(|h| HINSTANCE(h.0)).unwrap_or_default();
+            let class = w!("MacroRecorderOverlayWnd");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(wndproc),
+                hInstance: hinst,
+                lpszClassName: class,
+                // Erased in the key colour, so the window is invisible from the
+                // moment it appears rather than from its first paint. Without this
+                // the surface starts as whatever was in memory, and a full-screen
+                // window showing that for one frame is startling.
+                hbrBackground: CreateSolidBrush(COLORREF(KEY)),
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+
+            let (vx, vy, vw, vh) = super::platform::virtual_screen_rect();
+            let hwnd = CreateWindowExW(
+                // Layered for the colour key, transparent so clicks fall through to
+                // whatever is underneath, no-activate and tool-window so it never
+                // takes focus or appears in Alt-Tab.
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_TOPMOST
+                    | WS_EX_NOACTIVATE,
+                class,
+                PCWSTR(wide("Macro Recorder overlay").as_ptr()),
+                WS_POPUP,
+                vx,
+                vy,
+                vw,
+                vh,
+                None,
+                None,
+                Some(hinst),
+                None,
+            );
+            let hwnd = match hwnd {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("overlay window could not be created: {e}");
+                    RUNNING.store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
+            tracing::info!("overlay window up at {vx},{vy} {vw}x{vh}");
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(KEY), 0, LWA_COLORKEY);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            HWND_SLOT.store(hwnd.0 as isize, Ordering::Relaxed);
+
+            let mut seen = u64::MAX;
+            let mut msg = MSG::default();
+            while WANTED.load(Ordering::Relaxed) {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        WANTED.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                // Repaint only when there is something new to draw. A layered window
+                // redrawn ten times a second for no reason is a visible flicker and a
+                // pointless slice of a core.
+                let now = SIGHTING.lock().seq;
+                if now != seen {
+                    seen = now;
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    let _ = UpdateWindow(hwnd);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            HWND_SLOT.store(0, Ordering::Relaxed);
+            let _ = DestroyWindow(hwnd);
+            RUNNING.store(false, Ordering::Relaxed);
+        }
+    }
+
+    unsafe extern "system" fn wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+    ) -> LRESULT {
+        unsafe {
+            match msg {
+                WM_PAINT => {
+                    let mut ps = PAINTSTRUCT::default();
+                    let hdc = BeginPaint(hwnd, &mut ps);
+                    paint(hwnd, hdc);
+                    let _ = EndPaint(hwnd, &ps);
+                    LRESULT(0)
+                }
+                WM_CLOSE => {
+                    WANTED.store(false, Ordering::Relaxed);
+                    LRESULT(0)
+                }
+                // Nothing should ever hit this window, but say so anyway.
+                WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+                _ => DefWindowProcW(hwnd, msg, wp, lp),
+            }
+        }
+    }
+
+    /// Draws into an off-screen bitmap and blits it once.
+    ///
+    /// Straight onto the window would flash: the key-coloured fill and the
+    /// rectangles over it are two separate presentations of a layered surface.
+    unsafe fn paint(hwnd: HWND, hdc: HDC) {
+        unsafe {
+            let mut rc = RECT::default();
+            if GetClientRect(hwnd, &mut rc).is_err() {
+                return;
+            }
+            let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+            if w <= 0 || h <= 0 {
+                return;
+            }
+            let mem = CreateCompatibleDC(Some(hdc));
+            let bmp = CreateCompatibleBitmap(hdc, w, h);
+            let old = SelectObject(mem, HGDIOBJ(bmp.0));
+
+            let key_brush = CreateSolidBrush(COLORREF(KEY));
+            FillRect(mem, &rc, key_brush);
+            let _ = DeleteObject(HGDIOBJ(key_brush.0));
+
+            let seen = SIGHTING.lock().clone();
+            let (ox, oy, _, _) = super::platform::virtual_screen_rect();
+            let frame = |x: i32, y: i32, rw: i32, rh: i32, colour: u32, width: i32| {
+                let pen = CreatePen(PS_SOLID, width, COLORREF(colour));
+                let old_pen = SelectObject(mem, HGDIOBJ(pen.0));
+                let old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
+                let _ = Rectangle(mem, x - ox, y - oy, x - ox + rw, y - oy + rh);
+                SelectObject(mem, old_brush);
+                SelectObject(mem, old_pen);
+                let _ = DeleteObject(HGDIOBJ(pen.0));
+            };
+
+            // Blue: where it was allowed to look. Amber: where text was read.
+            // Violet: the interface element. Green or red: the match itself.
+            if let Some((x, y, rw, rh)) = seen.area {
+                frame(x, y, rw, rh, 0x00FF_A05A, 1);
+            }
+            if let Some((x, y, rw, rh)) = seen.text {
+                frame(x, y, rw, rh, 0x003C_BEFF, 1);
+            }
+            if let Some((x, y, rw, rh)) = seen.element {
+                frame(x, y, rw, rh, 0x00FF_78B4, 2);
+            }
+            if let Some((x, y, rw, rh, score)) = seen.hit {
+                // The colour is the answer and the number under it is why.
+                let col = if score >= 0.85 { 0x0078_DC50 } else { 0x005A_5AF0 };
+                frame(x, y, rw, rh, col, 2);
+                let label = wide(&format!("{score:.3}"));
+                SetBkMode(mem, TRANSPARENT);
+                SetTextColor(mem, COLORREF(col));
+                let _ = TextOutW(mem, x - ox, y - oy + rh + 2, &label[..label.len() - 1]);
+            }
+            if !seen.note.is_empty() {
+                let label = wide(&seen.note);
+                SetBkMode(mem, TRANSPARENT);
+                SetTextColor(mem, COLORREF(0x00E6_E6E6));
+                let _ = TextOutW(mem, 12, 12, &label[..label.len() - 1]);
+            }
+
+            let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod overlay {
+    pub fn set_enabled(_on: bool) {}
+    pub fn shutdown() {}
 }
 
 // ============================================================================
@@ -6230,6 +10867,9 @@ fn input_hook_thread(state: Arc<AppState>, mode: HookMode, with_tray: bool) {
         }
 
         tray::shutdown();
+        // The overlay owns a window on a thread of its own; it has to be told to
+        // take it down, or the desktop keeps a dead frame drawn on it.
+        overlay::shutdown();
         for id in HK_IDS {
             let _ = UnregisterHotKey(None, id);
         }
@@ -6536,6 +11176,24 @@ define_strings!(
     exp_add, exp_abbr, exp_text, exp_prefix, exp_default_trigger, exp_delims,
     exp_excluded_lbl, exp_tr_inherit, exp_tr_delim, exp_tr_prefix, exp_tr_instant,
     exp_in_type, exp_in_paste,
+    k_findimg, f_area, a_full, a_window, a_rect, a_near, f_margin, f_into, f_find_hint,
+    exp_ac_text, exp_ac_play, exp_ac_stop, exp_ac_run, f_lose_at, f_stable,
+    f_prep, p_none, p_ui, p_small, p_game, p_digits, p_auto,
+    f_expect, x_any, x_int, x_dec, x_time, x_pattern, tip_pattern, ocr_quality,
+    v_number, v_text, tip_value_text,
+    k_readtext, k_gettext, k_puttext, c_process, tip_process,
+    t_clipboard, t_wintitle, t_process, t_file, f_append,
+    a_anchor, f_anchor, f_edge, tip_edge,
+    c_element, k_findelem, k_clickelem, f_name, f_autoid, f_control, f_any,
+    f_in_front, f_invoke, tip_invoke, tip_uia, img_overlay, tip_overlay,
+    // 1.5.0
+    m_onmiss, m_continue, m_stop, m_break, m_retry, m_times, m_delay, tip_onmiss,
+    k_call, f_macro_file, tip_call, call_depth,
+    fast_capture, tip_fast_capture,
+    sec_vars, vars_open, vars_title, vars_none, vars_name, vars_value, vars_step,
+    vars_stepmode, vars_stepnext, tip_stepmode, vars_running, vars_idle,
+    rec_shots, rec_shots_ask, rec_shots_make, rec_shots_skip, rec_shots_done,
+    rec_shots_cb, tip_rec_shots, rec_shots_size, rec_shots_miss,
 );
 
 const EN: Strings = Strings {
@@ -6655,6 +11313,52 @@ const EN: Strings = Strings {
     exp_excluded_lbl: "Never in windows", exp_tr_inherit: "default",
     exp_tr_delim: "after a delimiter", exp_tr_prefix: "behind a marker",
     exp_tr_instant: "immediately", exp_in_type: "type", exp_in_paste: "paste",
+    k_findimg: "Find image", f_area: "Area", a_full: "whole screen",
+    a_window: "active window", a_rect: "a rectangle", a_near: "near the last match",
+    f_margin: "margin", f_into: "into", f_find_hint: "sets {}.found .x .y .w .h .score",
+    exp_ac_text: "types text", exp_ac_play: "plays a macro", exp_ac_stop: "stops everything",
+    exp_ac_run: "runs a program",
+    f_lose_at: "lost below", f_stable: "stable",
+    f_prep: "Prep", p_none: "none", p_ui: "interface", p_small: "small text",
+    p_game: "game HUD", p_digits: "digits", p_auto: "try each",
+    f_expect: "Expect", x_any: "anything", x_int: "whole number", x_dec: "decimal",
+    x_time: "clock", x_pattern: "pattern",
+    tip_pattern: "# a digit, @ a letter, ? one character, * any run",
+    ocr_quality: "fit {} ({})",
+    v_number: "number", v_text: "text",
+    tip_value_text: "{name} is replaced by what that variable holds; {{ is a brace",
+    k_readtext: "Read text", k_gettext: "Get text", k_puttext: "Put text",
+    c_process: "Process running", tip_process: "part of the name is enough",
+    t_clipboard: "clipboard", t_wintitle: "title of the window in front",
+    t_process: "program in front", t_file: "file", f_append: "add to the end",
+    a_anchor: "relative to another picture", f_anchor: "Anchor", f_edge: "outlines",
+    tip_edge: "match shapes rather than shades - survives a theme change",
+    c_element: "Element on screen", k_findelem: "Find element",
+    k_clickelem: "Press element", f_name: "Name", f_autoid: "Id", f_control: "Kind",
+    f_any: "any", f_in_front: "in the window in front", f_invoke: "ask the app",
+    tip_invoke: "press it through the application instead of clicking at it",
+    tip_uia: "the name a screen reader would read; games draw their own interface and expose none",
+    img_overlay: "Show what the script looks at",
+    tip_overlay: "a see-through window over everything, drawing the last search area and match",
+    m_onmiss: "If not found:", m_continue: "carry on", m_stop: "stop the script",
+    m_break: "leave the loop", m_retry: "try again", m_times: "times",
+    m_delay: "apart (ms)",
+    tip_onmiss: "until 1.5.0 every one of these steps carried on in silence, which is how a night macro ends up clicking at nothing for three hours",
+    k_call: "Call macro", f_macro_file: "File", tip_call: "runs another macro's script here; the variables are shared, nesting is capped at 8",
+    call_depth: "call nesting is capped at {}",
+    fast_capture: "Fast screen capture",
+    tip_fast_capture: "Desktop Duplication instead of GDI: about 5x on a whole screen and 20x on a small region. Falls back on its own if this machine will not do it.",
+    sec_vars: "🔎 Variables", vars_open: "Watch the run", vars_title: "Variables",
+    vars_none: "nothing set yet", vars_name: "name", vars_value: "value",
+    vars_step: "step", vars_stepmode: "Pause before each step", vars_stepnext: "▶ Next step",
+    tip_stepmode: "the script stops before every step and waits for Next",
+    vars_running: "running", vars_idle: "not running",
+    rec_shots: "📸 {} clicks with a picture", rec_shots_ask: "Turn {} recorded clicks into steps that look for the picture instead of the coordinates?",
+    rec_shots_make: "Make picture steps", rec_shots_skip: "Keep the coordinates",
+    rec_shots_done: "{} picture steps written",
+    rec_shots_cb: "Snip a picture at every click",
+    tip_rec_shots: "while recording, keep a small square from around each click, so the recording can be turned into steps that find the button wherever it has moved to",
+    rec_shots_size: "Square size (px)", rec_shots_miss: "If a picture is not found:",
 };
 
 const RU: Strings = Strings {
@@ -6779,6 +11483,53 @@ const RU: Strings = Strings {
     exp_excluded_lbl: "Молчать в окнах", exp_tr_inherit: "по умолчанию",
     exp_tr_delim: "после разделителя", exp_tr_prefix: "за префиксом",
     exp_tr_instant: "сразу", exp_in_type: "печатать", exp_in_paste: "вставить",
+    k_findimg: "Найти картинку", f_area: "Область", a_full: "весь экран",
+    a_window: "активное окно", a_rect: "прямоугольник", a_near: "рядом с прошлым совпадением",
+    f_margin: "запас", f_into: "в", f_find_hint: "задаёт {}.found .x .y .w .h .score",
+    exp_ac_text: "печатает текст", exp_ac_play: "запускает макрос", exp_ac_stop: "останавливает всё",
+    exp_ac_run: "запускает программу",
+    f_lose_at: "потеряно ниже", f_stable: "стабильно",
+    f_prep: "Обработка", p_none: "без неё", p_ui: "интерфейс",
+    p_small: "мелкий текст", p_game: "игровой HUD", p_digits: "цифры",
+    p_auto: "перебрать",
+    f_expect: "Ожидается", x_any: "что угодно", x_int: "целое число",
+    x_dec: "дробное число", x_time: "время", x_pattern: "шаблон",
+    tip_pattern: "# цифра, @ буква, ? один символ, * любой отрезок",
+    ocr_quality: "соответствие {} ({})",
+    v_number: "число", v_text: "текст",
+    tip_value_text: "{имя} заменяется значением переменной; {{ — сама скобка",
+    k_readtext: "Прочитать текст", k_gettext: "Взять текст", k_puttext: "Записать текст",
+    c_process: "Процесс запущен", tip_process: "достаточно части имени",
+    t_clipboard: "буфер обмена", t_wintitle: "заголовок активного окна",
+    t_process: "активная программа", t_file: "файл", f_append: "дописывать в конец",
+    a_anchor: "относительно другой картинки", f_anchor: "Якорь", f_edge: "по контурам",
+    tip_edge: "сравнивать форму, а не оттенки — переживает смену темы",
+    c_element: "Элемент на экране", k_findelem: "Найти элемент",
+    k_clickelem: "Нажать элемент", f_name: "Имя", f_autoid: "Id", f_control: "Тип",
+    f_any: "любой", f_in_front: "в активном окне", f_invoke: "через приложение",
+    tip_invoke: "попросить приложение нажать, а не кликать по координатам",
+    tip_uia: "имя, которое произнёс бы экранный диктор; игры рисуют интерфейс сами и ничего не сообщают",
+    img_overlay: "Показывать, куда смотрит скрипт",
+    tip_overlay: "прозрачное окно поверх всего: последняя область поиска и последнее совпадение",
+    m_onmiss: "Если не найдено:", m_continue: "идти дальше", m_stop: "остановить скрипт",
+    m_break: "выйти из цикла", m_retry: "повторить", m_times: "раз",
+    m_delay: "интервал (мс)",
+    tip_onmiss: "до 1.5.0 все эти шаги молча шли дальше — так ночной макрос три часа кликает в пустоту",
+    k_call: "Вызвать макрос", f_macro_file: "Файл", tip_call: "выполняет скрипт другого макроса здесь же; переменные общие, вложенность не глубже 8",
+    call_depth: "глубина вызовов ограничена {}",
+    fast_capture: "Быстрый захват экрана",
+    tip_fast_capture: "Desktop Duplication вместо GDI: примерно в 5 раз быстрее на весь экран и в 20 раз на маленькой области. Если машина не умеет — сам вернётся к GDI.",
+    sec_vars: "🔎 Переменные", vars_open: "Следить за прогоном", vars_title: "Переменные",
+    vars_none: "пока ничего не задано", vars_name: "имя", vars_value: "значение",
+    vars_step: "шаг", vars_stepmode: "Пауза перед каждым шагом", vars_stepnext: "▶ Следующий шаг",
+    tip_stepmode: "скрипт останавливается перед каждым шагом и ждёт «Следующий шаг»",
+    vars_running: "идёт", vars_idle: "не идёт",
+    rec_shots: "📸 Кликов с картинкой: {}", rec_shots_ask: "Превратить {} записанных кликов в шаги, которые ищут картинку, а не координаты?",
+    rec_shots_make: "Сделать шаги по картинке", rec_shots_skip: "Оставить координаты",
+    rec_shots_done: "Создано шагов по картинке: {}",
+    rec_shots_cb: "Вырезать картинку на каждом клике",
+    tip_rec_shots: "во время записи сохранять небольшой квадрат вокруг каждого клика, чтобы потом превратить запись в шаги, которые найдут кнопку там, куда она переехала",
+    rec_shots_size: "Размер квадрата (px)", rec_shots_miss: "Если картинка не найдена:",
 };
 
 const UK: Strings = Strings {
@@ -6904,6 +11655,53 @@ const UK: Strings = Strings {
     exp_excluded_lbl: "Мовчати у вікнах", exp_tr_inherit: "за умовчанням",
     exp_tr_delim: "після роздільника", exp_tr_prefix: "за префіксом",
     exp_tr_instant: "одразу", exp_in_type: "друкувати", exp_in_paste: "вставити",
+    k_findimg: "Знайти картинку", f_area: "Область", a_full: "увесь екран",
+    a_window: "активне вікно", a_rect: "прямокутник", a_near: "біля минулого збігу",
+    f_margin: "запас", f_into: "у", f_find_hint: "задає {}.found .x .y .w .h .score",
+    exp_ac_text: "друкує текст", exp_ac_play: "запускає макрос", exp_ac_stop: "зупиняє все",
+    exp_ac_run: "запускає програму",
+    f_lose_at: "втрачено нижче", f_stable: "стабільно",
+    f_prep: "Обробка", p_none: "без неї", p_ui: "інтерфейс",
+    p_small: "дрібний текст", p_game: "ігровий HUD", p_digits: "цифри",
+    p_auto: "перебрати",
+    f_expect: "Очікується", x_any: "будь-що", x_int: "ціле число",
+    x_dec: "дробове число", x_time: "час", x_pattern: "шаблон",
+    tip_pattern: "# цифра, @ літера, ? один символ, * будь-який відрізок",
+    ocr_quality: "відповідність {} ({})",
+    v_number: "число", v_text: "текст",
+    tip_value_text: "{ім'я} замінюється значенням змінної; {{ — сама дужка",
+    k_readtext: "Прочитати текст", k_gettext: "Узяти текст", k_puttext: "Записати текст",
+    c_process: "Процес запущено", tip_process: "достатньо частини імені",
+    t_clipboard: "буфер обміну", t_wintitle: "заголовок активного вікна",
+    t_process: "активна програма", t_file: "файл", f_append: "дописувати в кінець",
+    a_anchor: "відносно іншої картинки", f_anchor: "Якір", f_edge: "за контурами",
+    tip_edge: "порівнювати форму, а не відтінки — переживає зміну теми",
+    c_element: "Елемент на екрані", k_findelem: "Знайти елемент",
+    k_clickelem: "Натиснути елемент", f_name: "Ім'я", f_autoid: "Id", f_control: "Тип",
+    f_any: "будь-який", f_in_front: "в активному вікні", f_invoke: "через застосунок",
+    tip_invoke: "попросити застосунок натиснути, а не клацати по координатах",
+    tip_uia: "ім'я, яке б озвучив екранний диктор; ігри малюють інтерфейс самі й нічого не повідомляють",
+    img_overlay: "Показувати, куди дивиться скрипт",
+    tip_overlay: "прозоре вікно поверх усього: остання область пошуку й останній збіг",
+    m_onmiss: "Якщо не знайдено:", m_continue: "йти далі", m_stop: "зупинити скрипт",
+    m_break: "вийти з циклу", m_retry: "повторити", m_times: "разів",
+    m_delay: "інтервал (мс)",
+    tip_onmiss: "до 1.5.0 всі ці кроки мовчки йшли далі — так нічний макрос три години клікає в порожнечу",
+    k_call: "Викликати макрос", f_macro_file: "Файл", tip_call: "виконує скрипт іншого макроса тут; змінні спільні, вкладеність не глибша за 8",
+    call_depth: "глибина викликів обмежена {}",
+    fast_capture: "Швидкий захват екрана",
+    tip_fast_capture: "Desktop Duplication замість GDI: приблизно у 5 разів швидше на весь екран і у 20 разів на малій області. Якщо машина не вміє — сам повернеться до GDI.",
+    sec_vars: "🔎 Змінні", vars_open: "Стежити за прогоном", vars_title: "Змінні",
+    vars_none: "поки нічого не задано", vars_name: "ім'я", vars_value: "значення",
+    vars_step: "крок", vars_stepmode: "Пауза перед кожним кроком", vars_stepnext: "▶ Наступний крок",
+    tip_stepmode: "скрипт зупиняється перед кожним кроком і чекає «Наступний крок»",
+    vars_running: "триває", vars_idle: "не триває",
+    rec_shots: "📸 Кліків із картинкою: {}", rec_shots_ask: "Перетворити {} записаних кліків на кроки, які шукають картинку, а не координати?",
+    rec_shots_make: "Зробити кроки за картинкою", rec_shots_skip: "Залишити координати",
+    rec_shots_done: "Створено кроків за картинкою: {}",
+    rec_shots_cb: "Вирізати картинку на кожному кліку",
+    tip_rec_shots: "під час запису зберігати невеликий квадрат навколо кожного кліку, щоб потім перетворити запис на кроки, які знайдуть кнопку там, куди вона переїхала",
+    rec_shots_size: "Розмір квадрата (px)", rec_shots_miss: "Якщо картинку не знайдено:",
 };
 
 const PT: Strings = Strings {
@@ -7026,6 +11824,54 @@ const PT: Strings = Strings {
     exp_excluded_lbl: "Nunca em janelas", exp_tr_inherit: "predefinido",
     exp_tr_delim: "após delimitador", exp_tr_prefix: "atrás de marca",
     exp_tr_instant: "imediatamente", exp_in_type: "escrever", exp_in_paste: "colar",
+    k_findimg: "Procurar imagem", f_area: "Área", a_full: "ecrã inteiro",
+    a_window: "janela ativa", a_rect: "um retângulo", a_near: "perto do último acerto",
+    f_margin: "margem", f_into: "para", f_find_hint: "define {}.found .x .y .w .h .score",
+    exp_ac_text: "escreve texto", exp_ac_play: "reproduz um macro", exp_ac_stop: "para tudo",
+    exp_ac_run: "executa um programa",
+    f_lose_at: "perdido abaixo de", f_stable: "estável",
+    f_prep: "Preparo", p_none: "nenhum", p_ui: "interface",
+    p_small: "texto pequeno", p_game: "HUD de jogo", p_digits: "dígitos",
+    p_auto: "tentar todos",
+    f_expect: "Esperado", x_any: "qualquer coisa", x_int: "número inteiro",
+    x_dec: "número decimal", x_time: "relógio", x_pattern: "padrão",
+    tip_pattern: "# um dígito, @ uma letra, ? um carácter, * qualquer trecho",
+    ocr_quality: "ajuste {} ({})",
+    v_number: "número", v_text: "texto",
+    tip_value_text: "{nome} é substituído pelo valor da variável; {{ é uma chaveta",
+    k_readtext: "Ler texto", k_gettext: "Obter texto", k_puttext: "Gravar texto",
+    c_process: "Processo em execução", tip_process: "basta parte do nome",
+    t_clipboard: "área de transferência", t_wintitle: "título da janela em primeiro plano",
+    t_process: "programa em primeiro plano", t_file: "ficheiro", f_append: "juntar ao fim",
+    a_anchor: "relativo a outra imagem", f_anchor: "Âncora", f_edge: "contornos",
+    tip_edge: "comparar formas em vez de tons - resiste a uma mudança de tema",
+    c_element: "Elemento no ecrã", k_findelem: "Procurar elemento",
+    k_clickelem: "Premir elemento", f_name: "Nome", f_autoid: "Id", f_control: "Tipo",
+    f_any: "qualquer", f_in_front: "na janela em primeiro plano",
+    f_invoke: "pela aplicação",
+    tip_invoke: "pedir à aplicação que prima, em vez de clicar nas coordenadas",
+    tip_uia: "o nome que um leitor de ecrã leria; os jogos desenham a interface e não expõem nada",
+    img_overlay: "Mostrar onde o guião procura",
+    tip_overlay: "uma janela transparente sobre tudo, com a última área de procura e o último acerto",
+    m_onmiss: "Se não encontrar:", m_continue: "continuar", m_stop: "parar o guião",
+    m_break: "sair do ciclo", m_retry: "tentar de novo", m_times: "vezes",
+    m_delay: "intervalo (ms)",
+    tip_onmiss: "até 1.5.0 todos estes passos seguiam em silêncio — é assim que uma macro nocturna passa três horas a clicar no vazio",
+    k_call: "Chamar macro", f_macro_file: "Ficheiro", tip_call: "corre aqui o guião de outra macro; as variáveis são as mesmas, o aninhamento pára aos 8",
+    call_depth: "o aninhamento de chamadas está limitado a {}",
+    fast_capture: "Captura de ecrã rápida",
+    tip_fast_capture: "Desktop Duplication em vez de GDI: cerca de 5x num ecrã inteiro e 20x numa região pequena. Volta sozinho ao GDI se a máquina não souber.",
+    sec_vars: "🔎 Variáveis", vars_open: "Ver a execução", vars_title: "Variáveis",
+    vars_none: "ainda nada definido", vars_name: "nome", vars_value: "valor",
+    vars_step: "passo", vars_stepmode: "Pausa antes de cada passo", vars_stepnext: "▶ Passo seguinte",
+    tip_stepmode: "o guião pára antes de cada passo e espera por Passo seguinte",
+    vars_running: "a correr", vars_idle: "parado",
+    rec_shots: "📸 {} cliques com imagem", rec_shots_ask: "Transformar {} cliques gravados em passos que procuram a imagem em vez das coordenadas?",
+    rec_shots_make: "Criar passos por imagem", rec_shots_skip: "Manter as coordenadas",
+    rec_shots_done: "{} passos por imagem criados",
+    rec_shots_cb: "Recortar uma imagem em cada clique",
+    tip_rec_shots: "durante a gravação, guardar um quadrado pequeno à volta de cada clique, para depois transformar a gravação em passos que encontram o botão onde quer que ele esteja",
+    rec_shots_size: "Tamanho do quadrado (px)", rec_shots_miss: "Se a imagem não for encontrada:",
 };
 
 const ES: Strings = Strings {
@@ -7150,6 +11996,54 @@ const ES: Strings = Strings {
     exp_excluded_lbl: "Nunca en ventanas", exp_tr_inherit: "por defecto",
     exp_tr_delim: "tras delimitador", exp_tr_prefix: "tras marca",
     exp_tr_instant: "al instante", exp_in_type: "escribir", exp_in_paste: "pegar",
+    k_findimg: "Buscar imagen", f_area: "Área", a_full: "toda la pantalla",
+    a_window: "ventana activa", a_rect: "un rectángulo", a_near: "cerca del último acierto",
+    f_margin: "margen", f_into: "en", f_find_hint: "define {}.found .x .y .w .h .score",
+    exp_ac_text: "escribe texto", exp_ac_play: "reproduce un macro", exp_ac_stop: "detiene todo",
+    exp_ac_run: "ejecuta un programa",
+    f_lose_at: "perdido por debajo de", f_stable: "estable",
+    f_prep: "Preparación", p_none: "ninguna", p_ui: "interfaz",
+    p_small: "texto pequeño", p_game: "HUD de juego", p_digits: "dígitos",
+    p_auto: "probar todas",
+    f_expect: "Se espera", x_any: "cualquier cosa", x_int: "número entero",
+    x_dec: "número decimal", x_time: "reloj", x_pattern: "patrón",
+    tip_pattern: "# un dígito, @ una letra, ? un carácter, * cualquier tramo",
+    ocr_quality: "ajuste {} ({})",
+    v_number: "número", v_text: "texto",
+    tip_value_text: "{nombre} se sustituye por el valor de la variable; {{ es una llave",
+    k_readtext: "Leer texto", k_gettext: "Obtener texto", k_puttext: "Guardar texto",
+    c_process: "Proceso en ejecución", tip_process: "basta parte del nombre",
+    t_clipboard: "portapapeles", t_wintitle: "título de la ventana activa",
+    t_process: "programa activo", t_file: "archivo", f_append: "añadir al final",
+    a_anchor: "relativo a otra imagen", f_anchor: "Ancla", f_edge: "contornos",
+    tip_edge: "comparar formas en vez de tonos - resiste un cambio de tema",
+    c_element: "Elemento en pantalla", k_findelem: "Buscar elemento",
+    k_clickelem: "Pulsar elemento", f_name: "Nombre", f_autoid: "Id", f_control: "Tipo",
+    f_any: "cualquiera", f_in_front: "en la ventana activa",
+    f_invoke: "por la aplicación",
+    tip_invoke: "pedir a la aplicación que lo pulse, en vez de hacer clic en las coordenadas",
+    tip_uia: "el nombre que leería un lector de pantalla; los juegos dibujan su interfaz y no exponen nada",
+    img_overlay: "Mostrar dónde mira el guion",
+    tip_overlay: "una ventana transparente sobre todo, con la última área de búsqueda y el último acierto",
+    m_onmiss: "Si no se encuentra:", m_continue: "seguir", m_stop: "detener el guion",
+    m_break: "salir del bucle", m_retry: "reintentar", m_times: "veces",
+    m_delay: "intervalo (ms)",
+    tip_onmiss: "hasta 1.5.0 todos estos pasos seguían en silencio — así es como una macro nocturna pasa tres horas haciendo clic en el vacío",
+    k_call: "Llamar macro", f_macro_file: "Archivo", tip_call: "ejecuta aquí el guion de otra macro; las variables son las mismas, el anidamiento se corta en 8",
+    call_depth: "el anidamiento de llamadas está limitado a {}",
+    fast_capture: "Captura de pantalla rápida",
+    tip_fast_capture: "Desktop Duplication en vez de GDI: unas 5x en la pantalla entera y 20x en una región pequeña. Vuelve solo a GDI si la máquina no puede.",
+    sec_vars: "🔎 Variables", vars_open: "Ver la ejecución", vars_title: "Variables",
+    vars_none: "aún no hay nada", vars_name: "nombre", vars_value: "valor",
+    vars_step: "paso", vars_stepmode: "Pausa antes de cada paso", vars_stepnext: "▶ Paso siguiente",
+    tip_stepmode: "el guion se detiene antes de cada paso y espera a Paso siguiente",
+    vars_running: "en marcha", vars_idle: "detenido",
+    rec_shots: "📸 {} clics con imagen", rec_shots_ask: "¿Convertir {} clics grabados en pasos que buscan la imagen en lugar de las coordenadas?",
+    rec_shots_make: "Crear pasos por imagen", rec_shots_skip: "Mantener las coordenadas",
+    rec_shots_done: "{} pasos por imagen creados",
+    rec_shots_cb: "Recortar una imagen en cada clic",
+    tip_rec_shots: "durante la grabación, guardar un cuadrado pequeño alrededor de cada clic, para luego convertir la grabación en pasos que encuentren el botón donde sea que esté",
+    rec_shots_size: "Tamaño del cuadrado (px)", rec_shots_miss: "Si no se encuentra la imagen:",
 };
 
 const ZH: Strings = Strings {
@@ -7269,6 +12163,52 @@ const ZH: Strings = Strings {
     exp_excluded_lbl: "在这些窗口中不触发", exp_tr_inherit: "默认",
     exp_tr_delim: "分隔符之后", exp_tr_prefix: "标记之后",
     exp_tr_instant: "立即", exp_in_type: "逐字输入", exp_in_paste: "粘贴",
+    k_findimg: "查找图片", f_area: "搜索范围", a_full: "整个屏幕",
+    a_window: "活动窗口", a_rect: "指定矩形", a_near: "上次命中附近",
+    f_margin: "外扩", f_into: "存入", f_find_hint: "写入 {}.found .x .y .w .h .score",
+    exp_ac_text: "输入文本", exp_ac_play: "播放宏", exp_ac_stop: "停止全部",
+    exp_ac_run: "运行程序",
+    f_lose_at: "低于则视为消失", f_stable: "稳定",
+    f_prep: "预处理", p_none: "不处理", p_ui: "界面文字", p_small: "小号文字",
+    p_game: "游戏 HUD", p_digits: "数字", p_auto: "逐个尝试",
+    f_expect: "期望格式", x_any: "任意", x_int: "整数", x_dec: "小数",
+    x_time: "时间", x_pattern: "模式",
+    tip_pattern: "# 一位数字, @ 一个字母, ? 任意一个字符, * 任意长度",
+    ocr_quality: "匹配度 {} ({})",
+    v_number: "数值", v_text: "文本",
+    tip_value_text: "{名称} 会替换为该变量的值; {{ 表示大括号本身",
+    k_readtext: "读取文本", k_gettext: "取得文本", k_puttext: "写出文本",
+    c_process: "进程在运行", tip_process: "写出名称的一部分即可",
+    t_clipboard: "剪贴板", t_wintitle: "前台窗口标题",
+    t_process: "前台程序", t_file: "文件", f_append: "追加到末尾",
+    a_anchor: "相对另一张图片", f_anchor: "锚点", f_edge: "按轮廓",
+    tip_edge: "比较形状而非明暗, 换主题也能匹配",
+    c_element: "界面元素", k_findelem: "查找元素", k_clickelem: "点按元素",
+    f_name: "名称", f_autoid: "Id", f_control: "类型", f_any: "任意",
+    f_in_front: "仅前台窗口", f_invoke: "交给程序",
+    tip_invoke: "请程序自己按下, 而不是按坐标点击",
+    tip_uia: "屏幕阅读器会念出的名称; 游戏自绘界面, 不会公开任何元素",
+    img_overlay: "显示脚本正在看哪里",
+    tip_overlay: "覆盖全屏的透明窗口, 画出最近的搜索范围和命中位置",
+    m_onmiss: "找不到时：", m_continue: "继续下一步", m_stop: "停止脚本",
+    m_break: "跳出循环", m_retry: "重试", m_times: "次",
+    m_delay: "间隔 (毫秒)",
+    tip_onmiss: "1.5.0 之前这些步骤都会默默继续 —— 夜间运行的宏就是这样对着空白点击三个小时的",
+    k_call: "调用宏", f_macro_file: "文件", tip_call: "在此处运行另一个宏的脚本；变量共享，嵌套上限为 8 层",
+    call_depth: "调用嵌套上限为 {}",
+    fast_capture: "快速屏幕捕获",
+    tip_fast_capture: "用 Desktop Duplication 取代 GDI：整屏约快 5 倍，小区域约快 20 倍。本机不支持时会自动退回 GDI。",
+    sec_vars: "🔎 变量", vars_open: "查看运行", vars_title: "变量",
+    vars_none: "尚未设置任何变量", vars_name: "名称", vars_value: "值",
+    vars_step: "步骤", vars_stepmode: "每步之前暂停", vars_stepnext: "▶ 下一步",
+    tip_stepmode: "脚本在每一步之前停下，等待「下一步」",
+    vars_running: "运行中", vars_idle: "未运行",
+    rec_shots: "📸 带图片的点击：{}", rec_shots_ask: "把录制的 {} 次点击改成按图片查找而不是按坐标的步骤吗？",
+    rec_shots_make: "生成图片步骤", rec_shots_skip: "保留坐标",
+    rec_shots_done: "已生成 {} 个图片步骤",
+    rec_shots_cb: "每次点击时截取图片",
+    tip_rec_shots: "录制时保存每次点击周围的一小块方形图像，之后就能把录制变成无论按钮移到哪里都能找到它的步骤",
+    rec_shots_size: "方块大小 (px)", rec_shots_miss: "找不到图片时：",
 };
 
 const LANG_CODES: [&str; 6] = ["en", "ru", "uk", "pt", "es", "zh"];
@@ -8122,6 +13062,14 @@ struct MacroApp {
     ed_undo: Option<MacroData>,
     /// The editor lives in its own OS window.
     editor_open: bool,
+    /// So does the variables watcher.
+    vars_open: bool,
+    /// Set when a recording ends with squares to offer. Cleared either way, so the
+    /// offer is made once per recording and never nags.
+    shots_offer: bool,
+    /// Whether we were recording on the previous frame, which is how the moment a
+    /// recording ends is noticed without the transport knowing about the UI.
+    was_recording: bool,
     /// Cached summary plus the inputs it was built from, so a long macro is not
     /// re-narrated on every frame.
     ed_steps: Vec<Step>,
@@ -8140,6 +13088,13 @@ struct MacroApp {
     template: Option<Arc<vision::Template>>,
     ocr_text: String,
     ocr_rect: (i32, i32, i32, i32),
+    /// What the panel does to the pixels, and what it expects to read. Both are
+    /// here so a profile can be tried against a real screen before it is written
+    /// into a step, which is the only way to choose one honestly.
+    ocr_prep: ocr::Prep,
+    ocr_expect: ocr::Expect,
+    /// Fit of the last reading, and the profile that produced it.
+    ocr_fit: Option<(f64, ocr::Prep)>,
     /// Two-corner region picker: deadline, and whether we are on the second corner.
     ocr_pick: Option<(Instant, bool)>,
     ocr_corner: (i32, i32),
@@ -8188,6 +13143,9 @@ impl MacroApp {
             ed_scale: 1.0,
             ed_undo: None,
             editor_open: false,
+            vars_open: false,
+            shots_offer: false,
+            was_recording: false,
             ed_steps: Vec::new(),
             ed_steps_key: (usize::MAX, 0, 0),
             ed_cursor: 0,
@@ -8200,6 +13158,9 @@ impl MacroApp {
             template: None,
             ocr_text: String::new(),
             ocr_rect: (0, 0, 600, 200),
+            ocr_prep: ocr::Prep::default(),
+            ocr_expect: ocr::Expect::default(),
+            ocr_fit: None,
             ocr_pick: None,
             ocr_corner: (0, 0),
             ed_view: 0,
@@ -8301,9 +13262,131 @@ impl MacroApp {
         }
     }
 
+    /// Writes the squares as templates and rewrites the recording as a script.
+    ///
+    /// Everything or nothing: if a PNG will not write, the pictures that did write
+    /// are left where they are but the script is not replaced, so the recording the
+    /// user just made is never traded for a half-built script.
+    fn make_click_image_steps(&mut self) {
+        let s = self.strs();
+        let shots = self.state.click_shots.lock().clone();
+        if shots.is_empty() {
+            return;
+        }
+        let stamp = recording_stamp();
+        let mut names = Vec::with_capacity(shots.len());
+        let mut failed: Option<String> = None;
+        for (n, shot) in shots.iter().enumerate() {
+            let name = click_shot_name(&stamp, n + 1);
+            match save_click_shot(shot, &name) {
+                Ok(()) => names.push(name),
+                Err(e) => {
+                    failed = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(e) = failed {
+            self.status_msg = s.save_err.replace("{}", &e);
+            return;
+        }
+        let threshold = self.config.img_threshold.clamp(0.3, 1.0);
+        let miss = self.config.click_shot_miss;
+        let data = self.state.macro_data.lock().clone();
+        let (script, made) = script_from_click_shots(&data, &shots, &names, threshold, miss);
+        if made == 0 {
+            // Every press was a drag or was never released. Saying so beats
+            // replacing the script with one `Play events` step and calling it done.
+            self.status_msg = s.rec_shots_done.replace("{}", "0");
+            return;
+        }
+        self.edit(|d| d.script = script);
+        self.ed_view = 2;
+        self.status_msg = s.rec_shots_done.replace("{}", &made.to_string());
+        info!("recording turned into {made} picture steps, templates rec_{stamp}_*");
+    }
+
+    /// The offer itself, drawn over the main window while it stands.
+    fn shots_offer_ui(&mut self, ctx: &egui::Context) {
+        if !self.shots_offer {
+            return;
+        }
+        let s = self.strs();
+        let count = self.state.click_shots.lock().len();
+        if count == 0 {
+            self.shots_offer = false;
+            return;
+        }
+        let mut make = false;
+        let mut skip = false;
+        egui::Window::new(s.rec_shots.replace("{}", &count.to_string()))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(s.rec_shots_ask.replace("{}", &count.to_string()));
+                ui.add_space(6.0);
+                // The one decision worth making here, because it is the one that
+                // decides what a broken macro does at three in the morning.
+                let mut miss = self.config.click_shot_miss;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(s.rec_shots_miss);
+                    egui::ComboBox::from_id_salt("shot_miss")
+                        .selected_text(miss.name(s))
+                        .width(150.0)
+                        .show_ui(ui, |ui| {
+                            for i in 0..OnMiss::COUNT {
+                                let opt = OnMiss::from_index(i);
+                                if ui.selectable_label(miss.index() == i, opt.name(s)).clicked() {
+                                    miss = opt;
+                                }
+                            }
+                        });
+                });
+                self.config.click_shot_miss = miss;
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    make = ui.button(s.rec_shots_make).clicked();
+                    skip = ui.button(s.rec_shots_skip).clicked();
+                });
+            });
+        if make {
+            self.make_click_image_steps();
+            self.shots_offer = false;
+        } else if skip {
+            // The squares are dropped, not kept: an offer that was declined and
+            // then quietly reappears after the next recording is worse than no
+            // offer at all.
+            self.state.click_shots.lock().clear();
+            self.shots_offer = false;
+        }
+    }
+
     fn set_template(&mut self, w: u32, h: u32, rgba: Vec<u8>, name: String) {
         self.template = Some(Arc::new(vision::Template { w, h, rgba, name }));
         *LAST_HIT.lock() = None;
+    }
+
+    /// Reads the panel's rectangle with the panel's profile.
+    ///
+    /// One place, because the panel reads from two: the button, and the moment the
+    /// second corner is picked. They must agree about which profile was used or the
+    /// number shown next to the text is a lie.
+    fn read_ocr_panel(&mut self, s: &Strings) {
+        let (x, y, w, h) = self.ocr_rect;
+        match ocr::read_region_as(x, y, w, h, self.ocr_prep, &self.ocr_expect) {
+            Ok(r) => {
+                let text = r.text();
+                self.ocr_fit = Some((r.quality, r.prep));
+                self.ocr_text =
+                    if text.is_empty() { s.ocr_empty.to_string() } else { text };
+            }
+            Err(e) => {
+                self.ocr_fit = None;
+                self.ocr_text = format!("{} — {e}", s.ocr_off);
+            }
+        }
     }
 
     fn load_template_png(&mut self, path: &Path) {
@@ -8402,7 +13485,16 @@ fn condition_ui(
     cond: &mut Condition,
     from_panel: Option<(i32, i32, i32, i32)>,
 ) -> bool {
-    let names = [s.c_always, s.c_var, s.c_image, s.c_pixel, s.c_window, s.c_text];
+    let names = [
+        s.c_always,
+        s.c_var,
+        s.c_image,
+        s.c_pixel,
+        s.c_window,
+        s.c_text,
+        s.c_process,
+        s.c_element,
+    ];
     let mut changed = false;
 
     ui.horizontal_wrapped(|ui| {
@@ -8438,10 +13530,18 @@ fn condition_ui(
                             }
                         }
                     });
-                changed |= ui.add(egui::DragValue::new(value).speed(0.5)).changed();
+                changed |= value_ui(ui, s, &format!("{salt}_cv"), value);
             });
         }
-        Condition::Image { template, threshold } => {
+        Condition::Image {
+            template,
+            threshold,
+            area,
+            lose_at,
+            stable_of,
+            stable_in,
+            edge,
+        } => {
             ui.horizontal_wrapped(|ui| {
                 ui.label(s.f_template);
                 changed |= ui
@@ -8451,6 +13551,22 @@ fn condition_ui(
                 changed |= ui
                     .add(egui::DragValue::new(threshold).range(0.3..=1.0).speed(0.01))
                     .changed();
+            });
+            changed |= area_ui(ui, s, salt, area);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(s.f_lose_at);
+                changed |= ui
+                    .add(egui::DragValue::new(lose_at).range(0.0..=1.0).speed(0.01))
+                    .changed();
+                ui.label(s.f_stable);
+                changed |= ui
+                    .add(egui::DragValue::new(stable_of).range(0..=32))
+                    .changed();
+                ui.label("/");
+                changed |= ui
+                    .add(egui::DragValue::new(stable_in).range(0..=32))
+                    .changed();
+                changed |= ui.checkbox(edge, s.f_edge).on_hover_text(s.tip_edge).changed();
             });
         }
         Condition::Pixel { x, y, r, g, b, tol } => {
@@ -8477,12 +13593,24 @@ fn condition_ui(
                     .changed();
             });
         }
-        Condition::Text { x, y, w, h, needle } => {
+        Condition::Element { query } => {
+            changed |= query_ui(ui, s, salt, query);
+        }
+        Condition::Process { name } => {
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui
+                    .add(egui::TextEdit::singleline(name).desired_width(200.0))
+                    .on_hover_text(s.tip_process)
+                    .changed();
+            });
+        }
+        Condition::Text { x, y, w, h, needle, prep } => {
             ui.horizontal_wrapped(|ui| {
                 ui.label(s.f_needle);
                 changed |= ui
                     .add(egui::TextEdit::singleline(needle).desired_width(180.0))
                     .changed();
+                changed |= prep_picker(ui, s, &format!("{salt}_ctxt"), prep);
             });
             changed |= region_ui(ui, s, x, y, w, h, from_panel);
         }
@@ -8749,7 +13877,7 @@ impl MacroApp {
                         ui.add(egui::DragValue::new(ms).range(0..=3_600_000).speed(10.0)).changed();
                 });
             }
-            StepKind::WaitFor { cond, appear, timeout_ms } => {
+            StepKind::WaitFor { cond, appear, timeout_ms, miss } => {
                 changed |= condition_ui(ui, s, "wf", cond, Some(self.ocr_rect));
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui.selectable_value(appear, true, s.f_appear).clicked();
@@ -8759,8 +13887,9 @@ impl MacroApp {
                         .add(egui::DragValue::new(timeout_ms).range(0..=3_600_000).speed(50.0))
                         .changed();
                 });
+                changed |= miss_ui(ui, s, "wf", miss);
             }
-            StepKind::ClickImage { template, threshold, button } => {
+            StepKind::ClickImage { template, threshold, button, area, edge, miss } => {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(s.f_template);
                     changed |= ui
@@ -8771,7 +13900,36 @@ impl MacroApp {
                         .add(egui::DragValue::new(threshold).range(0.3..=1.0).speed(0.01))
                         .changed();
                     changed |= button_picker(ui, s, "ci", button);
+                    changed |= ui.checkbox(edge, s.f_edge).on_hover_text(s.tip_edge).changed();
                 });
+                changed |= area_ui(ui, s, "ci", area);
+                changed |= miss_ui(ui, s, "ci", miss);
+            }
+            StepKind::FindImage { template, threshold, area, var, edge, miss } => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(s.f_template);
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(template).desired_width(140.0))
+                        .changed();
+                    changed |= template_picker(ui, "fi_tpl", template);
+                    changed |= ui
+                        .add(egui::DragValue::new(threshold).range(0.3..=1.0).speed(0.01))
+                        .changed();
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(s.f_into);
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(var).desired_width(110.0))
+                        .changed();
+                    changed |= ui.checkbox(edge, s.f_edge).on_hover_text(s.tip_edge).changed();
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(s.f_find_hint.replace("{}", var)).weak().small(),
+                    );
+                });
+                changed |= area_ui(ui, s, "fi", area);
+                changed |= miss_ui(ui, s, "fi", miss);
             }
             StepKind::Click { x, y, button } => {
                 ui.horizontal_wrapped(|ui| {
@@ -8821,7 +13979,7 @@ impl MacroApp {
                             }
                         });
                     ui.label(s.f_value);
-                    changed |= ui.add(egui::DragValue::new(value).speed(0.5)).changed();
+                    changed |= value_ui(ui, s, "scr_sv", value);
                 });
             }
             StepKind::If { cond } | StepKind::While { cond } => {
@@ -8841,12 +13999,108 @@ impl MacroApp {
                         .changed();
                 });
             }
-            StepKind::ReadNumber { x, y, w, h, var } => {
+            StepKind::FindElement { query, var, timeout_ms, miss } => {
+                changed |= query_ui(ui, s, "fe", query);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(s.f_into);
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(var).desired_width(110.0))
+                        .changed();
+                    ui.label(s.f_timeout);
+                    changed |= ui
+                        .add(egui::DragValue::new(timeout_ms).range(0..=600_000).speed(50))
+                        .changed();
+                });
+                changed |= miss_ui(ui, s, "fe", miss);
+            }
+            StepKind::ClickElement { query, button, invoke, timeout_ms, miss } => {
+                changed |= query_ui(ui, s, "ce", query);
+                ui.horizontal_wrapped(|ui| {
+                    changed |= button_picker(ui, s, "ce", button);
+                    changed |=
+                        ui.checkbox(invoke, s.f_invoke).on_hover_text(s.tip_invoke).changed();
+                    ui.label(s.f_timeout);
+                    changed |= ui
+                        .add(egui::DragValue::new(timeout_ms).range(0..=600_000).speed(50))
+                        .changed();
+                });
+                changed |= miss_ui(ui, s, "ce", miss);
+            }
+            StepKind::Call { path, miss } => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(s.f_macro_file).on_hover_text(s.tip_call);
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(path).desired_width(220.0))
+                        .on_hover_text(s.tip_call)
+                        .changed();
+                    if ui.button("…").clicked() {
+                        if let Some(picked) = rfd::FileDialog::new()
+                            .add_filter("Macro", &["json", "mrz", "gz"])
+                            .set_directory(paths::data_dir())
+                            .pick_file()
+                        {
+                            // Kept relative when it sits beside the macro that names
+                            // it, so a project folder can be moved or shared whole.
+                            let here = self
+                                .state
+                                .current_path
+                                .lock()
+                                .as_ref()
+                                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                            *path = match here.and_then(|d| picked.strip_prefix(d).ok().map(|r| r.to_path_buf())) {
+                                Some(rel) => rel.to_string_lossy().to_string(),
+                                None => picked.to_string_lossy().to_string(),
+                            };
+                            changed = true;
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        s.call_depth.replace("{}", &MAX_CALL_DEPTH.to_string()),
+                    )
+                    .weak()
+                    .small(),
+                );
+                changed |= miss_ui(ui, s, "call", miss);
+            }
+            StepKind::ReadText { x, y, w, h, var, prep } => {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(s.f_var);
                     changed |= ui
                         .add(egui::TextEdit::singleline(var).desired_width(100.0))
                         .changed();
+                    changed |= prep_picker(ui, s, "rt", prep);
+                });
+                changed |= region_ui(ui, s, x, y, w, h, Some(self.ocr_rect));
+            }
+            StepKind::GetText { source, var } => {
+                ui.horizontal_wrapped(|ui| {
+                    changed |= source_picker(ui, s, "gt", source);
+                    ui.label(s.f_into);
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(var).desired_width(110.0))
+                        .changed();
+                });
+            }
+            StepKind::PutText { sink, text } => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(s.f_text);
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(text).desired_width(190.0))
+                        .on_hover_text(s.tip_value_text)
+                        .changed();
+                    changed |= sink_picker(ui, s, "pt", sink);
+                });
+            }
+            StepKind::ReadNumber { x, y, w, h, var, prep, expect } => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(s.f_var);
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(var).desired_width(100.0))
+                        .changed();
+                    changed |= prep_picker(ui, s, "rn", prep);
+                    changed |= expect_picker(ui, s, "rn", expect);
                 });
                 changed |= region_ui(ui, s, x, y, w, h, Some(self.ocr_rect));
             }
@@ -9261,6 +14515,133 @@ impl MacroApp {
         });
     }
 
+    /// The other half of the debug overlay: what the script knows, not where it
+    /// is looking.
+    ///
+    /// Its own window rather than a panel in the main one for the same reason the
+    /// editor has one: this is read while another application is in front, and a
+    /// table that is only visible when the recorder has focus is a table nobody
+    /// reads. Only open costs anything - `set_watching_vars` is what makes the
+    /// interpreter publish at all.
+    fn vars_viewport(&mut self, ctx: &egui::Context) {
+        set_watching_vars(self.vars_open);
+        if !self.vars_open {
+            // Step mode with the window shut would park a run with no button to
+            // free it. Closing the window is therefore also "let it go".
+            self.state.step_mode.store(false, Ordering::Relaxed);
+            return;
+        }
+        let s = self.strs();
+        let title = s.vars_title;
+        let mut close = false;
+        let state = self.state.clone();
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("macro_vars"),
+            egui::ViewportBuilder::default()
+                .with_title(title)
+                .with_inner_size([420.0, 480.0])
+                .with_min_inner_size([300.0, 220.0]),
+            |ctx, _class| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let view = script_view();
+                    let running = view.as_ref().is_some_and(|v| v.running);
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(if running { s.vars_running } else { s.vars_idle });
+                        ui.separator();
+                        let mut stepping = state.step_mode.load(Ordering::Relaxed);
+                        if ui
+                            .checkbox(&mut stepping, s.vars_stepmode)
+                            .on_hover_text(s.tip_stepmode)
+                            .changed()
+                        {
+                            state.step_mode.store(stepping, Ordering::Relaxed);
+                            // Turning it off has to release a run already parked;
+                            // turning it on has to start from a clean slate, or a
+                            // leftover raised flag lets the first step through.
+                            state.step_once.store(!stepping, Ordering::Relaxed);
+                        }
+                        let waiting = view.as_ref().is_some_and(|v| v.waiting);
+                        if ui
+                            .add_enabled(waiting, egui::Button::new(s.vars_stepnext))
+                            .clicked()
+                        {
+                            state.step_once.store(true, Ordering::Relaxed);
+                        }
+                    });
+                    ui.separator();
+
+                    match &view {
+                        Some(v) => {
+                            let depth = if v.depth > 0 {
+                                format!("  ↳{}", v.depth)
+                            } else {
+                                String::new()
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} {}{depth}  {}",
+                                    s.vars_step, v.pc, v.step
+                                ))
+                                .monospace(),
+                            );
+                            ui.separator();
+                            if v.vars.is_empty() {
+                                ui.label(egui::RichText::new(s.vars_none).weak());
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("vars_rows")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        egui::Grid::new("vars_grid")
+                                            .num_columns(2)
+                                            .striped(true)
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(s.vars_name).strong(),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(s.vars_value).strong(),
+                                                );
+                                                ui.end_row();
+                                                for (k, val) in &v.vars {
+                                                    ui.label(
+                                                        egui::RichText::new(k).monospace(),
+                                                    );
+                                                    // Newlines from an OCR read
+                                                    // would each claim a row.
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            val.replace('\n', " ⏎ "),
+                                                        )
+                                                        .monospace(),
+                                                    );
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    });
+                            }
+                        }
+                        None => {
+                            ui.label(egui::RichText::new(s.vars_none).weak());
+                        }
+                    }
+                });
+                // A parked run publishes nothing new, so nothing would wake the
+                // window up to notice the button being pressable.
+                ctx.request_repaint_after(Duration::from_millis(120));
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+            },
+        );
+        if close {
+            self.vars_open = false;
+            self.state.step_mode.store(false, Ordering::Relaxed);
+            self.state.step_once.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Hosts the editor in its own OS window while `editor_open` is set.
     fn editor_viewport(&mut self, ctx: &egui::Context) {
         if !self.editor_open {
@@ -9406,13 +14787,7 @@ impl eframe::App for MacroApp {
                     self.ocr_rect = (x, y, w, h);
                     self.ocr_pick = None;
                     // Read straight away: seeing the text is the proof it worked.
-                    match ocr::read_region(x, y, w, h) {
-                        Ok(boxes) if boxes.is_empty() => {
-                            self.ocr_text = s.ocr_empty.to_string()
-                        }
-                        Ok(boxes) => self.ocr_text = ocr::joined(&boxes),
-                        Err(e) => self.ocr_text = format!("{} — {e}", s.ocr_off),
-                    }
+                    self.read_ocr_panel(s);
                 } else {
                     self.ocr_corner = (px, py);
                     self.ocr_pick = Some((Instant::now() + Duration::from_secs(3), true));
@@ -9441,8 +14816,22 @@ impl eframe::App for MacroApp {
         }
 
         // Drawn before the main panel so it is a sibling window, not a nested one.
+        // The moment a recording stops is the moment the squares are worth
+        // something, and it is also the only moment the user is looking at this
+        // window rather than at the thing they were recording.
+        if self.was_recording && !recording {
+            self.shots_offer = !self.state.click_shots.lock().is_empty();
+        }
+        self.was_recording = recording;
+
         let ctx = ui.ctx().clone();
         self.editor_viewport(&ctx);
+        self.vars_viewport(&ctx);
+        self.shots_offer_ui(&ctx);
+        // The overlay owns its own window on its own thread; this only says whether
+        // it should be there. Idempotent, so calling it every frame costs a load.
+        WATCHING.store(self.config.debug_overlay, Ordering::Relaxed);
+        overlay::set_enabled(self.config.debug_overlay);
 
         let panel = egui::Frame::central_panel(ui.style()).fill(self.panel_fill);
         egui::CentralPanel::default().frame(panel).show(ui, |ui| {
@@ -9562,6 +14951,29 @@ impl eframe::App for MacroApp {
                             egui::DragValue::new(&mut self.config.mouse_sample_ms).range(1..=100),
                         );
                     });
+                    ui.separator();
+                    ui.checkbox(&mut self.config.record_click_shots, s.rec_shots_cb)
+                        .on_hover_text(s.tip_rec_shots);
+                    if self.config.record_click_shots {
+                        ui.horizontal(|ui| {
+                            ui.label(s.rec_shots_size);
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.click_shot_size)
+                                    .range(16..=512)
+                                    .speed(2.0),
+                            );
+                        });
+                        let n = self.state.click_shots.lock().len();
+                        if n > 0 {
+                            ui.label(
+                                egui::RichText::new(
+                                    s.rec_shots.replace("{}", &n.to_string()),
+                                )
+                                .weak()
+                                .small(),
+                            );
+                        }
+                    }
                 });
 
                 // ---- target window ---------------------------------------------
@@ -9839,6 +15251,8 @@ impl eframe::App for MacroApp {
                     let triggers =
                         [s.exp_tr_inherit, s.exp_tr_delim, s.exp_tr_prefix, s.exp_tr_instant];
                     let inserts = [s.exp_in_type, s.exp_in_paste];
+                    let actions =
+                        [s.exp_ac_text, s.exp_ac_play, s.exp_ac_stop, s.exp_ac_run];
 
                     self.exp_dirty |=
                         ui.checkbox(&mut self.exp_book.enabled, s.exp_enable).changed();
@@ -9951,6 +15365,23 @@ impl eframe::App for MacroApp {
                                         .changed();
                                 }
 
+                                let mut ai = action_index(&e.action);
+                                egui::ComboBox::from_id_salt(format!("exp_ac{i}"))
+                                    .selected_text(actions[ai])
+                                    .width(104.0)
+                                    .show_ui(ui, |ui| {
+                                        for (k, name) in actions.iter().enumerate() {
+                                            if ui.selectable_label(ai == k, *name).clicked() {
+                                                ai = k;
+                                            }
+                                        }
+                                    });
+                                let want_act = action_from_index(ai);
+                                if want_act != e.action {
+                                    e.action = want_act;
+                                    self.exp_dirty = true;
+                                }
+
                                 let mut ii = usize::from(e.insert == expander::Insert::Paste);
                                 egui::ComboBox::from_id_salt(format!("exp_in{i}"))
                                     .selected_text(inserts[ii])
@@ -10002,6 +15433,7 @@ impl eframe::App for MacroApp {
                                 text: String::new(),
                                 trigger: expander::Trigger::Inherit,
                                 insert: expander::Insert::Type,
+                                action: expander::Action::Text,
                             });
                             self.exp_dirty = true;
                         }
@@ -10036,14 +15468,12 @@ impl eframe::App for MacroApp {
                     self.ocr_rect = (rx, ry, rw, rh);
 
                     ui.horizontal_wrapped(|ui| {
+                        prep_picker(ui, s, "panel", &mut self.ocr_prep);
+                        expect_picker(ui, s, "panel", &mut self.ocr_expect);
+                    });
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button(s.ocr_read).clicked() {
-                            match ocr::read_region(rx, ry, rw, rh) {
-                                Ok(boxes) if boxes.is_empty() => {
-                                    self.ocr_text = s.ocr_empty.to_string()
-                                }
-                                Ok(boxes) => self.ocr_text = ocr::joined(&boxes),
-                                Err(e) => self.ocr_text = format!("{} — {e}", s.ocr_off),
-                            }
+                            self.read_ocr_panel(s);
                         }
                         match self.ocr_pick {
                             Some((d, second)) => {
@@ -10061,6 +15491,23 @@ impl eframe::App for MacroApp {
                         }
                     });
 
+                    if let Some((fit, used)) = self.ocr_fit {
+                        // Not a confidence from the engine - a judgement about the
+                        // shape of what came back. Shown so a profile can be chosen
+                        // by comparing numbers rather than by squinting.
+                        let names =
+                            [s.p_none, s.p_ui, s.p_small, s.p_game, s.p_digits, s.p_auto];
+                        let name = names[used.index().min(names.len() - 1)];
+                        ui.label(
+                            egui::RichText::new(
+                                s.ocr_quality
+                                    .replacen("{}", &format!("{fit:.2}"), 1)
+                                    .replacen("{}", name, 1),
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
                     if !self.ocr_text.is_empty() {
                         egui::ScrollArea::vertical().max_height(120.0).id_salt("ocr_out").show(
                             ui,
@@ -10111,6 +15558,14 @@ impl eframe::App for MacroApp {
                                 )
                                 .ok_or_else(|| anyhow::anyhow!("bad template buffer"))
                                 .and_then(|img| Ok(img.save(&path)?));
+                                if saved.is_ok() {
+                                    // Written now because now is the only moment the
+                                    // scale it was cut at is still known.
+                                    save_template_meta(
+                                        &path,
+                                        &TemplateMeta { dpi: platform::current_dpi() },
+                                    );
+                                }
                                 match saved {
                                     Ok(()) => {
                                         self.status_msg =
@@ -10137,6 +15592,13 @@ impl eframe::App for MacroApp {
                             .text(s.img_threshold),
                     );
                     ui.checkbox(&mut self.config.img_multiscale, s.img_multiscale);
+                    ui.checkbox(&mut self.config.debug_overlay, s.img_overlay)
+                        .on_hover_text(s.tip_overlay);
+                    ui.checkbox(&mut self.config.fast_capture, s.fast_capture)
+                        .on_hover_text(s.tip_fast_capture);
+                    if ui.button(s.vars_open).on_hover_text(s.tip_stepmode).clicked() {
+                        self.vars_open = true;
+                    }
                     ui.checkbox(&mut self.config.img_region_enabled, s.img_region);
                     if self.config.img_region_enabled {
                         ui.horizontal_wrapped(|ui| {
@@ -10636,7 +16098,8 @@ OPTIONS:
     -s, --speed <X>      Playback speed multiplier (0.05 - 10.0)
         --no-gui         Play the macro headless and exit
         --selftest <W>   Run a self-test and exit.
-                         W: timing, vision, churn[=secs], soak[=hours]
+                         W: timing, vision, script[=rounds],
+                            churn[=secs], soak[=hours, fractions allowed]
     -h, --help           Show this help
     -V, --version        Show the version
 
@@ -10827,23 +16290,25 @@ fn median_ms(n: usize, mut f: impl FnMut()) -> f64 {
 /// different haystack sizes without re-capturing and inheriting capture's noise.
 fn crop_frame(hay: &vision::Frame, w: u32, h: u32) -> vision::Frame {
     let (w, h) = (w.min(hay.w), h.min(hay.h));
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    let mut px = Vec::with_capacity((w * h * 4) as usize);
     for row in 0..h {
         let src = (row * hay.w * 4) as usize;
-        rgba.extend_from_slice(&hay.rgba[src..src + (w * 4) as usize]);
+        px.extend_from_slice(&hay.px[src..src + (w * 4) as usize]);
     }
-    vision::Frame { x: hay.x, y: hay.y, w, h, rgba }
+    vision::Frame { x: hay.x, y: hay.y, w, h, px, order: hay.order }
 }
 
 /// A square cut out of whatever is on screen, which will therefore match.
 fn crop_template(hay: &vision::Frame, at: u32, size: u32, name: &str) -> vision::Template {
     let size = size.min(hay.w.saturating_sub(at)).min(hay.h.saturating_sub(at)).max(2);
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    let mut px = Vec::with_capacity((size * size * 4) as usize);
     for row in 0..size {
         let src = (((at + row) * hay.w + at) * 4) as usize;
-        rgba.extend_from_slice(&hay.rgba[src..src + (size * 4) as usize]);
+        px.extend_from_slice(&hay.px[src..src + (size * 4) as usize]);
     }
-    vision::Template { w: size, h: size, rgba, name: name.to_string() }
+    // A template is always red-first and always opaque; the mask reads the alpha
+    // byte and a screen grab does not have one worth reading.
+    vision::Frame { x: 0, y: 0, w: size, h: size, px, order: hay.order }.as_template(name)
 }
 
 /// Random pixels, which will not match anything on screen.
@@ -10859,6 +16324,9 @@ fn noise_template(size: u32, name: &str) -> vision::Template {
 }
 
 fn run_vision_selftest() -> Result<()> {
+    // UI Automation is COM, and COM has to be started on the thread that uses it.
+    // The playback thread does this for itself; this one has to be told.
+    virtual_desktop::init_thread();
     let (vx, vy, vw, vh) = platform::virtual_screen_rect();
     let mpx = |w: u32, h: u32| (w as f64 * h as f64) / 1_000_000.0;
     println!("Self-test: vision and OCR");
@@ -10890,6 +16358,313 @@ fn run_vision_selftest() -> Result<()> {
         );
     }
 
+    // ---- where a capture's time actually goes -------------------------------
+    // The claim under test: the GDI object churn and the second copy were the
+    // expensive parts. They were not. `BitBlt` from the desktop DC is a readback
+    // out of whatever the compositor is holding the screen in, and it is the floor
+    // - the DC and the copy out are rounding error beside it. Printed rather than
+    // asserted, because the split is a property of the machine's graphics stack.
+    println!("\nWhere a capture goes");
+    println!(
+        "{:<14} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "region", "GetDC", "+BitBlt", "+copy", "old DDB", "mem->mem", "blt %"
+    );
+    for (w, h) in &sizes {
+        let (w, h) = (*w, *h);
+        let dc_ms = median_ms(9, || {
+            let _ = platform::probe_screen_dc();
+        });
+        let blt_ms = median_ms(9, || {
+            let _ = platform::probe_blt(vx, vy, w, h);
+        });
+        let all_ms = median_ms(9, || {
+            let _ = platform::capture(vx, vy, w, h);
+        });
+        let ddb_ms = median_ms(9, || {
+            let _ = platform::probe_blt_ddb(vx, vy, w, h);
+        });
+        let mem_ms = median_ms(9, || {
+            let _ = platform::probe_blt_mem(w, h);
+        });
+        println!(
+            "{:<14} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>8.0}%",
+            format!("{w}x{h}"),
+            dc_ms,
+            blt_ms,
+            all_ms,
+            ddb_ms,
+            mem_ms,
+            if all_ms > 0.0 { 100.0 * blt_ms / all_ms } else { 0.0 }
+        );
+    }
+
+    // ---- the fast path against the old one ----------------------------------
+    // Two questions, in this order: does it give the same pixels, and is it
+    // actually faster. The first is the one that can lose a macro - a capture that
+    // is quick and wrong finds buttons in the wrong place.
+    //
+    // "The same pixels" cannot be tested by comparing two captures for equality,
+    // and the first version of this table tried. A screen with anything live on it
+    // - a game, a video, a blinking caret - differs from itself between any two
+    // looks, and the table dutifully reported that 97 % of the frame had changed.
+    // It had. So the comparison is against the screen's own rate of change: take
+    // two captures the old way, then one of each, and ask whether the two methods
+    // disagree more than the old method disagrees with itself over the same
+    // interval. If they do not, the difference is the screen moving, not the code.
+    //
+    // The swap column is the one that would catch a channel order mistake, and it
+    // is read backwards on purpose: swapping red and blue has to make the match
+    // *worse*. If it ever makes it better, the fast path is handing back BGRA
+    // labelled RGBA and every template in the program is being matched against its
+    // own mirror.
+    /// Compares a fast capture against the old one, only where the screen was
+    /// demonstrably holding still.
+    ///
+    /// Returns (still pixels, of those how many the two methods disagree about,
+    /// how many they would disagree about with red and blue swapped).
+    ///
+    /// This is the shape the test had to take, and it took two goes to get there.
+    /// Comparing two captures outright fails on any screen with something live on
+    /// it: the first version reported 97 % of the frame changed, and it had - there
+    /// was a game running. Sampling only the pixels two consecutive captures agreed
+    /// about was better but still not enough, because a pixel in a continuously
+    /// re-rendered scene lands on the same value twice often enough to matter.
+    /// Three consecutive captures, all three agreeing, is the bar: a pixel that
+    /// held still across two whole intervals was not being drawn, and a pixel that
+    /// was not being drawn has to read the same whichever interface fetched it.
+    fn agreement(
+        a: &[&vision::Frame],
+        b: &vision::Frame,
+    ) -> (u64, u64, u64) {
+        let Some(first) = a.first() else { return (0, u64::MAX, 0) };
+        if a.iter().any(|f| f.px.len() != b.px.len()) || first.px.is_empty() {
+            return (0, u64::MAX, 0);
+        }
+        let (mut still, mut bad, mut bad_swapped) = (0u64, 0u64, 0u64);
+        let n = b.px.len() / 4;
+        for i in 0..n {
+            let o = i * 4;
+            let q = &first.px[o..o + 3];
+            if a.iter().skip(1).any(|f| f.px[o..o + 3] != *q) {
+                continue; // that pixel was being drawn; it proves nothing
+            }
+            still += 1;
+            let r = &b.px[o..o + 3];
+            if q != r {
+                bad += 1;
+            }
+            if !(q[0] == r[2] && q[1] == r[1] && q[2] == r[0]) {
+                bad_swapped += 1;
+            }
+        }
+        (still, bad, bad_swapped)
+    }
+
+    println!("\nDesktop Duplication against GDI");
+    println!(
+        "{:<12} {:>8} {:>8} {:>7} {:>9} {:>9} {:>9} {:>7}",
+        "region", "GDI ms", "fast ms", "faster", "still px", "disagree", "if swapped", "quiet?"
+    );
+    let mut any_fast = false;
+    for (w, h) in &sizes {
+        let (w, h) = (*w, *h);
+        platform::set_fast_capture(false);
+        let gdi_ms = median_ms(9, || {
+            let _ = platform::capture(vx, vy, w, h);
+        });
+        // Three the old way back to back, so a pixel that held still across both
+        // intervals can be told from one that merely repeated a value once.
+        let a1 = platform::capture(vx, vy, w, h);
+        let a2 = platform::capture(vx, vy, w, h);
+        let a3 = platform::capture(vx, vy, w, h);
+        platform::reset_capture_counters();
+        platform::set_fast_capture(true);
+        let fast_ms = median_ms(9, || {
+            let _ = platform::capture(vx, vy, w, h);
+        });
+        let b = platform::capture(vx, vy, w, h);
+        let (hits, reused, misses) = platform::capture_counters();
+        let used_fast = misses == 0 && (hits + reused) > 0;
+        any_fast |= used_fast;
+
+        let (still, bad, bad_swapped) = match (&a1, &a2, &a3, &b) {
+            (Some(a1), Some(a2), Some(a3), Some(b)) => agreement(&[a1, a2, a3], b),
+            _ => (0, u64::MAX, 0),
+        };
+        let total = (w as u64) * (h as u64);
+        // A pixel that was not being drawn has to read the same either way. One in
+        // a hundred is left for a screen that started drawing it again between the
+        // third capture and the fourth; a channel order or a row pitch mistake is
+        // not one in a hundred, it is most of the frame - which is what the swap
+        // column is there to show by contrast.
+        let enough = still >= 2_000;
+        let rate = if still == 0 { 1.0 } else { bad as f64 / still as f64 };
+        let swap_rate = if still == 0 { 0.0 } else { bad_swapped as f64 / still as f64 };
+        let agrees = enough && bad != u64::MAX && rate <= 0.01 && bad_swapped >= bad;
+        println!(
+            "{:<12} {:>8.2} {:>8.2} {:>6.1}x {:>8.0}% {:>8.2}% {:>9.1}% {:>7}",
+            format!("{w}x{h}"),
+            gdi_ms,
+            fast_ms,
+            if fast_ms > 0.0 { gdi_ms / fast_ms } else { 0.0 },
+            100.0 * still as f64 / total as f64,
+            rate * 100.0,
+            swap_rate * 100.0,
+            if !used_fast {
+                "n/a"
+            } else if !enough {
+                "busy"
+            } else if agrees {
+                "yes"
+            } else {
+                "busy"
+            }
+        );
+    }
+    if !any_fast {
+        println!(
+            "  Duplication is not available here, so every row above is GDI twice \n\
+             \x20 and `agrees` reads n/a. That is the fallback working as intended."
+        );
+    }
+
+    // ---- the check that does not care what the screen is doing --------------
+    // Counting pixels is only decisive on a screen that is holding still, and the
+    // machine this was written on had a game running on it, so it never was. This
+    // asks the question the program actually cares about instead: cut a template
+    // out of a frame the old way and look for it in a frame taken the new way.
+    //
+    // Every mistake the fast path could make shows up here, and each one shows up
+    // differently. Red and blue swapped: the correlation collapses, because the
+    // greys it is built from are computed from the wrong channels. A row pitch
+    // ignored: the picture shears and the hit lands somewhere else, or nowhere.
+    // Coordinates taken from the wrong monitor: the hit is in the wrong place by a
+    // screen's width. A frame served stale: the score drops but the position is
+    // exactly right, which is the one answer that is not a fault.
+    {
+        platform::set_fast_capture(false);
+        let old = platform::capture(vx, vy, vw.min(1280), vh.min(720));
+        platform::set_fast_capture(true);
+        let new = platform::capture(vx, vy, vw.min(1280), vh.min(720));
+        match (old, new) {
+            (Some(old), Some(new)) => {
+                // The busiest 96-pixel square in the frame: a flat one correlates
+                // with everything and would prove nothing.
+                let side = 96u32;
+                let mut best = (0u32, 0u32, -1.0f64);
+                let step = 64u32;
+                let mut y = 0;
+                while y + side < old.h {
+                    let mut x = 0;
+                    while x + side < old.w {
+                        let (mut sum, mut sq) = (0.0f64, 0.0f64);
+                        for r in (0..side).step_by(8) {
+                            for c in (0..side).step_by(8) {
+                                let i = (((y + r) * old.w + x + c) * 4) as usize;
+                                let v = old.px[i + 1] as f64;
+                                sum += v;
+                                sq += v * v;
+                            }
+                        }
+                        let n = ((side / 8) * (side / 8)) as f64;
+                        let var = sq / n - (sum / n) * (sum / n);
+                        if var > best.2 {
+                            best = (x, y, var);
+                        }
+                        x += step;
+                    }
+                    y += step;
+                }
+                let (tx, ty, _) = best;
+                let mut px = Vec::with_capacity((side * side * 4) as usize);
+                for r in 0..side {
+                    let o = (((ty + r) * old.w + tx) * 4) as usize;
+                    px.extend_from_slice(&old.px[o..o + (side * 4) as usize]);
+                }
+                let tpl =
+                    vision::Frame { x: 0, y: 0, w: side, h: side, px, order: old.order }
+                        .as_template("cross-check");
+                match vision::find(&new, &tpl, false) {
+                    Some(hit) => {
+                        let want_x = new.x + tx as i32 + side as i32 / 2;
+                        let want_y = new.y + ty as i32 + side as i32 / 2;
+                        let err = (hit.x - want_x).abs().max((hit.y - want_y).abs());
+                        println!(
+                            "\nA {side}x{side} template cut from a GDI frame, looked for in a \n\
+                             duplicated one: found at {},{} - wanted {want_x},{want_y} - \
+                             off by {err} px, score {:.3}\n  \
+                             {}",
+                            hit.x,
+                            hit.y,
+                            hit.score,
+                            if err <= 1 {
+                                "Same place. Channel order, row pitch and monitor origin \
+                                 are all right."
+                            } else {
+                                "WRONG PLACE - the duplicated frame is not laid out the \
+                                 way the old one is."
+                            }
+                        );
+                    }
+                    None => println!("\nThe cross-check template was not found at all."),
+                }
+            }
+            _ => println!("\nThe cross-check needs both capture paths and did not get them."),
+        }
+    }
+
+    // ---- a frame nobody changed has to come back unchanged ------------------
+    // The reuse path is the one that makes a polling loop nearly free, and it is
+    // also the one that could quietly serve a stale screen. Two looks at a settled
+    // rectangle with no new frame between them must be identical to the byte; if
+    // the compositor did send a frame, the check has nothing to say and says so.
+    {
+        platform::set_fast_capture(true);
+        let (w, h) = (320.min(vw), 240.min(vh));
+        platform::reset_capture_counters();
+        let f1 = platform::capture(vx, vy, w, h);
+        let f2 = platform::capture(vx, vy, w, h);
+        let (hits, reused, _) = platform::capture_counters();
+        let verdict = match (&f1, &f2) {
+            _ if hits > 1 => "the screen moved - nothing to conclude".to_string(),
+            (Some(a), Some(b)) if a.px == b.px => {
+                format!("identical, {reused} of {} looks reused a frame", hits + reused)
+            }
+            (Some(_), Some(_)) => "DIFFERENT with no new frame - the reuse path is wrong"
+                .to_string(),
+            _ => "a capture failed".to_string(),
+        };
+        println!("\nTwo looks at an unchanged rectangle: {verdict}");
+    }
+    platform::reset_capture_counters();
+
+    // ---- the same rectangle, over and over ----------------------------------
+    // What a polling loop does. The cached bitmap is what this row is for: before
+    // it, every one of these built and destroyed a DC and a bitmap.
+    {
+        let (w, h) = (400.min(vw), 300.min(vh));
+        let n = 200;
+        let t0 = std::time::Instant::now();
+        let mut ok = 0usize;
+        for _ in 0..n {
+            if platform::capture(vx, vy, w, h).is_some() {
+                ok += 1;
+            }
+        }
+        let per = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let (hits, reused, misses) = platform::capture_counters();
+        println!(
+            "\n{n} captures of the same {w}x{h} rectangle back to back: \
+             {per:.2} ms each, {ok}/{n} succeeded"
+        );
+        // The interesting column is `unchanged`. A script waiting for something to
+        // appear looks at a screen that is not moving, and a frame the compositor
+        // never sent is a frame nobody had to read back.
+        println!(
+            "  new frames {hits}, unchanged {reused}, fell back to GDI {misses}"
+        );
+    }
+
     let Some(hay) = platform::capture(vx, vy, vw, vh) else {
         println!("\nCould not capture the screen - the rest of this test needs it.");
         return Ok(());
@@ -10901,8 +16676,8 @@ fn run_vision_selftest() -> Result<()> {
     // knowing - it would mean a script's poll rate depends on what is on screen.
     println!("\nTemplate search, single scale, whole screen as haystack");
     println!(
-        "{:<16} {:>9} {:>10} {:>9} {:>8}",
-        "template", "hit ms", "miss ms", "score", "err px"
+        "{:<16} {:>9} {:>10} {:>9} {:>8} {:>10}",
+        "template", "hit ms", "miss ms", "score", "err px", "vs 1 thread"
     );
     for size in [32u32, 64, 128, 256] {
         if size + 8 >= hay.w.min(hay.h) {
@@ -10925,13 +16700,26 @@ fn run_vision_selftest() -> Result<()> {
             Some(h) => (h.score, (h.x - want_x).abs().max((h.y - want_y).abs())),
             None => (0.0, -1),
         };
+        // The same search with the threads taken away. A different answer here is a
+        // regression; the same answer means a template that matches in many places.
+        vision::set_max_threads(1);
+        let serial = vision::find(&hay, &hit_tpl, false);
+        vision::set_max_threads(0);
+        let agree = match (&found, &serial) {
+            (Some(a), Some(b)) => {
+                if a.x == b.x && a.y == b.y { "same" } else { "DIFFERENT" }
+            }
+            (None, None) => "same",
+            _ => "DIFFERENT",
+        };
         println!(
-            "{:<16} {:>9.1} {:>10.1} {:>9.3} {:>8}",
+            "{:<16} {:>9.1} {:>10.1} {:>9.3} {:>8} {:>10}",
             format!("{size}x{size}"),
             hit_ms,
             miss_ms,
             score,
-            err
+            err,
+            agree
         );
     }
 
@@ -10975,6 +16763,97 @@ fn run_vision_selftest() -> Result<()> {
         if step_ms > 0.0 { 1000.0 / step_ms } else { 0.0 }
     );
 
+    // ---- what the search area is worth --------------------------------------
+    // The point of the release, measured rather than promised: a script step is a
+    // capture plus a search, and both scale with the area it is allowed to look at.
+    println!("\nOne script image step by search area, 64x64 template");
+    println!(
+        "{:<16} {:>9} {:>10} {:>9} {:>12}",
+        "area", "capture", "search", "total ms", "checks/sec"
+    );
+    for (w, h) in
+        [(vw, vh), (1920, 1080), (1280, 720), (800, 600), (400, 300), (200, 150)]
+    {
+        if w > vw || h > vh {
+            continue;
+        }
+        let cap_ms = median_ms(5, || {
+            let _ = platform::capture(vx, vy, w, h);
+        });
+        let sub_frame = crop_frame(&hay, w as u32, h as u32);
+        let find_ms = median_ms(5, || {
+            let _ = vision::find(&sub_frame, &tpl64, false);
+        });
+        let total = cap_ms + find_ms;
+        println!(
+            "{:<16} {:>9.1} {:>10.1} {:>9.1} {:>12.1}",
+            format!("{w}x{h}"),
+            cap_ms,
+            find_ms,
+            total,
+            if total > 0.0 { 1000.0 / total } else { 0.0 }
+        );
+    }
+
+    // ---- what the vector kernel is worth ------------------------------------
+    // Stage 4 found a sevenfold win by measuring rather than guessing, so the same
+    // rule applies to the kernel that replaced it: print both numbers.
+    println!(
+        "\nCorrelation kernel ({})",
+        if vision::vectorised() { "AVX2 + FMA available" } else { "no AVX2 on this machine" }
+    );
+    println!("{:<16} {:>10} {:>10} {:>9} {:>10}", "template", "plain ms", "vector ms", "speed-up", "same spot");
+    for size in [32u32, 64, 128] {
+        if size + 8 >= hay.w.min(hay.h) {
+            continue;
+        }
+        let tpl = crop_template(&hay, size, size, "kernel");
+        vision::set_scalar_only(true);
+        let plain_ms = median_ms(3, || {
+            let _ = vision::find(&hay, &tpl, false);
+        });
+        let plain = vision::find(&hay, &tpl, false);
+        vision::set_scalar_only(false);
+        let vec_ms = median_ms(3, || {
+            let _ = vision::find(&hay, &tpl, false);
+        });
+        let vectored = vision::find(&hay, &tpl, false);
+        let same = match (&plain, &vectored) {
+            (Some(a), Some(b)) => {
+                if a.x == b.x && a.y == b.y { "same" } else { "DIFFERENT" }
+            }
+            (None, None) => "same",
+            _ => "DIFFERENT",
+        };
+        println!(
+            "{:<16} {:>10.1} {:>10.1} {:>9.2} {:>10}",
+            format!("{size}x{size}"),
+            plain_ms,
+            vec_ms,
+            if vec_ms > 0.0 { plain_ms / vec_ms } else { 0.0 },
+            same
+        );
+    }
+
+    // ---- what outline matching costs ----------------------------------------
+    println!("\nGrey against outline matching, 64x64 template");
+    println!("{:<16} {:>10} {:>9} {:>10}", "mode", "ms", "score", "err px");
+    {
+        let tpl = crop_template(&hay, 64, 64, "edge");
+        let want_x = hay.x + 64 + 32;
+        let want_y = hay.y + 64 + 32;
+        for (name, edge) in [("grey", false), ("outline", true)] {
+            let ms = median_ms(3, || {
+                let _ = vision::find_mode(&hay, &tpl, false, edge);
+            });
+            let (score, err) = match vision::find_mode(&hay, &tpl, false, edge) {
+                Some(h) => (h.score, (h.x - want_x).abs().max((h.y - want_y).abs())),
+                None => (0.0, -1),
+            };
+            println!("{name:<16} {ms:>10.1} {score:>9.3} {err:>10}");
+        }
+    }
+
     // ---- OCR ----------------------------------------------------------------
     println!("\nText recognition");
     println!("{:<14} {:>9} {:>8}", "region", "ms", "lines");
@@ -10997,6 +16876,75 @@ fn run_vision_selftest() -> Result<()> {
         }
     }
 
+    // ---- what preparing the pixels costs and buys ---------------------------
+    // The claim being tested: preparation is worth more than a second engine would
+    // be. A profile that costs three times as much and reads the same text is not.
+    println!("\nText recognition by preparation profile, 400x200 region");
+    println!("{:<16} {:>9} {:>8} {:>8} {:>10}", "profile", "ms", "lines", "chars", "fit");
+    for prep in
+        [ocr::Prep::None, ocr::Prep::Ui, ocr::Prep::Small, ocr::Prep::Game, ocr::Prep::Digits]
+    {
+        let (w, h) = (400.min(vw), 200.min(vh));
+        let mut lines = 0usize;
+        let mut chars = 0usize;
+        let mut fit = 0.0f64;
+        let mut failed: Option<String> = None;
+        let ms = median_ms(3, || {
+            match ocr::read_region_as(vx, vy, w, h, prep, &ocr::Expect::Any) {
+                Ok(r) => {
+                    lines = r.boxes.len();
+                    chars = r.text().chars().count();
+                    fit = r.quality;
+                }
+                Err(e) => failed = Some(e.to_string()),
+            }
+        });
+        match &failed {
+            Some(e) => {
+                println!("{:<16}   {e}", format!("{prep:?}"));
+                break;
+            }
+            None => println!(
+                "{:<16} {:>9.1} {:>8} {:>8} {:>10.2}",
+                format!("{prep:?}"),
+                ms,
+                lines,
+                chars,
+                fit
+            ),
+        }
+    }
+
+    // ---- what asking Windows costs ------------------------------------------
+    // The first rung of the cascade, and only the first rung if it is faster than
+    // the picture search. Against a game it finds nothing at all, which is the
+    // honest answer rather than a fault.
+    println!("\nUI Automation, against whatever window is in front");
+    println!("{:<30} {:>9} {:>8}", "query", "ms", "found");
+    for (label, q) in [
+        (
+            "any button, front window",
+            uia::Query { control: "Button".into(), in_front: true, ..Default::default() },
+        ),
+        (
+            "any button, whole desktop",
+            uia::Query { control: "Button".into(), in_front: false, ..Default::default() },
+        ),
+        (
+            "name substring, front window",
+            uia::Query {
+                name: "e".into(),
+                control: "Button".into(),
+                in_front: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let mut found = false;
+        let ms = median_ms(3, || found = uia::find(&q, 0).is_some());
+        println!("{:<30} {:>9.1} {:>8}", label, ms, if found { "yes" } else { "no" });
+    }
+
     println!(
         "\nHow to read this:\n\
          - The step cost is the one that matters. It is the floor under how often a\n\
@@ -11013,7 +16961,24 @@ fn run_vision_selftest() -> Result<()> {
            read.\n\
          - err px is how far the hit landed from where the template was cut out. It has\n\
            to stay at 0 or 1. A faster search that answers in the wrong place is not a\n\
-           faster search."
+           faster search - unless the last column says the single-threaded sweep gives\n\
+           the same answer, in which case the template matches in several places and\n\
+           the screen, not the code, decided which one won.\n\
+         - The area table is what this release is for. Compare the bottom row against\n\
+           the top one: that ratio is what a script gains by being told where to look.\n\
+         - The kernel table prices the vector path against the plain one. `same spot`\n\
+           has to say `same`: the two differ in the last bits of an f32, and if that\n\
+           ever decides which position wins, the release finds pictures in different\n\
+           places on different processors.\n\
+         - Outline matching costs an extra pass over each plane and scores lower on\n\
+           the same picture. That is expected - it is a different measurement - and it\n\
+           earns its place when a template stops matching after a theme change.\n\
+         - The profile table is the case for preparing the pixels. Compare chars and\n\
+           fit, not only ms: a profile that costs three times as much and reads the\n\
+           same text is not worth having, and one that reads twice as much for twice\n\
+           the cost is.\n\
+         - UI Automation belongs at the front of the cascade only if it is faster than\n\
+           the picture search here. Zero found against a game is the expected answer."
     );
     Ok(())
 }
@@ -11253,7 +17218,7 @@ fn run_soak_selftest(hours: f64) -> Result<()> {
     start_playback(&state);
     let (vx, vy, vw, vh) = platform::virtual_screen_rect();
     let tpl = platform::capture(vx, vy, vw.min(256), vh.min(256))
-        .map(|f| vision::Template { w: f.w, h: f.h, rgba: f.rgba, name: "soak".into() });
+        .map(|f| f.as_template("soak"));
 
     let started = Instant::now();
     let end = started + Duration::from_secs_f64(hours * 3600.0);
@@ -11444,23 +17409,452 @@ fn run_soak_selftest(hours: f64) -> Result<()> {
 
 fn run_selftest(which: &str) -> Result<()> {
     // `churn=600` runs for ten minutes; plain `churn` for five.
-    let (name, arg) = match which.split_once('=') {
-        Some((n, a)) => (n, a.parse::<u64>().ok()),
-        None => (which, None),
+    // Two parses, because the soak is measured in hours and everything else in
+    // whole units. `soak=0.35` used to parse as a `u64`, fail, and fall through to
+    // the twelve-hour default without a word - which is a very long time to wait
+    // for a twenty-minute answer, and it is exactly what happened while this
+    // release was being tested.
+    let (name, arg, hours) = match which.split_once('=') {
+        Some((n, a)) => (n, a.parse::<u64>().ok(), a.parse::<f64>().ok()),
+        None => (which, None, None),
     };
+    if which.contains('=') && arg.is_none() && hours.is_none() {
+        println!("'{which}': the part after '=' is not a number - ignoring it");
+    }
     match name {
         "timing" => run_timing_selftest(),
         "vision" => run_vision_selftest(),
         "churn" => run_churn_selftest(arg.unwrap_or(300).clamp(5, 7200)),
-        "soak" => run_soak_selftest((arg.unwrap_or(12) as f64).clamp(0.1, 48.0)),
+        "soak" => run_soak_selftest(hours.unwrap_or(12.0).clamp(0.01, 48.0)),
+        "script" => run_script_selftest(arg.unwrap_or(200).clamp(1, 100_000)),
         _ => {
             println!(
                 "unknown self-test '{which}'. \
-                 Available: timing, vision, churn[=seconds], soak[=hours]"
+                 Available: timing, vision, churn[=seconds], soak[=hours], \
+                 script[=rounds]"
             );
             Ok(())
         }
     }
+}
+
+/// Drives the script interpreter through the 1.5.0 paths, on real threads.
+///
+/// The unit tests check the pieces: that a policy round-trips, that `break_target`
+/// counts nesting, that a drag is not a click. What they cannot check is the
+/// interpreter actually running - the retry loop sleeping and being cancelled, a
+/// call handing its variables down and getting them back, a recursion guard firing
+/// eight frames deep, a step gate parking a run and something else releasing it.
+/// Those are all about a playback thread and the flags other threads set under it,
+/// and the only way to test them is to run one.
+///
+/// Everything runs dry: `arm_dry` silences all five `SendInput` call sites, so
+/// nothing here reaches the operating system.
+fn run_script_selftest(rounds: u64) -> Result<()> {
+    use std::sync::atomic::AtomicU64;
+
+    virtual_desktop::init_thread();
+    selftest::arm_dry();
+    println!("Self-test: the script interpreter\n");
+
+    let dir = paths::sub_dir("selftest");
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut checks = 0u32;
+    let mut check = |name: &str, ok: bool, detail: String| {
+        checks += 1;
+        println!("{:<52} {:>8}  {detail}", name, if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(name.to_string());
+        }
+    };
+
+    // A script whose steps can be counted from outside. `Log` is the only step that
+    // touches nothing and leaves a trace, so the counting is done by wrapping the
+    // run instead: what matters is where the program counter stopped, and that is
+    // visible in the variables the run leaves behind.
+    let run = |script: Vec<ScriptStep>, vars: Vec<(&str, Value)>| -> (ScriptEnd, std::collections::HashMap<String, Value>, Duration) {
+        let (tx, _rx) = unbounded();
+        let state = AppState::new(tx);
+        // `stopping()` compares the run's generation against the live one, and a
+        // fresh AppState starts at zero. A harness that forgot this would see every
+        // run cancelled before its first step - which is exactly what it did.
+        state.play_generation.store(1, Ordering::Relaxed);
+        let mut data = MacroData::new(vec![MacroEvent {
+            t_us: 0,
+            kind: InputEventKind::Key { vk: 0x20, scan: 0, down: true, extended: false },
+        }], 1000);
+        data.script = script;
+        let mut ctx = ScriptCtx {
+            state: &state,
+            data: &data,
+            generation: 1,
+            map: CoordMap::IDENTITY,
+            vars: vars.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            templates: Default::default(),
+            last_text: String::new(),
+            last_hit: Default::default(),
+            latched: Default::default(),
+            history: Default::default(),
+            depth: 0,
+            called: Default::default(),
+        };
+        let mut pressed = PressedInputs::default();
+        let mut mover = MoveEngine::new(&state);
+        let mut guard = FrameGuard::new(&state);
+        let t0 = Instant::now();
+        let end = run_script(&mut ctx, &mut pressed, &mut mover, &mut guard);
+        (end, ctx.vars, t0.elapsed())
+    };
+
+    let bump = |name: &str| {
+        ScriptStep::new(StepKind::SetVar {
+            name: name.into(),
+            op: VarOp::Add,
+            value: Value::Num(1.0),
+        })
+    };
+    // A picture that certainly is not on screen: no such template file exists, so
+    // `find_image_into` returns false without ever looking.
+    let missing = |miss: OnMiss| {
+        ScriptStep::new(StepKind::ClickImage {
+            template: "no_such_template_ever".into(),
+            threshold: 0.99,
+            button: MouseButton::Left,
+            area: SearchArea::Rect { x: 0, y: 0, w: 32, h: 32 },
+            edge: false,
+            miss,
+        })
+    };
+
+    // ---- the four policies, one at a time -----------------------------------
+    println!("What a step that finds nothing does\n");
+    println!("{:<52} {:>8}  {}", "check", "result", "detail");
+
+    {
+        let (end, vars, _) = run(vec![missing(OnMiss::Continue), bump("after")], vec![]);
+        let after = vars.get("after").map_or(0.0, |v| v.as_num());
+        check(
+            "carry on: the next step still runs",
+            end == ScriptEnd::Finished && after == 1.0,
+            format!("{end:?}, after = {after}"),
+        );
+    }
+    {
+        let (end, vars, _) = run(vec![missing(OnMiss::Stop), bump("after")], vec![]);
+        let after = vars.get("after").map_or(0.0, |v| v.as_num());
+        check(
+            "stop: the next step does not run",
+            end == ScriptEnd::Finished && after == 0.0,
+            format!("{end:?}, after = {after}"),
+        );
+    }
+    {
+        // while true { miss(Break); bump(inner) }  then bump(after)
+        let script = vec![
+            ScriptStep::new(StepKind::While { cond: Condition::Always }),
+            missing(OnMiss::Break),
+            bump("inner"),
+            ScriptStep::new(StepKind::EndWhile),
+            bump("after"),
+        ];
+        let (end, vars, took) = run(script, vec![]);
+        let inner = vars.get("inner").map_or(-1.0, |v| v.as_num());
+        let after = vars.get("after").map_or(0.0, |v| v.as_num());
+        check(
+            "leave the loop: an endless loop ends, once",
+            end == ScriptEnd::Finished && inner == -1.0 && after == 1.0,
+            format!("{end:?}, inner = {inner}, after = {after}, {:.0} ms", took.as_secs_f64() * 1000.0),
+        );
+    }
+    {
+        let times = 3;
+        let delay = 120u64;
+        let (end, vars, took) =
+            run(vec![missing(OnMiss::Retry { times, delay_ms: delay }), bump("after")], vec![]);
+        let after = vars.get("after").map_or(0.0, |v| v.as_num());
+        let ms = took.as_secs_f64() * 1000.0;
+        // Three retries at 120 ms each is 360 ms of napping, and `nap` sleeps in
+        // 15 ms slices, so the floor is real and the ceiling is generous.
+        let waited = ms >= (times as f64 * delay as f64 * 0.8);
+        check(
+            "try again: it waits, then stops",
+            end == ScriptEnd::Finished && after == 0.0 && waited,
+            format!("{end:?}, after = {after}, {ms:.0} ms for {times}x{delay} ms"),
+        );
+    }
+
+    // ---- calling another macro ----------------------------------------------
+    println!("\nCalling another macro\n");
+    println!("{:<52} {:>8}  {}", "check", "result", "detail");
+
+    // A callee that adds one to `n` and writes a string back.
+    let child = {
+        let mut d = MacroData::new(vec![], 0);
+        d.script = vec![
+            ScriptStep::new(StepKind::SetVar {
+                name: "n".into(),
+                op: VarOp::Add,
+                value: Value::Num(1.0),
+            }),
+            ScriptStep::new(StepKind::SetVar {
+                name: "from_child".into(),
+                op: VarOp::Set,
+                value: Value::Str("yes".into()),
+            }),
+        ];
+        d
+    };
+    let child_path = dir.join("selftest_child.json");
+    save_macro(&child_path, &child)?;
+
+    {
+        let script = vec![
+            ScriptStep::new(StepKind::Call {
+                path: child_path.to_string_lossy().to_string(),
+                miss: OnMiss::Stop,
+            }),
+            bump("after"),
+        ];
+        let (end, vars, _) = run(script, vec![("n", Value::Num(41.0))]);
+        let n = vars.get("n").map_or(0.0, |v| v.as_num());
+        let back = vars.get("from_child").map(|v| v.to_string()).unwrap_or_default();
+        let after = vars.get("after").map_or(0.0, |v| v.as_num());
+        check(
+            "variables go in and come back out",
+            end == ScriptEnd::Finished && n == 42.0 && back == "yes" && after == 1.0,
+            format!("n = {n}, from_child = {back:?}, after = {after}"),
+        );
+    }
+    {
+        let script = vec![
+            ScriptStep::new(StepKind::Call {
+                path: "no_such_macro_anywhere.json".into(),
+                miss: OnMiss::Stop,
+            }),
+            bump("after"),
+        ];
+        let (end, vars, _) = run(script, vec![]);
+        let after = vars.get("after").map_or(0.0, |v| v.as_num());
+        check(
+            "a file that will not load obeys its policy",
+            end == ScriptEnd::Finished && after == 0.0,
+            format!("{end:?}, after = {after}"),
+        );
+    }
+    {
+        // The one that would take the process down without a cap: a macro that
+        // calls itself. Written to disk under its own name so the call really does
+        // reload it rather than recursing on an in-memory copy.
+        let self_path = dir.join("selftest_recursive.json");
+        let mut recursive = MacroData::new(vec![], 0);
+        recursive.script = vec![
+            ScriptStep::new(StepKind::SetVar {
+                name: "depth".into(),
+                op: VarOp::Add,
+                value: Value::Num(1.0),
+            }),
+            ScriptStep::new(StepKind::Call {
+                path: self_path.to_string_lossy().to_string(),
+                miss: OnMiss::Continue,
+            }),
+        ];
+        save_macro(&self_path, &recursive)?;
+        let script = vec![ScriptStep::new(StepKind::Call {
+            path: self_path.to_string_lossy().to_string(),
+            miss: OnMiss::Continue,
+        })];
+        let (end, vars, took) = run(script, vec![]);
+        let depth = vars.get("depth").map_or(0.0, |v| v.as_num());
+        // One `SetVar` per level, and the cap stops it entering the ninth.
+        let want = MAX_CALL_DEPTH as f64;
+        check(
+            "a macro that calls itself stops at the cap",
+            end == ScriptEnd::Finished && depth == want,
+            format!("ran {depth} levels, cap is {want}, {:.0} ms", took.as_secs_f64() * 1000.0),
+        );
+    }
+
+    // ---- the step gate -------------------------------------------------------
+    println!("\nPausing before each step\n");
+    println!("{:<52} {:>8}  {}", "check", "result", "detail");
+    {
+        let (tx, _rx) = unbounded();
+        let state = AppState::new(tx);
+        state.play_generation.store(1, Ordering::Relaxed);
+        let mut data = MacroData::new(vec![], 0);
+        data.script = (0..5).map(|_| bump("n")).collect();
+        state.step_mode.store(true, Ordering::Relaxed);
+        set_watching_vars(true);
+
+        let st = state.clone();
+        let done = Arc::new(AtomicU64::new(0));
+        let d2 = done.clone();
+        let handle = std::thread::Builder::new().name("gate".into()).spawn(move || {
+            let mut ctx = ScriptCtx {
+                state: &st,
+                data: &data,
+                generation: 1,
+                map: CoordMap::IDENTITY,
+                vars: Default::default(),
+                templates: Default::default(),
+                last_text: String::new(),
+                last_hit: Default::default(),
+                latched: Default::default(),
+                history: Default::default(),
+                depth: 0,
+                called: Default::default(),
+            };
+            let mut pressed = PressedInputs::default();
+            let mut mover = MoveEngine::new(&st);
+            let mut guard = FrameGuard::new(&st);
+            let end = run_script(&mut ctx, &mut pressed, &mut mover, &mut guard);
+            d2.store(1, Ordering::Relaxed);
+            (end, ctx.vars.get("n").map_or(0.0, |v| v.as_num()))
+        })?;
+
+        // It must be parked, and it must be publishing what it is parked on.
+        std::thread::sleep(Duration::from_millis(250));
+        let parked = script_view().is_some_and(|v| v.waiting);
+        let still_running = done.load(Ordering::Relaxed) == 0;
+        check(
+            "the run parks before its first step",
+            parked && still_running,
+            format!("waiting = {parked}, finished = {}", !still_running),
+        );
+
+        // Let it through one step at a time and watch the counter follow.
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            state.step_once.store(true, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(120));
+            seen.push(script_view().map_or(0, |v| v.pc));
+        }
+        state.step_mode.store(false, Ordering::Relaxed);
+        state.step_once.store(true, Ordering::Relaxed);
+        let (end, n) = handle.join().map_err(|_| anyhow::anyhow!("the gate thread panicked"))?;
+        check(
+            "letting it through one step at a time runs them all",
+            end == ScriptEnd::Finished && n == 5.0,
+            format!("{end:?}, n = {n}, program counter went {seen:?}"),
+        );
+        set_watching_vars(false);
+    }
+    {
+        // The failure mode that would be worst: a run parked in step mode that Stop
+        // cannot reach. The gate has to answer to `stop_play` as well as to the
+        // button, or the only way out would be to kill the process.
+        let (tx, _rx) = unbounded();
+        let state = AppState::new(tx);
+        state.play_generation.store(1, Ordering::Relaxed);
+        let mut data = MacroData::new(vec![], 0);
+        data.script = (0..3).map(|_| bump("n")).collect();
+        state.step_mode.store(true, Ordering::Relaxed);
+        set_watching_vars(true);
+        let st = state.clone();
+        let handle = std::thread::Builder::new().name("gate2".into()).spawn(move || {
+            let mut ctx = ScriptCtx {
+                state: &st,
+                data: &data,
+                generation: 1,
+                map: CoordMap::IDENTITY,
+                vars: Default::default(),
+                templates: Default::default(),
+                last_text: String::new(),
+                last_hit: Default::default(),
+                latched: Default::default(),
+                history: Default::default(),
+                depth: 0,
+                called: Default::default(),
+            };
+            let mut pressed = PressedInputs::default();
+            let mut mover = MoveEngine::new(&st);
+            let mut guard = FrameGuard::new(&st);
+            run_script(&mut ctx, &mut pressed, &mut mover, &mut guard)
+        })?;
+        std::thread::sleep(Duration::from_millis(200));
+        let t0 = Instant::now();
+        state.stop_play.store(true, Ordering::Relaxed);
+        let end = handle.join().map_err(|_| anyhow::anyhow!("the gate thread panicked"))?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        check(
+            "Stop releases a run parked in step mode",
+            end == ScriptEnd::Stopped && ms < 1000.0,
+            format!("{end:?} after {ms:.0} ms"),
+        );
+        set_watching_vars(false);
+    }
+
+    // ---- the stress round ----------------------------------------------------
+    // Every policy, in a loop, with calls nested under it, run until something
+    // either leaks a press or stops agreeing with itself. The counters here are the
+    // same ones stage 5 watches: a press left held is the failure this program can
+    // least afford.
+    println!("\n{rounds} rounds of every policy, with calls under them\n");
+    {
+        let mut ends = std::collections::BTreeMap::<String, u64>::new();
+        let t0 = Instant::now();
+        let mut worst_held = 0i64;
+        for r in 0..rounds {
+            let miss = match r % 4 {
+                0 => OnMiss::Continue,
+                1 => OnMiss::Stop,
+                2 => OnMiss::Break,
+                _ => OnMiss::Retry { times: 1, delay_ms: 0 },
+            };
+            let script = vec![
+                ScriptStep::new(StepKind::While { cond: Condition::Always }),
+                ScriptStep::new(StepKind::Call {
+                    path: child_path.to_string_lossy().to_string(),
+                    miss: OnMiss::Continue,
+                }),
+                missing(miss),
+                ScriptStep::new(StepKind::Break),
+                ScriptStep::new(StepKind::EndWhile),
+                bump("after"),
+            ];
+            let (end, _, _) = run(script, vec![("n", Value::Num(0.0))]);
+            *ends.entry(format!("{end:?}")).or_default() += 1;
+            worst_held = worst_held.max(selftest::held().abs());
+        }
+        let per = t0.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+        println!("  ends: {ends:?}");
+        check(
+            "no press left held across the whole stress run",
+            worst_held == 0,
+            format!("worst |held| = {worst_held}, {per:.2} ms a round"),
+        );
+        check(
+            "every round ended in a way the interpreter names",
+            ends.keys().all(|k| k == "Finished"),
+            format!("{} distinct endings", ends.len()),
+        );
+    }
+
+    let _ = std::fs::remove_file(&child_path);
+    let _ = std::fs::remove_file(dir.join("selftest_recursive.json"));
+    selftest::disarm();
+
+    println!("\n{checks} checks, {} failed", failures.len());
+    if !failures.is_empty() {
+        println!("  {}", failures.join("\n  "));
+        anyhow::bail!("{} script self-test check(s) failed", failures.len());
+    }
+    println!(
+        "\nHow to read this:\n\
+         - The four policies are the whole of what 1.5.0 changed about a step that\n\
+           finds nothing, and `carry on` has to still be indistinguishable from\n\
+           1.4.0 or every existing macro has changed behaviour.\n\
+         - `try again` is timed rather than counted: the retries are only useful if\n\
+           they actually wait, and a retry loop that spins is worse than none.\n\
+         - The recursion round is the one that would otherwise end the process. With\n\
+           `panic = \"abort\"` a stack overflow is not an error anybody handles.\n\
+         - `Stop releases a run parked in step mode` is the one to look at first if\n\
+           step mode ever feels wrong. A run that only the Next button can free, in\n\
+           a program whose whole point is a global stop key, would be a trap."
+    );
+    Ok(())
 }
 
 fn run_timing_selftest() -> Result<()> {
@@ -12095,7 +18489,25 @@ mod tests {
             text: text.into(),
             trigger: t,
             insert: expander::Insert::Type,
+            action: expander::Action::Text,
         }
+    }
+
+    fn typed_busy(
+        book: &expander::Book,
+        s: &str,
+        allow_text: bool,
+    ) -> Option<expander::Fire> {
+        let mut buf: Vec<char> = Vec::new();
+        let mut last = None;
+        for c in s.chars() {
+            buf.push(c);
+            last = expander::match_at(book, &buf, c, allow_text);
+            if last.is_some() {
+                break;
+            }
+        }
+        last
     }
 
     fn typed(book: &expander::Book, s: &str) -> Option<expander::Fire> {
@@ -12103,7 +18515,7 @@ mod tests {
         let mut last = None;
         for c in s.chars() {
             buf.push(c);
-            last = expander::match_at(book, &buf, c);
+            last = expander::match_at(book, &buf, c, true);
             if last.is_some() {
                 break;
             }
@@ -12189,6 +18601,235 @@ mod tests {
         b.entries[0].enabled = true;
         b.enabled = false;
         assert!(typed(&b, "addr ").is_none());
+    }
+
+    /// Writes a solid-colour PNG, which is all these tests need to exist.
+    fn write_png(path: &std::path::Path, w: u32, h: u32, shade: u8) {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([shade, shade, shade, 255]));
+        img.save(path).unwrap();
+    }
+
+    #[test]
+    fn a_folder_of_variants_loads_as_a_set() {
+        let dir = std::env::temp_dir().join("mr_tpl_variants");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Claim")).unwrap();
+        write_png(&dir.join("Claim/normal.png"), 20, 10, 200);
+        write_png(&dir.join("Claim/hover.png"), 20, 10, 150);
+        write_png(&dir.join("Claim/dark.png"), 20, 10, 40);
+        // Something that is not a picture must not become one.
+        std::fs::write(dir.join("Claim/notes.txt"), "ignore me").unwrap();
+
+        let set = load_template_set_at(&dir.join("Claim"), "Claim");
+        assert_eq!(set.len(), 3, "three PNGs, and only the PNGs");
+        // Alphabetical, so a tie between variants does not depend on the file system.
+        assert!(set.iter().all(|t| t.w == 20 && t.h == 10));
+
+        // A single file still works, which is what every existing macro uses.
+        write_png(&dir.join("Solo.png"), 8, 8, 90);
+        assert_eq!(load_template_set_at(&dir.join("Solo"), "Solo").len(), 1);
+
+        // And a name that is neither is empty rather than a panic.
+        assert!(load_template_set_at(&dir.join("Nothing"), "Nothing").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_template_is_rescaled_from_the_dpi_it_was_cut_at() {
+        let dir = std::env::temp_dir().join("mr_tpl_dpi");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("Btn.png");
+        write_png(&png, 90, 30, 128);
+
+        // No sidecar means nothing is known, and nothing known means nothing done.
+        // This is the assertion that stops an upgrade from breaking every template
+        // that was cut before this release existed.
+        let plain = load_template_set_at(&dir.join("Btn"), "Btn");
+        assert_eq!(plain.len(), 1);
+        assert_eq!((plain[0].w, plain[0].h), (90, 30));
+
+        // Half the dpi it will be looked for on, so it has to come back twice the size.
+        save_template_meta(&png, &TemplateMeta { dpi: platform::current_dpi() / 2 });
+        let scaled = load_template_set_at(&dir.join("Btn"), "Btn");
+        assert_eq!((scaled[0].w, scaled[0].h), (180, 60));
+
+        // The sidecar sits beside the picture, not instead of it.
+        assert!(dir.join("Btn.png.json").exists());
+        assert!(png.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_thresholds_stop_a_wobbling_score_from_flapping() {
+        // The sequence from the report that asked for this: around a single threshold
+        // of 0.80 it reads as four state changes.
+        let scores = [0.79, 0.81, 0.79, 0.82, 0.78];
+        let mut one = false;
+        let mut flips_one = 0;
+        for sc in scores {
+            let now = match_decision(sc, 0.80, 0.0, one);
+            if now != one {
+                flips_one += 1;
+            }
+            one = now;
+        }
+        assert_eq!(flips_one, 4, "a single threshold should flap here");
+
+        // With a lower threshold to lose it, the same sequence settles after one.
+        let mut two = false;
+        let mut flips_two = 0;
+        for sc in scores {
+            let now = match_decision(sc, 0.80, 0.70, two);
+            if now != two {
+                flips_two += 1;
+            }
+            two = now;
+        }
+        assert_eq!(flips_two, 1);
+        assert!(two, "it appeared at 0.81 and never dropped under 0.70");
+
+        // And it does come back when the picture really goes.
+        assert!(!match_decision(0.69, 0.80, 0.70, true));
+    }
+
+    #[test]
+    fn a_lower_threshold_that_is_not_lower_changes_nothing() {
+        // Zero means unset; a value at or above the appear threshold is a mistake, and
+        // honouring it would make a found picture impossible to lose.
+        for bad in [0.0, 0.80, 0.95] {
+            assert!(!match_decision(0.79, 0.80, bad, true), "lose_at {bad} was honoured");
+        }
+    }
+
+    #[test]
+    fn stability_tells_an_object_from_a_flicker() {
+        // 82, 84, 83: an object. 83, 51, 74: noise that was briefly plausible.
+        let mut steady = 0u32;
+        let mut answers = Vec::new();
+        for sc in [0.82, 0.84, 0.83] {
+            answers.push(stable_enough(&mut steady, sc >= 0.80, 2, 3));
+        }
+        assert_eq!(answers, vec![false, true, true], "two of three should settle true");
+
+        let mut noisy = 0u32;
+        let mut answers = Vec::new();
+        for sc in [0.83, 0.51, 0.74] {
+            answers.push(stable_enough(&mut noisy, sc >= 0.80, 2, 3));
+        }
+        assert!(answers.iter().all(|a| !a), "one good frame in three is not an object");
+    }
+
+    #[test]
+    fn asking_for_no_stability_answers_frame_by_frame() {
+        let mut h = 0u32;
+        assert!(stable_enough(&mut h, true, 0, 0));
+        assert!(!stable_enough(&mut h, false, 1, 1));
+        assert!(stable_enough(&mut h, true, 1, 1));
+        // And the window cannot be pushed past the width of the mask it lives in.
+        let mut wide = 0u32;
+        for _ in 0..40 {
+            stable_enough(&mut wide, true, 40, 40);
+        }
+        assert!(stable_enough(&mut wide, true, 40, 40));
+    }
+
+    #[test]
+    fn a_search_area_stays_inside_the_desktop() {
+        // A window can sit half off-screen and a hand-typed rectangle can be nonsense;
+        // the capture has to be a real rectangle either way.
+        let (fx, fy, fw, fh) = (0, 0, 1920, 1080);
+        let clamp = |x: i32, y: i32, w: i32, h: i32| {
+            let x = x.clamp(fx, fx + fw - 1);
+            let y = y.clamp(fy, fy + fh - 1);
+            (x, y, w.clamp(1, fx + fw - x), h.clamp(1, fy + fh - y))
+        };
+        assert_eq!(clamp(-500, -500, 800, 600), (0, 0, 800, 600));
+        assert_eq!(clamp(1800, 1000, 800, 600), (1800, 1000, 120, 80));
+        assert_eq!(clamp(0, 0, -5, -5), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn a_step_kind_survives_the_round_trip_including_the_new_one() {
+        // COUNT and the two index tables have to agree, and adding a kind is exactly
+        // where they stop agreeing.
+        for i in 0..StepKind::COUNT {
+            assert_eq!(StepKind::from_index(i).index(), i, "kind {i} does not round-trip");
+        }
+        assert!(matches!(
+            StepKind::from_index(17),
+            StepKind::FindImage { .. }
+        ));
+    }
+
+    #[test]
+    fn an_image_step_keeps_its_area_through_a_save() {
+        let mut data = MacroData::new(vec![ev(0)], 1000);
+        data.script.push(ScriptStep {
+            kind: StepKind::FindImage {
+                template: "claim".into(),
+                threshold: 0.9,
+                area: SearchArea::Rect { x: 10, y: 20, w: 300, h: 200 },
+                var: "target".into(),
+                edge: false,
+                miss: OnMiss::Continue,
+            },
+            enabled: true,
+        });
+        let back: MacroData =
+            serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
+        match &back.script[0].kind {
+            StepKind::FindImage { area, var, .. } => {
+                assert_eq!(var, "target");
+                assert_eq!(*area, SearchArea::Rect { x: 10, y: 20, w: 300, h: 200 });
+            }
+            other => panic!("wrong kind back: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_image_step_written_before_areas_existed_still_loads() {
+        // Every macro saved up to 1.3.5 has no `area` field at all.
+        let json = r#"{"events":[{"t_us":0,"kind":{"MouseMove":{"x":1,"y":1,"dx":0,"dy":0}}}],
+            "script":[{"kind":{"ClickImage":{"template":"claim","threshold":0.85,
+            "button":"Left"}},"enabled":true}]}"#;
+        let data = parse_macro(json).expect("an older macro must still load");
+        match &data.script[0].kind {
+            StepKind::ClickImage { area, .. } => assert_eq!(*area, SearchArea::FullScreen),
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_command_entry_carries_its_action_instead_of_text() {
+        let mut e = entry(";farm", "C:/macros/farm.mrz", expander::Trigger::Instant);
+        e.action = expander::Action::PlayMacro;
+        let b = book_with(vec![e]);
+        let f = typed(&b, ";farm").expect("fired");
+        assert_eq!(f.action, expander::Action::PlayMacro);
+        assert_eq!(f.payload, "C:/macros/farm.mrz");
+        // The path is a path, not something to type: no placeholders, no segments.
+        assert!(f.segments.is_empty());
+        assert_eq!(f.backspaces, 5);
+    }
+
+    #[test]
+    fn replaying_silences_text_entries_but_not_commands() {
+        let mut cmd = entry(";stop", "", expander::Trigger::Instant);
+        cmd.action = expander::Action::StopAll;
+        let b = book_with(vec![entry(";sig", "text", expander::Trigger::Instant), cmd]);
+
+        // Idle: both work.
+        assert!(typed_busy(&b, ";sig", true).is_some());
+        assert!(typed_busy(&b, ";stop", true).is_some());
+
+        // Replaying: typing into a running macro would fight with it, but a command
+        // that stops it is the whole point of being able to reach for one.
+        assert!(typed_busy(&b, ";sig", false).is_none());
+        assert_eq!(
+            typed_busy(&b, ";stop", false).expect("a command must still fire").action,
+            expander::Action::StopAll
+        );
     }
 
     #[test]
@@ -12339,7 +18980,7 @@ mod tests {
                 rgba[d..d + 4].copy_from_slice(&tpl.rgba[sidx..sidx + 4]);
             }
         }
-        vision::Frame { x: 0, y: 0, w, h, rgba }
+        vision::Frame::rgba(0, 0, w, h, rgba)
     }
 
     fn checker_template(w: u32, h: u32) -> vision::Template {
@@ -12414,13 +19055,7 @@ mod tests {
     #[test]
     fn a_missing_template_scores_low() {
         let tpl = checker_template(32, 32);
-        let flat = vision::Frame {
-            x: 0,
-            y: 0,
-            w: 200,
-            h: 200,
-            rgba: vec![90u8; 200 * 200 * 4],
-        };
+        let flat = vision::Frame::rgba(0, 0, 200, 200, vec![90u8; 200 * 200 * 4]);
         let hit = vision::find(&flat, &tpl, false);
         // A featureless screen cannot correlate with a patterned template.
         assert!(hit.map(|h| h.score < 0.5).unwrap_or(true));
@@ -12429,7 +19064,7 @@ mod tests {
     #[test]
     fn template_larger_than_the_screen_is_not_a_match() {
         let tpl = checker_template(64, 64);
-        let small = vision::Frame { x: 0, y: 0, w: 32, h: 32, rgba: vec![0u8; 32 * 32 * 4] };
+        let small = vision::Frame::rgba(0, 0, 32, 32, vec![0u8; 32 * 32 * 4]);
         assert!(vision::find(&small, &tpl, false).is_none());
     }
 
@@ -12610,18 +19245,22 @@ mod tests {
             step(StepKind::While { cond: Condition::Var {
                 name: "n".into(),
                 cmp: Cmp::Lt,
-                value: 3.0,
+                value: Value::Num(3.0),
             } }),
             step(StepKind::PlayEvents { from: 0, to: 1 }),
-            step(StepKind::SetVar { name: "n".into(), op: VarOp::Add, value: 1.0 }),
+            step(StepKind::SetVar {
+                name: "n".into(),
+                op: VarOp::Add,
+                value: Value::Num(1.0),
+            }),
             step(StepKind::EndWhile),
         ];
-        d.vars.insert("n".into(), 0.0);
+        d.vars.insert("n".into(), Value::Num(0.0));
         let text = serde_json::to_string(&d).unwrap();
         let back = parse_macro(&text).unwrap();
         assert_eq!(back.script.len(), 4);
         assert!(back.has_script());
-        assert_eq!(back.vars.get("n"), Some(&0.0));
+        assert_eq!(back.vars.get("n"), Some(&Value::Num(0.0)));
     }
 
     #[test]
@@ -13009,5 +19648,968 @@ mod tests {
     fn profile_names_are_sanitized() {
         let p = profile_path("farm/../evil");
         assert!(p.file_name().unwrap().to_string_lossy().starts_with("farm_"));
+    }
+
+    // ---- image search --------------------------------------------------------
+
+    /// The same picture, made lighter or darker the way a theme change does.
+    fn reshade(f: &vision::Frame, add: i16, gain: f32) -> vision::Frame {
+        let mut px = f.px.clone();
+        for p in px.chunks_exact_mut(4) {
+            for c in p.iter_mut().take(3) {
+                let v = (*c as f32 * gain) as i16 + add;
+                *c = v.clamp(0, 255) as u8;
+            }
+        }
+        vision::Frame { x: f.x, y: f.y, w: f.w, h: f.h, px, order: f.order }
+    }
+
+    #[test]
+    fn the_vector_kernel_agrees_with_the_plain_one() {
+        // The two have to give the same answer to within rounding, or the release
+        // finds pictures in different places depending on the processor.
+        let tpl = checker_template(32, 24);
+        let hay = haystack(320, 240, &tpl, 100, 60);
+        let hit = vision::find(&hay, &tpl, false).expect("should find it");
+        assert!(hit.score > 0.95, "score was {}", hit.score);
+        assert_eq!((hit.x, hit.y), (100 + 16, 60 + 12));
+
+        // And the one-pass form must still refuse a template with no contrast: it
+        // would otherwise correlate with everything equally well.
+        let flat = vision::Template {
+            w: 16,
+            h: 16,
+            rgba: vec![128u8; 16 * 16 * 4],
+            name: "flat".into(),
+        };
+        let score = vision::find(&hay, &flat, false).map(|h| h.score).unwrap_or(-1.0);
+        assert!(score <= 0.0, "a blank template scored {score}");
+    }
+
+    #[test]
+    fn correlation_still_ignores_brightness_and_contrast() {
+        // What normalised correlation is for, and what the rewritten inner loop
+        // must not have lost.
+        let tpl = checker_template(32, 24);
+        let hay = haystack(320, 240, &tpl, 100, 60);
+        let dimmed = reshade(&hay, -40, 0.75);
+        let hit = vision::find(&dimmed, &tpl, false).expect("should still find it");
+        assert!(hit.score > 0.95, "score fell to {} on a dimmed screen", hit.score);
+        assert_eq!((hit.x, hit.y), (100 + 16, 60 + 12));
+    }
+
+    #[test]
+    fn the_outline_mode_finds_the_same_place() {
+        // Edge matching is a different measurement, so the score is its own; what
+        // has to survive is where it says the picture is.
+        let tpl = checker_template(32, 24);
+        let hay = haystack(320, 240, &tpl, 100, 60);
+        let hit = vision::find_mode(&hay, &tpl, false, true).expect("should find it");
+        assert_eq!((hit.x, hit.y), (100 + 16, 60 + 12));
+        // Never quite 1.0, and it should not be: the template's outermost ring has
+        // no neighbours outside itself, so its gradients are computed against a
+        // replicated border while the screen's are computed against whatever is
+        // really there. The interior is what carries the match.
+        assert!(hit.score > 0.85, "outline score was {}", hit.score);
+    }
+
+    #[test]
+    fn a_template_larger_than_the_area_is_still_not_a_match() {
+        // The prepared form has more ways to be handed nonsense than the old one.
+        let big = checker_template(64, 64);
+        let small = vision::Frame::rgba(0, 0, 16, 16, vec![0u8; 16 * 16 * 4]);
+        assert!(vision::find(&small, &big, false).is_none());
+        assert!(vision::find_mode(&small, &big, false, true).is_none());
+    }
+
+    #[test]
+    fn an_anchored_area_survives_a_save_and_load() {
+        let mut data = MacroData::new(vec![ev(0)], 1000);
+        data.script.push(ScriptStep {
+            kind: StepKind::ClickImage {
+                template: "join".into(),
+                threshold: 0.85,
+                button: MouseButton::Left,
+                area: SearchArea::NearAnchor {
+                    anchor: "heading".into(),
+                    dx: -150,
+                    dy: 40,
+                    w: 300,
+                    h: 120,
+                },
+                edge: true,
+                miss: OnMiss::Continue,
+            },
+            enabled: true,
+        });
+        let back: MacroData =
+            serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
+        match &back.script[0].kind {
+            StepKind::ClickImage { area, edge, .. } => {
+                assert!(*edge);
+                assert_eq!(
+                    *area,
+                    SearchArea::NearAnchor {
+                        anchor: "heading".into(),
+                        dx: -150,
+                        dy: 40,
+                        w: 300,
+                        h: 120,
+                    }
+                );
+            }
+            other => panic!("wrong kind back: {other:?}"),
+        }
+    }
+
+    // ---- OCR preparation ---------------------------------------------------
+
+    /// A strip of `shade` pixels with `text` pixels written into the middle third.
+    fn strip(bg: u8, fg: u8, n: usize) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(n * 4);
+        for i in 0..n {
+            let v = if i % 5 == 0 { fg } else { bg };
+            rgba.extend_from_slice(&[v, v, v, 255]);
+        }
+        rgba
+    }
+
+    #[test]
+    fn otsu_puts_the_cut_between_the_two_populations() {
+        // Forty dark pixels and sixty light ones: the threshold has to land in the
+        // gap, not on either cluster.
+        let mut g = vec![30u8; 40];
+        g.extend(std::iter::repeat_n(210u8, 60));
+        let t = ocr::otsu(&g);
+        assert!((30..210).contains(&t), "threshold {t} is not between the two levels");
+
+        // A flat picture has no gap, and must still answer rather than divide by
+        // zero or loop.
+        let flat = vec![128u8; 50];
+        let _ = ocr::otsu(&flat);
+        let _ = ocr::otsu(&[]);
+    }
+
+    #[test]
+    fn binarising_ends_with_dark_text_whichever_way_it_started() {
+        // Light glyphs on a dark panel - the common case on a screen, and the one
+        // Windows OCR is worst at. Every version of it has to come out the same way
+        // round: the minority is the text, and the text ends up black.
+        let light_on_dark = ocr::prepare(&strip(20, 240, 100), ocr::Prep::Game, vision::Order::Rgba);
+        let dark_on_light = ocr::prepare(&strip(240, 20, 100), ocr::Prep::Game, vision::Order::Rgba);
+        for (name, out) in [("light on dark", light_on_dark), ("dark on light", dark_on_light)]
+        {
+            let black = out.chunks_exact(4).filter(|p| p[0] == 0).count();
+            let white = out.chunks_exact(4).filter(|p| p[0] == 255).count();
+            assert_eq!(black + white, 100, "{name}: something is not black or white");
+            assert!(black < white, "{name}: the text should be the black minority");
+        }
+    }
+
+    #[test]
+    fn preparing_nothing_changes_nothing() {
+        // The default has to be byte-for-byte what 1.3.5 sent to the engine, or
+        // every existing macro reads differently after an upgrade.
+        let src = strip(20, 240, 64);
+        assert_eq!(ocr::prepare(&src, ocr::Prep::None, vision::Order::Rgba), src);
+        // And a region too small to hold a pixel is not a panic.
+        assert!(ocr::prepare(&[], ocr::Prep::Ui, vision::Order::Rgba).is_empty());
+    }
+
+    #[test]
+    fn the_contrast_stretch_survives_a_flat_region() {
+        // A single colour has no range to stretch, which is a division by zero if
+        // nobody checks. The pixels come back grey, not NaN.
+        let out = ocr::prepare(&[90, 90, 90, 255, 90, 90, 90, 255], ocr::Prep::Ui, vision::Order::Rgba);
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[3], 255, "alpha has to stay opaque");
+    }
+
+    // ---- expected format ---------------------------------------------------
+
+    #[test]
+    fn a_pattern_is_small_enough_to_type_and_still_useful() {
+        assert!(ocr::pattern_matches("##:##", "12:34"));
+        assert!(!ocr::pattern_matches("##:##", "1:34"));
+        assert!(ocr::pattern_matches("*gems*", "Total Gems: 12"), "case is ignored");
+        assert!(ocr::pattern_matches("@@@", "abc"));
+        assert!(!ocr::pattern_matches("@@@", "ab1"));
+        assert!(ocr::pattern_matches("?#", "x7"));
+        // Surrounding whitespace is not a failure - OCR adds it constantly.
+        assert!(ocr::pattern_matches("##", "  42  "));
+        // A run of stars is one star, and must not take exponential time.
+        assert!(ocr::pattern_matches("*******x", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaax"));
+        assert!(!ocr::pattern_matches("*******x", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaay"));
+    }
+
+    #[test]
+    fn the_expected_format_refuses_a_wrong_shaped_reading() {
+        use ocr::Expect::*;
+        assert!(ocr::accepts(&Integer, "Gems: 1,250"));
+        assert!(!ocr::accepts(&Integer, "no digits here"));
+        assert!(ocr::accepts(&Time, "02:34"));
+        assert!(!ocr::accepts(&Time, "1250"));
+        assert!(ocr::accepts(&Decimal, "12.5%"));
+        assert!(ocr::accepts(&Any, "anything at all"));
+        assert!(!ocr::accepts(&Any, "   "));
+        // An empty pattern is a pattern nobody finished typing, not a pattern that
+        // matches everything.
+        assert!(!ocr::accepts(&Pattern(String::new()), "12:34"));
+    }
+
+    #[test]
+    fn a_decimal_reads_the_point_and_drops_the_thousands_separator() {
+        assert_eq!(ocr::first_decimal("1,250.5 gems"), Some(1250.5));
+        assert_eq!(ocr::first_decimal("12.5%"), Some(12.5));
+        // A trailing stop is a full stop, not a point with nothing after it.
+        assert_eq!(ocr::first_decimal("Level 7."), Some(7.0));
+        assert_eq!(ocr::first_decimal("nothing"), None);
+    }
+
+    #[test]
+    fn the_value_read_follows_the_format_asked_for() {
+        // The same text means different numbers under different formats, which is
+        // the whole reason the format is asked for.
+        assert_eq!(ocr::value_of(&ocr::Expect::Time, "02:34"), Some(154.0));
+        assert_eq!(ocr::value_of(&ocr::Expect::Integer, "02:34"), Some(2.0));
+        // The default keeps the old rule: a clock reads as seconds.
+        assert_eq!(ocr::value_of(&ocr::Expect::Any, "02:34"), Some(154.0));
+    }
+
+    #[test]
+    fn quality_prefers_the_reading_that_fits_the_format() {
+        use ocr::Expect::Time;
+        // What the ladder is choosing between: a clean clock, a clock with a
+        // mis-read digit, and a line of noise.
+        let good = ocr::quality("02:34", &Time);
+        let smudged = ocr::quality("O2:34", &Time);
+        let noise = ocr::quality("~ ##@!", &Time);
+        assert!(good > smudged, "{good} should beat {smudged}");
+        assert!(smudged > noise, "{smudged} should beat {noise}");
+        assert!(good >= 0.999, "a perfect clock has to stop the ladder early");
+        assert_eq!(ocr::quality("", &Time), 0.0);
+        assert_eq!(ocr::quality("   ", &ocr::Expect::Any), 0.0);
+    }
+
+    #[test]
+    fn an_ocr_step_written_before_profiles_existed_still_loads() {
+        // Every macro saved up to 1.3.5 has neither `prep` nor `expect`, and must
+        // keep behaving exactly as it did.
+        let json = r#"{"events":[{"t_us":0,"kind":{"MouseMove":{"x":1,"y":1,"dx":0,"dy":0}}}],
+            "script":[{"kind":{"ReadNumber":{"x":0,"y":0,"w":300,"h":80,"var":"gold"}},
+            "enabled":true},
+            {"kind":{"If":{"cond":{"Text":{"x":0,"y":0,"w":10,"h":10,"needle":"go"}}}},
+            "enabled":true},
+            {"kind":"EndIf","enabled":true}]}"#;
+        let data = parse_macro(json).expect("an older macro must still load");
+        match &data.script[0].kind {
+            StepKind::ReadNumber { prep, expect, var, .. } => {
+                assert_eq!(var, "gold");
+                assert_eq!(*prep, ocr::Prep::None);
+                assert_eq!(*expect, ocr::Expect::Any);
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+        match &data.script[1].kind {
+            StepKind::If { cond: Condition::Text { prep, .. } } => {
+                assert_eq!(*prep, ocr::Prep::None)
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    // ---- values that can hold text -----------------------------------------
+
+    #[test]
+    fn a_value_reads_as_a_number_whichever_way_it_is_stored() {
+        // The point of this: a count read off the screen lands in a variable as
+        // text, and then gets compared against a number. That has to work without
+        // a conversion step nobody would think to add.
+        assert_eq!(Value::Str("42".into()).as_num(), 42.0);
+        assert_eq!(Value::Str("  7 ".into()).as_num(), 7.0);
+        assert_eq!(Value::Num(3.5).as_num(), 3.5);
+        // And something that is not a number is not silently one.
+        assert_eq!(Value::Str("Roblox".into()).numeric(), None);
+        assert_eq!(Value::Str("Roblox".into()).as_num(), 0.0);
+        assert_eq!(Value::Str(String::new()).numeric(), None);
+        // A whole number prints without a tail: `7`, never `7.0`.
+        assert_eq!(Value::Num(7.0).as_text(), "7");
+        assert_eq!(Value::Num(-7.0).as_text(), "-7");
+        assert_eq!(Value::Num(0.5).as_text(), "0.5");
+    }
+
+    #[test]
+    fn a_value_written_before_text_existed_still_loads() {
+        // Every macro up to 1.3.5 stored a bare number, and the untagged form has
+        // to keep reading those as numbers rather than as the text "10".
+        let v: Value = serde_json::from_str("10").unwrap();
+        assert_eq!(v, Value::Num(10.0));
+        let t: Value = serde_json::from_str("\"10\"").unwrap();
+        assert_eq!(t, Value::Str("10".into()));
+        // And a whole older macro, with vars and a condition in it.
+        let json = r#"{"events":[{"t_us":0,"kind":{"MouseMove":{"x":1,"y":1,"dx":0,"dy":0}}}],
+            "vars":{"count":3.0},
+            "script":[{"kind":{"While":{"cond":{"Var":{"name":"count","cmp":"Lt",
+            "value":10.0}}}},"enabled":true},{"kind":"EndWhile","enabled":true}]}"#;
+        let data = parse_macro(json).expect("an older macro must still load");
+        assert_eq!(data.vars.get("count"), Some(&Value::Num(3.0)));
+        match &data.script[0].kind {
+            StepKind::While { cond: Condition::Var { value, .. } } => {
+                assert_eq!(*value, Value::Num(10.0))
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comparison_falls_back_to_text_only_when_it_has_to() {
+        let num = Value::Num(10.0);
+        let as_text = Value::Str("10".into());
+        let word = Value::Str("Roblox".into());
+
+        // Two things that read as numbers are compared as numbers, whichever way
+        // round they are stored.
+        assert!(Cmp::Eq.test_values(&num, &as_text));
+        assert!(Cmp::Lt.test_values(&Value::Str("9".into()), &num));
+
+        // Text is compared as text, trimmed and without case.
+        assert!(Cmp::Eq.test_values(&word, &Value::Str("  roblox ".into())));
+        assert!(Cmp::Ne.test_values(&word, &Value::Str("minecraft".into())));
+
+        // And `has` is the forgiving containment screen text needs.
+        assert!(Cmp::Has.test_values(
+            &Value::Str("Roblox - Level 7".into()),
+            &Value::Str("roblox".into())
+        ));
+        assert!(!Cmp::Has.test_values(&word, &Value::Str("minecraft".into())));
+    }
+
+    #[test]
+    fn adding_to_text_joins_it_and_adding_to_numbers_adds_them() {
+        let join = VarOp::Add
+            .apply_values(&Value::Str("Level ".into()), &Value::Num(7.0));
+        assert_eq!(join, Value::Str("Level 7".into()));
+
+        // Two numbers that happen to be stored as text are still two numbers: a
+        // count read from the screen and then incremented must not become "31".
+        let sum = VarOp::Add.apply_values(&Value::Str("3".into()), &Value::Num(1.0));
+        assert_eq!(sum, Value::Num(4.0));
+
+        // Set replaces, whatever the kinds are.
+        assert_eq!(
+            VarOp::Set.apply_values(&Value::Num(1.0), &Value::Str("x".into())),
+            Value::Str("x".into())
+        );
+        // Taking away from text is meaningless, so it answers with a number.
+        assert_eq!(
+            VarOp::Sub.apply_values(&Value::Str("hello".into()), &Value::Num(1.0)),
+            Value::Num(-1.0)
+        );
+    }
+
+    #[test]
+    fn placeholders_in_step_text_are_filled_from_the_variables() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("gold".to_string(), Value::Num(1250.0));
+        vars.insert("who".to_string(), Value::Str("Watson".into()));
+
+        assert_eq!(expand_vars("{who} has {gold}", &vars), "Watson has 1250");
+        // A brace that was meant literally stays one.
+        assert_eq!(expand_vars("{{gold}}", &vars), "{gold}");
+        // A name nobody set is left as written rather than vanishing: a message
+        // that silently loses a word is much harder to diagnose.
+        assert_eq!(expand_vars("{missing}", &vars), "{missing}");
+        // An unclosed brace is text, not an error.
+        assert_eq!(expand_vars("100% {sure", &vars), "100% {sure");
+        assert_eq!(expand_vars("", &vars), "");
+    }
+
+    #[test]
+    fn the_new_text_steps_survive_a_save_and_load() {
+        let mut data = MacroData::new(vec![ev(0)], 1000);
+        data.script.push(ScriptStep {
+            kind: StepKind::GetText {
+                source: TextSource::File("C:/tmp/in.txt".into()),
+                var: "line".into(),
+            },
+            enabled: true,
+        });
+        data.script.push(ScriptStep {
+            kind: StepKind::PutText {
+                sink: TextSink::File { path: "C:/tmp/out.txt".into(), append: true },
+                text: "{line}".into(),
+            },
+            enabled: true,
+        });
+        data.vars.insert("who".into(), Value::Str("Watson".into()));
+
+        let back: MacroData =
+            serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
+        assert_eq!(back.vars.get("who"), Some(&Value::Str("Watson".into())));
+        match (&back.script[0].kind, &back.script[1].kind) {
+            (
+                StepKind::GetText { source: TextSource::File(p), var },
+                StepKind::PutText { sink: TextSink::File { append, .. }, text },
+            ) => {
+                assert_eq!(p, "C:/tmp/in.txt");
+                assert_eq!(var, "line");
+                assert!(*append);
+                assert_eq!(text, "{line}");
+            }
+            other => panic!("wrong kinds back: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_element_step_survives_a_save_and_load() {
+        let mut data = MacroData::new(vec![ev(0)], 1000);
+        data.script.push(ScriptStep {
+            kind: StepKind::ClickElement {
+                query: uia::Query {
+                    name: "Save".into(),
+                    automation_id: "btnSave".into(),
+                    control: "Button".into(),
+                    in_front: true,
+                },
+                button: MouseButton::Left,
+                invoke: true,
+                timeout_ms: 2000,
+                miss: OnMiss::Continue,
+            },
+            enabled: true,
+        });
+        let back: MacroData =
+            serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
+        match &back.script[0].kind {
+            StepKind::ClickElement { query, invoke, timeout_ms, .. } => {
+                assert_eq!(query.name, "Save");
+                assert_eq!(query.control, "Button");
+                assert!(*invoke);
+                assert_eq!(*timeout_ms, 2000);
+            }
+            other => panic!("wrong kind back: {other:?}"),
+        }
+        // A control type nobody recognises is "any", not a panic.
+        assert_eq!(uia::control_id("Button"), 50000);
+        assert_eq!(uia::control_id("button"), 50000);
+        assert_eq!(uia::control_id("Nonsense"), 0);
+        assert_eq!(uia::control_id(""), 0);
+        // A query that names nothing must match nothing. Without this, the three
+        // conditions collapse to "true", a subtree search for "true" returns the
+        // root, and `Press element` clicks the middle of the window - which is
+        // exactly what a step freshly added from the menu would have done.
+        assert!(uia::Query::default().is_empty());
+        assert!(uia::Query { in_front: false, ..Default::default() }.is_empty());
+        assert!(uia::Query { control: "Nonsense".into(), ..Default::default() }.is_empty());
+        assert!(!uia::Query { name: "Save".into(), ..Default::default() }.is_empty());
+        assert!(!uia::Query { control: "Button".into(), ..Default::default() }.is_empty());
+        assert!(
+            !uia::Query { automation_id: "btnSave".into(), ..Default::default() }.is_empty()
+        );
+        // Whitespace is not a name.
+        assert!(uia::Query { name: "   ".into(), ..Default::default() }.is_empty());
+
+        // And the flag that says "ask the application" defaults to on for a query
+        // written before it existed.
+        let q: uia::Query = serde_json::from_str(
+            r#"{"name":"Save","automation_id":"","control":""}"#,
+        )
+        .unwrap();
+        assert!(q.in_front);
+    }
+
+    #[test]
+    fn a_file_read_into_a_variable_is_capped() {
+        let dir = std::env::temp_dir().join("mr_text_file");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.txt");
+
+        // Naming the wrong path must not be able to pull an unbounded file into a
+        // variable, so the read stops at the cap.
+        let big = "x".repeat(TEXT_FILE_CAP as usize + 500);
+        std::fs::write(&path, &big).unwrap();
+        let read = read_text_file(path.to_str().unwrap());
+        assert_eq!(read.len() as u64, TEXT_FILE_CAP);
+
+        // A file that is not there is empty, not a panic.
+        assert!(read_text_file(dir.join("nothing.txt").to_str().unwrap()).is_empty());
+
+        // Writing replaces by default and adds to the end when asked.
+        let out = dir.join("out.txt");
+        let p = out.to_str().unwrap();
+        write_text_file(p, "one", false);
+        write_text_file(p, "-two", true);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "one-two");
+        write_text_file(p, "fresh", false);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_step_and_condition_kind_still_round_trips() {
+        // Adding a kind is exactly where COUNT and the two index tables stop
+        // agreeing, and the "Add" menu then offers a step nobody can edit.
+        for i in 0..StepKind::COUNT {
+            assert_eq!(StepKind::from_index(i).index(), i, "step kind {i}");
+        }
+        for i in 0..8 {
+            assert_eq!(Condition::from_index(i).kind_index(), i, "condition kind {i}");
+        }
+        // Each of the three new kinds has to be reachable from the "Add" menu, which
+        // is what the index tables are for.
+        assert!(matches!(StepKind::from_index(21), StepKind::FindElement { .. }));
+        assert!(matches!(StepKind::from_index(22), StepKind::ClickElement { .. }));
+        assert!(matches!(Condition::from_index(7), Condition::Element { .. }));
+        for i in 0..4 {
+            assert_eq!(TextSource::from_index(i).index(), i);
+        }
+        for i in 0..2 {
+            assert_eq!(TextSink::from_index(i).index(), i);
+        }
+    }
+
+    // ---- 1.5.0: channel order ------------------------------------------------
+
+    #[test]
+    fn a_bgra_frame_and_its_rgba_twin_are_the_same_picture() {
+        // The capture path stopped swapping red and blue and started saying which
+        // way round they are instead. If `Order` is ever read wrongly the search
+        // correlates a picture against its own mirror, which does not fail loudly -
+        // it just stops finding things. So: build one frame both ways and require
+        // the same template to land in the same place with the same score.
+        let (w, h) = (160u32, 120u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        // Two properties this pattern has to have. Not grey, because equal
+        // channels would pass whatever the order - which is exactly how a swap
+        // survives a careless test. And not periodic, because a repeating pattern
+        // matches in several places and the position assertion below would then be
+        // measuring which tie the sweep happened to break.
+        let mut rng = Rng(0x5150_1509_A5A5_1234);
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i] = (rng.next_u64() & 0xFF) as u8;
+                rgba[i + 1] = (rng.next_u64() & 0xFF) as u8;
+                rgba[i + 2] = (rng.next_u64() & 0xFF) as u8;
+                rgba[i + 3] = 255;
+            }
+        }
+        let mut bgra = rgba.clone();
+        for p in bgra.chunks_exact_mut(4) {
+            p.swap(0, 2);
+            p[3] = 0; // and GDI leaves the alpha at zero, as the real thing does
+        }
+        let a = vision::Frame::rgba(0, 0, w, h, rgba);
+        let b = vision::Frame { x: 0, y: 0, w, h, px: bgra, order: vision::Order::Bgra };
+
+        // `to_rgba` is the way back out, and it has to undo both the order and the
+        // missing alpha.
+        assert_eq!(a.to_rgba(), b.to_rgba(), "to_rgba must reconcile the two orders");
+
+        let tpl = vision::Frame::rgba(
+            0,
+            0,
+            24,
+            24,
+            {
+                let mut t = vec![0u8; 24 * 24 * 4];
+                for y in 0..24u32 {
+                    for x in 0..24u32 {
+                        let src = (((y + 40) * w + x + 50) * 4) as usize;
+                        let dst = ((y * 24 + x) * 4) as usize;
+                        t[dst..dst + 4].copy_from_slice(&a.px[src..src + 4]);
+                    }
+                }
+                t
+            },
+        )
+        .as_template("probe");
+
+        let ha = vision::find(&a, &tpl, false).expect("red-first haystack");
+        let hb = vision::find(&b, &tpl, false).expect("blue-first haystack");
+        assert_eq!((ha.x, ha.y), (hb.x, hb.y), "the two orders found different places");
+        assert!((ha.score - hb.score).abs() < 1e-4, "{} vs {}", ha.score, hb.score);
+        assert_eq!((ha.x, ha.y), (62, 52), "and it is not where the template was cut");
+    }
+
+    #[test]
+    fn a_capture_with_no_alpha_still_matches() {
+        // A screen grab has an alpha of zero everywhere. The mask reads the alpha,
+        // so a haystack whose mask were consulted would be entirely masked out and
+        // every search would come back with nothing. The search throws the
+        // haystack's mask away for exactly this reason; this is the test that says
+        // so, because the symptom would otherwise be "image steps stopped working".
+        let (w, h) = (96u32, 96u32);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let v = (((x / 8) + (y / 8)) % 2) as u8 * 200 + 20;
+                px[i] = v;
+                px[i + 1] = v;
+                px[i + 2] = v;
+                px[i + 3] = 0; // no alpha at all, as GDI leaves it
+            }
+        }
+        let hay = vision::Frame { x: 0, y: 0, w, h, px, order: vision::Order::Bgra };
+        let tpl = checker_template(16, 16);
+        assert!(
+            vision::find(&hay, &tpl, false).is_some(),
+            "a frame with no alpha found nothing at all"
+        );
+    }
+
+    // ---- 1.5.0: what happens when a step finds nothing -----------------------
+
+    #[test]
+    fn a_missing_miss_policy_reads_as_carry_on() {
+        // Every macro written before 1.5.0 has no `miss` field anywhere, and every
+        // one of them has to keep behaving exactly as it did. This is the whole
+        // compatibility promise of the feature in one assertion.
+        let old = r#"{"version":3,"duration_us":10,"events":[],"script":[
+            {"kind":{"ClickImage":{"template":"a","threshold":0.9,"button":"Left"}},
+             "enabled":true},
+            {"kind":{"WaitFor":{"cond":"Always","appear":true,"timeout_ms":5}},
+             "enabled":true}]}"#;
+        let data = parse_macro(old).expect("a 1.4.0 script must still load");
+        for st in &data.script {
+            assert_eq!(st.kind.miss(), OnMiss::Continue, "{:?}", st.kind);
+        }
+    }
+
+    #[test]
+    fn every_miss_policy_round_trips() {
+        for i in 0..OnMiss::COUNT {
+            assert_eq!(OnMiss::from_index(i).index(), i, "policy {i}");
+        }
+        let mut data = MacroData::new(vec![ev(0)], 1000);
+        for m in [
+            OnMiss::Continue,
+            OnMiss::Stop,
+            OnMiss::Break,
+            OnMiss::Retry { times: 7, delay_ms: 250 },
+        ] {
+            data.script.push(ScriptStep::new(StepKind::ClickImage {
+                template: "t".into(),
+                threshold: 0.9,
+                button: MouseButton::Left,
+                area: SearchArea::default(),
+                edge: false,
+                miss: m,
+            }));
+        }
+        let back: MacroData =
+            serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
+        assert_eq!(back.script[1].kind.miss(), OnMiss::Stop);
+        assert_eq!(back.script[2].kind.miss(), OnMiss::Break);
+        assert_eq!(back.script[3].kind.miss(), OnMiss::Retry { times: 7, delay_ms: 250 });
+    }
+
+    #[test]
+    fn leaving_a_loop_lands_in_the_same_place_however_it_was_asked_for() {
+        // `Break` the step and `Break` the miss policy are two spellings of one
+        // jump. If they ever disagreed about nesting, a macro would leave the wrong
+        // loop - and it would do so only sometimes, which is the worst kind.
+        let k = |kind| ScriptStep::new(kind);
+        let steps = vec![
+            k(StepKind::While { cond: Condition::Always }), // 0
+            k(StepKind::While { cond: Condition::Always }), // 1
+            k(StepKind::Break),                             // 2 - inner
+            k(StepKind::EndWhile),                          // 3
+            k(StepKind::Break),                             // 4 - outer
+            k(StepKind::EndWhile),                          // 5
+            k(StepKind::Log { text: String::new() }),       // 6
+        ];
+        assert_eq!(break_target(&steps, 2), 4, "the inner break lands after its own end");
+        assert_eq!(break_target(&steps, 4), 6, "the outer break lands after the outer end");
+        // A break with no loop around it runs off the end rather than anywhere odd.
+        let loose = vec![k(StepKind::Break), k(StepKind::Log { text: String::new() })];
+        assert_eq!(break_target(&loose, 0), loose.len());
+    }
+
+    #[test]
+    fn a_retry_policy_reports_how_many_extra_looks_it_wants() {
+        assert_eq!(OnMiss::Continue.retries(), (0, 0));
+        assert_eq!(OnMiss::Stop.retries(), (0, 0));
+        assert_eq!(OnMiss::Retry { times: 4, delay_ms: 750 }.retries(), (4, 750));
+    }
+
+    // ---- 1.5.0: calling another macro ---------------------------------------
+
+    #[test]
+    fn a_call_step_survives_a_save_and_load() {
+        let mut data = MacroData::new(vec![ev(0)], 1000);
+        data.script.push(ScriptStep::new(StepKind::Call {
+            path: "sub/login.json".into(),
+            miss: OnMiss::Stop,
+        }));
+        let back: MacroData =
+            serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
+        match &back.script[0].kind {
+            StepKind::Call { path, miss } => {
+                assert_eq!(path, "sub/login.json");
+                assert_eq!(*miss, OnMiss::Stop);
+            }
+            other => panic!("wrong kind back: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_call_depth_cap_is_small_enough_to_be_reached_before_the_stack_is() {
+        // Under `panic = "abort"` a stack overflow is the process gone with keys
+        // held. The cap is the only thing standing between that and a macro that
+        // names itself, so it has to be a small number and it has to be checked
+        // before the recursion, not after.
+        assert!(MAX_CALL_DEPTH >= 2, "nesting has to be worth having");
+        assert!(MAX_CALL_DEPTH <= 32, "a cap this deep is not a cap");
+    }
+
+    // ---- 1.5.0: recording into picture steps --------------------------------
+
+    fn click_pair(t: u64, x: i32, y: i32, up_x: i32, up_y: i32, up_t: u64) -> Vec<MacroEvent> {
+        vec![
+            MacroEvent {
+                t_us: t,
+                kind: InputEventKind::MouseButton {
+                    button: MouseButton::Left,
+                    down: true,
+                    x,
+                    y,
+                },
+            },
+            MacroEvent {
+                t_us: up_t,
+                kind: InputEventKind::MouseButton {
+                    button: MouseButton::Left,
+                    down: false,
+                    x: up_x,
+                    y: up_y,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn a_click_is_told_apart_from_a_drag() {
+        // A drag is press, move, release, and turning one into "find the picture
+        // and click it" would drop the drag without saying so. The distance and the
+        // hold are both checked because a slow press in place is still a click and
+        // a fast flick across the screen is not.
+        let click = click_pair(0, 100, 100, 102, 101, 50_000);
+        assert_eq!(matching_release(&click, 0, MouseButton::Left), Some(1));
+
+        let drag = click_pair(0, 100, 100, 400, 300, 50_000);
+        assert_eq!(matching_release(&drag, 0, MouseButton::Left), None, "a drag");
+
+        let held = click_pair(0, 100, 100, 100, 100, 5_000_000);
+        assert_eq!(matching_release(&held, 0, MouseButton::Left), None, "a long hold");
+
+        // A press that is never released is the end of the recording, not a click.
+        assert_eq!(matching_release(&click[..1], 0, MouseButton::Left), None);
+    }
+
+    #[test]
+    fn turning_clicks_into_pictures_keeps_every_event() {
+        // The promise of the feature: the clicks become pictures and *nothing else
+        // changes*. The keystrokes between them, the timing, the scrolling - all of
+        // it has to still be replayed, or the macro that comes back is not the
+        // macro that was recorded.
+        let mut events = Vec::new();
+        events.extend(click_pair(0, 50, 50, 50, 50, 10_000));
+        events.push(MacroEvent {
+            t_us: 20_000,
+            kind: InputEventKind::Key { vk: 0x41, scan: 0, down: true, extended: false },
+        });
+        events.push(MacroEvent {
+            t_us: 21_000,
+            kind: InputEventKind::Key { vk: 0x41, scan: 0, down: false, extended: false },
+        });
+        events.extend(click_pair(30_000, 300, 200, 301, 200, 40_000));
+        let total = events.len();
+        let data = MacroData::new(events, 40_000);
+
+        let shots: Vec<ClickShot> = [0usize, 4]
+            .iter()
+            .map(|i| ClickShot {
+                index: *i,
+                button: MouseButton::Left,
+                x: 0,
+                y: 0,
+                left: 0,
+                top: 0,
+                w: 2,
+                h: 2,
+                rgba: vec![255u8; 16],
+                dpi: 96,
+            })
+            .collect();
+        let names = vec!["a".to_string(), "b".to_string()];
+        let (script, made) =
+            script_from_click_shots(&data, &shots, &names, 0.85, OnMiss::Stop);
+        assert_eq!(made, 2, "both clicks should have become picture steps");
+
+        // Two picture steps, and the keystrokes in a `Play events` range between
+        // them. Nothing after the last click here, so no trailing range.
+        let images = script
+            .iter()
+            .filter(|s| matches!(s.kind, StepKind::ClickImage { .. }))
+            .count();
+        assert_eq!(images, 2);
+
+        // The ranges, taken together, must cover every event that is not part of a
+        // converted click, exactly once and in order.
+        let mut covered: Vec<usize> = Vec::new();
+        for st in &script {
+            if let StepKind::PlayEvents { from, to } = st.kind {
+                assert!(from <= to, "a backwards range: {from}..{to}");
+                covered.extend(from..=to);
+            }
+        }
+        assert_eq!(covered, vec![2, 3], "only the keystrokes should be replayed raw");
+        assert!(covered.iter().all(|i| *i < total));
+
+        // And the generated steps carry the policy they were asked for, which is
+        // the whole reason the offer has a combo box on it.
+        for st in &script {
+            if matches!(st.kind, StepKind::ClickImage { .. }) {
+                assert_eq!(st.kind.miss(), OnMiss::Stop);
+            }
+        }
+    }
+
+    #[test]
+    fn a_drag_is_left_alone_rather_than_turned_into_a_picture() {
+        let events = click_pair(0, 50, 50, 400, 400, 10_000);
+        let data = MacroData::new(events, 10_000);
+        let shots = vec![ClickShot {
+            index: 0,
+            button: MouseButton::Left,
+            x: 50,
+            y: 50,
+            left: 0,
+            top: 0,
+            w: 2,
+            h: 2,
+            rgba: vec![255u8; 16],
+            dpi: 96,
+        }];
+        let (script, made) =
+            script_from_click_shots(&data, &shots, &["d".into()], 0.85, OnMiss::Continue);
+        assert_eq!(made, 0, "a drag must not become a picture step");
+        // And the whole recording still plays.
+        assert_eq!(script.len(), 1);
+        assert!(matches!(script[0].kind, StepKind::PlayEvents { from: 0, to: 1 }));
+    }
+
+    #[test]
+    fn a_shot_pointing_at_an_event_that_was_deleted_is_ignored() {
+        // The squares are taken during recording and used after it, and the editor
+        // sits between the two. An index that no longer names a click has to be
+        // skipped rather than panic or generate a step for something else.
+        let data = MacroData::new(click_pair(0, 10, 10, 10, 10, 5_000), 5_000);
+        let shots = vec![ClickShot {
+            index: 99,
+            button: MouseButton::Left,
+            x: 0,
+            y: 0,
+            left: 0,
+            top: 0,
+            w: 2,
+            h: 2,
+            rgba: vec![255u8; 16],
+            dpi: 96,
+        }];
+        let (script, made) =
+            script_from_click_shots(&data, &shots, &["gone".into()], 0.85, OnMiss::Stop);
+        assert_eq!(made, 0);
+        assert_eq!(script.len(), 1, "the recording still plays whole");
+    }
+
+    #[test]
+    fn generated_template_names_are_unique_and_ordered() {
+        let stamp = "20260101_1200";
+        let names: Vec<String> = (1..=12).map(|n| click_shot_name(stamp, n)).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "the names have to sort into step order");
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
+    }
+
+    // ---- 1.5.0: the self-running executable's footer -------------------------
+
+    #[test]
+    fn a_footer_length_that_overflows_is_refused() {
+        // The hole this closes: `16 + len` wraps to zero in a release build for a
+        // length near u64::MAX, and the `checked_sub` underneath it then succeeds.
+        // The subtraction looked careful; the addition it depended on was not.
+        let mut image = vec![0u8; 4096];
+        image.extend_from_slice(&(u64::MAX - 15).to_le_bytes());
+        image.extend_from_slice(PAYLOAD_MAGIC);
+        assert_eq!(payload_offset(&image), None, "a wrapping length must be refused");
+
+        // And the plain lie: more bytes than the file holds.
+        let mut image = vec![0u8; 4096];
+        image.extend_from_slice(&1_000_000u64.to_le_bytes());
+        image.extend_from_slice(PAYLOAD_MAGIC);
+        assert_eq!(payload_offset(&image), None, "a length past the end of the file");
+
+        // A length past what any real macro could be, but inside the file.
+        let mut image = vec![0u8; 200 * 1024 * 1024];
+        let n = (MAX_PAYLOAD + 1).to_le_bytes();
+        image.extend_from_slice(&n);
+        image.extend_from_slice(PAYLOAD_MAGIC);
+        assert_eq!(payload_offset(&image), None, "a length past the cap");
+    }
+
+    #[test]
+    fn an_honest_footer_still_parses() {
+        // The hardening must not have closed the door on the feature itself.
+        let body = b"hello, payload";
+        let mut image = vec![7u8; 512];
+        let start = image.len();
+        image.extend_from_slice(body);
+        image.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        image.extend_from_slice(PAYLOAD_MAGIC);
+        assert_eq!(payload_offset(&image), Some(start));
+        // No magic at all is not an error, it is an ordinary executable.
+        assert_eq!(payload_offset(&vec![7u8; 512]), None);
+        // And a file too short to hold a footer must not index backwards past zero.
+        assert_eq!(payload_offset(&[]), None);
+        assert_eq!(payload_offset(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn a_compression_bomb_is_refused_rather_than_allocated() {
+        // A gigabyte of zeroes compresses to about a megabyte, and `read_to_end`
+        // would have committed the gigabyte. Under `panic = "abort"` a failed
+        // allocation is not something anybody catches.
+        let huge = vec![0u8; (MAX_INFLATED + 4096) as usize];
+        let squashed = gzip(&huge).expect("gzip");
+        assert!(
+            (squashed.len() as u64) < MAX_INFLATED / 100,
+            "the bomb should be much smaller than what it expands to"
+        );
+        let err = gunzip(&squashed).expect_err("the bomb must be refused");
+        assert!(
+            err.to_string().contains("expands past"),
+            "refused for the wrong reason: {err}"
+        );
+        // And something of an ordinary size still round-trips.
+        let ordinary = b"a macro, compressed".to_vec();
+        assert_eq!(gunzip(&gzip(&ordinary).unwrap()).unwrap(), ordinary);
+    }
+
+    #[test]
+    fn every_prep_and_format_round_trips_through_its_index() {
+        for i in 0..6 {
+            assert_eq!(ocr::Prep::from_index(i).index(), i);
+        }
+        for i in 0..5 {
+            assert_eq!(ocr::Expect::from_index(i).index(), i);
+        }
+        // The ladder must not contain the rung that means "climb the ladder".
+        assert!(!ocr::Prep::LADDER.contains(&ocr::Prep::Auto));
     }
 }
