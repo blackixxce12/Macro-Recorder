@@ -24,7 +24,8 @@ all. **If you only have an hour, do the 🆕 ones.** They are collected in
 Rows marked ⚠️ can change system state (shut down, log off, run as administrator).
 Read them before running them.
 
-Sections **P**, **Q** and **R** are entirely new. P is the text expander, which arrived
+Section **S** is 1.5.0's, and every row in it is untested by anybody. Sections **P**,
+**Q** and **R** were 1.4.0's and are entirely new. P is the text expander, which arrived
 in 1.3.5 and was missed when this document was written — it is the one component that
 sees every key you press, so it earns its rows. Q and R are 1.4.0's two additions that
 cannot be tested any other way.
@@ -503,16 +504,155 @@ looks at**. R-2 is the one that would be unforgivable to get wrong.
 
 ---
 
+## S. 1.5.0 🌟
+
+Everything in this section is new and has never been touched by a human. Four features
+and one security fix, in the order they are most likely to bite.
+
+Rows marked 🌟 are 1.5.0.
+
+### S1. Recording straight into picture steps 🌟
+
+The one that writes files and rewrites your macro, so it is first.
+
+| ID | Do | Expect |
+|---|---|---|
+| S-1 | **🎬 Recording → Snip a picture at every click**, record 5 clicks on ordinary buttons, stop | A dialog offers to turn 5 clicks into picture steps, and says "5" |
+| S-2 | Press **Keep the coordinates** | Dialog closes. The macro is unchanged. Record again — it offers again, with the new count only |
+| S-3 | Repeat S-1 and press **Make picture steps** | `templates/` gains `rec_<date>_01.png` … `_05.png`, each with a `.png.json` beside it. The editor switches to the Script tab |
+| S-4 | Open one of the PNGs | It is a square of the screen centred on where you clicked, right way up, correct colours — **not** blue-and-red swapped |
+| S-5 | Read the generated script | `Click image` steps interleaved with `Play events` ranges. The ranges together cover every event that was not a converted click |
+| S-6 | Type something between two clicks while recording, then convert | The typing is still there, inside a `Play events` step, and still replays |
+| S-7 | Play the converted macro **without moving anything** | It does what the recording did |
+| S-8 | Move the target window a few hundred pixels, then play it | It still hits the buttons. **This is the whole point of the feature** |
+| S-9 | Record a **drag** (press, move, release) and convert | The drag is *not* turned into a picture step. It stays inside a `Play events` range and still drags |
+| S-10 | Record a **double-click** and convert | Nothing lost — either two picture steps or a `Play events` range, but the double-click still registers as one |
+| S-11 | Click very near a screen edge, convert, open the PNG | A full square, pushed inside the desktop — not a sliver |
+| S-12 | Set **Square size** to 16, then to 512, record and convert at each | Both work. 16 px probably matches in many places (expected); 512 px is slow but correct |
+| S-13 | Change **If a picture is not found** in the dialog to *carry on*, convert | The generated steps show no ⚠ marker and carry on when the picture is missing |
+| S-14 | Record 300+ clicks with snipping on | Memory does not run away (each square is ~16 KB); collection stops at 1000 |
+| S-15 | With snipping on, record while a **game** is in front | The mouse does not stutter. The squares are cut on a background thread, and this is the row that proves it |
+| S-16 | Turn snipping off, record, stop | No dialog, no files written |
+| S-17 | Record with snipping on, then delete events in the editor before converting | Shots pointing at deleted events are skipped; no crash, no wrong step |
+| S-18 | On a 150 % display: convert, then look at a `.png.json` | It records that display's DPI, so the template rescales on a 100 % screen |
+
+### S2. If it is not found 🌟
+
+| ID | Do | Expect |
+|---|---|---|
+| S-19 | Load a **1.4.0** macro with image steps and play it | Behaves exactly as it did. Every step reads *carry on* |
+| S-20 | A `Click image` naming a template that does not exist, set to *carry on* | Script continues. Log: nothing alarming |
+| S-21 | The same set to **stop the script** | Run ends. Log names the step and says it stopped because the step asked |
+| S-22 | The same inside a `While`, set to **leave the loop** | The loop ends and the step after `End while` runs — once |
+| S-23 | Nested loops, inner step set to **leave the loop** | Leaves the *inner* loop only |
+| S-24 | Set to **try again 3 × 500 ms**, time the run | About 1.5 s of waiting, then the run stops. Log shows "trying again (1 of 3)", "(2 of 3)", "(3 of 3)" |
+| S-25 | Press **Stop** during those retries | Stops within a moment. It must not finish the retries first |
+| S-26 | A `Wait for` with a 5 s timeout set to **stop the script** | Waits 5 s, then ends the run rather than walking on |
+| S-27 | A `Press element` with a nonsense name set to **stop** | Ends the run |
+| S-28 | Look at the script list with several policies set | Steps with anything other than *carry on* show ⚠ or ⟲ on their line |
+| S-29 | Save and reload a macro with all four policies in it | All four survive |
+| S-30 | Open a 1.5.0 macro in a text editor | `"miss"` appears only where it is not `Continue`… (it is written always; check it reads sensibly) |
+
+### S3. Call macro 🌟
+
+| ID | Do | Expect |
+|---|---|---|
+| S-31 | Make `child.json` that sets a variable. Call it from a parent | Parent sees the variable afterwards |
+| S-32 | Set a variable in the parent, read it in the child | The child sees it |
+| S-33 | Call by bare name (`child`) with the file beside the parent | Found. `.json` is added for you |
+| S-34 | Use the **…** button to pick a file beside the saved parent | The path is stored **relative** |
+| S-35 | Move the whole folder elsewhere and play | Still works — that is what the relative path is for |
+| S-36 | Call a file that does not exist, policy *stop* | Run ends, log lists every path it looked in |
+| S-37 | Make a macro that calls **itself**, policy *carry on* | Stops at 8 levels. Log: "refused: already 8 deep". **The application must not crash** |
+| S-38 | Two macros calling each other | Same — capped at 8 |
+| S-39 | A `Break` inside the child, inside a `While` in the parent | The child's `Break` does **not** break the parent's loop |
+| S-40 | `Quit the app` inside the child | The whole application closes |
+| S-41 | Press **Stop** while the child is running | Everything stops |
+| S-42 | A child containing a `Play events` step | It replays the **child's** recording, not the parent's |
+| S-43 | Call inside a `While` that turns 100 times | The file is read once, not a hundred times (watch the log) |
+| S-44 | Export a parent that calls a child to a standalone `.exe`, run it **without** the child beside it | It fails the way its policy says — documented limitation, but it must fail cleanly |
+
+### S4. The variables window 🌟
+
+| ID | Do | Expect |
+|---|---|---|
+| S-45 | **🔎 Image search → Watch the run**, then play a script | A second window lists variables and updates as the run goes |
+| S-46 | A script with an OCR read | The text appears, with newlines shown as ⏎ rather than breaking the table |
+| S-47 | Close the window mid-run | The run carries on normally |
+| S-48 | Tick **Pause before each step** and start a run | It stops before step 0 and waits |
+| S-49 | Press **▶ Next step** repeatedly | Exactly one step per press. The variable values change at the step that changes them |
+| S-50 | While parked, press the **Stop hotkey** | Stops. **This is the row that matters most in this section** |
+| S-51 | While parked, untick **Pause before each step** | The run continues on its own |
+| S-52 | While parked, close the variables window | The run continues on its own |
+| S-53 | Step into a `Call macro` | The step line shows a depth marker (↳1) while inside the child |
+| S-54 | Leave the window **closed** and run a long script | No measurable slowdown — the publishing is meant to cost nothing when nobody is watching |
+| S-55 | Play a macro with no script at all, window open | Says "not running" or shows nothing; no crash |
+
+### S5. Fast screen capture 🌟
+
+| ID | Do | Expect |
+|---|---|---|
+| S-56 | `--selftest vision` | The **Desktop Duplication against GDI** table appears; the cross-check says "Same place", 0 px off |
+| S-57 | Read the "Two looks at an unchanged rectangle" line | "identical" |
+| S-58 | Run an image step that used to work in 1.4.0 | Finds the same thing in the same place |
+| S-59 | Untick **Fast screen capture**, run the same step | Still finds it — slower. Results must not differ |
+| S-60 | A **second monitor**: a template on monitor 2 | Found, at the right coordinates |
+| S-61 | A search area **spanning both monitors** | Still works (it falls back to GDI for that rectangle) |
+| S-62 | Monitor at **150 %** scale | Coordinates land correctly |
+| S-63 | A **rotated** monitor | Falls back to GDI. Works, slower |
+| S-64 | Change resolution **while a script is polling** | It recovers within a step or two. Log may show "desktop duplication reset" |
+| S-65 | A game in **exclusive full screen** | Either duplication or the fallback works. It must not return black frames or stale ones |
+| S-66 | Lock the workstation mid-run, unlock | It recovers |
+| S-67 | Over **Remote Desktop** | Falls back to GDI, still works |
+| S-68 | Watch memory in Task Manager with an image script running | Higher than 1.4.0 (about 80 MB vs 12) and **flat**. Rising is a leak |
+| S-69 | Untick fast capture and watch memory | Drops back down after the run ends |
+| S-70 | OCR a region and check the text | Correct. A channel-order mistake would garble it |
+| S-71 | **📋 Paste** a snippet and **🔍 Find on screen** from the main window | Works, and the search thread does not fight the playback thread over the duplication |
+
+### S6. The self-running `.exe` footer 🌟
+
+⚠️ These make deliberately malformed files. Do them in a scratch folder.
+
+| ID | Do | Expect |
+|---|---|---|
+| S-72 | Export a macro to a standalone `.exe` and run it | Plays, as before |
+| S-73 | Append 16 random bytes to a normal (non-exported) `.exe` and run it | Runs as the ordinary application. No payload, no complaint |
+| S-74 | Take an exported `.exe`, overwrite the 8 length bytes before the magic with `FF FF FF FF FF FF FF FF`, run it | Starts as the ordinary application. **It must not crash and must not hang.** The log says the footer claimed an impossible payload |
+| S-75 | The same with `F0 FF FF FF FF FF FF FF` (the overflow case) | Same |
+| S-76 | Truncate an exported `.exe` in the middle of its payload, run it | Starts normally, log says the payload would not decompress |
+| S-77 | Corrupt a few bytes in the middle of the payload, run it | Same |
+| S-78 | Export a `.mrz` (gzip) macro and reload it | Works |
+
+---
+
 ## Short pass
 
 If time is short, these are the rows that cover code that is either brand new or has
-never had real input behind it. **1.4.0 first**, because none of it has been touched by
-a human:
+never had real input behind it. **1.5.0 first**, because none of it has been touched by
+a human at all:
+
+**S-3, S-4, S-8, S-9, S-15** · **S-19, S-21, S-24, S-25** · **S-37, S-41** ·
+**S-50, S-52** · **S-56, S-58, S-64, S-68** · **S-74**
+
+Eighteen rows, roughly an hour. Five of them matter more than the rest:
+
+- **S-19** — a 1.4.0 macro that behaves differently after upgrading breaks every user
+  who has one. The whole compatibility promise of the miss policies is this row.
+- **S-37** — a macro that calls itself must stop, not overflow the stack. With
+  `panic = "abort"` an overflow is the process gone with keys held.
+- **S-50** — a run parked in step mode that Stop cannot reach would be a trap in a
+  program whose entire premise is a global stop key.
+- **S-8** — if a converted macro does not survive the window moving, the feature has no
+  reason to exist.
+- **S-68** — the new capture path holds a GPU texture and a D3D device. Flat is
+  expected; rising is a leak, and it would be a 14 MB-per-run leak.
+
+Then the 1.4.0 set, still untouched:
 
 **G-32, G-47, G-54** · **H-14, H-20, H-24, H-28, H-33** · **I-9, I-11, I-16** ·
 **P-11, P-15** · **Q-7, Q-15** · **R-2, R-8**
 
-Seventeen rows, roughly an hour. Three of them matter more than the rest:
+Three of those matter more than the rest:
 
 - **P-11** — grep the logs for what you typed. If anything comes back, stop and tell me
   before doing anything else.
